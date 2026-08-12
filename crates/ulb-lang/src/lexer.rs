@@ -382,8 +382,9 @@ impl Lexer<'_> {
                     segment_start = self.pos as u32;
                 }
                 _ => {
-                    literal.push(byte as char);
-                    self.pos += 1;
+                    let ch = self.source[self.pos..].chars().next().unwrap_or('\u{FFFD}');
+                    literal.push(ch);
+                    self.pos += ch.len_utf8();
                 }
             }
         }
@@ -563,6 +564,24 @@ mod tests {
                     panic!("expected literal segment");
                 };
                 assert_eq!(text, "a\"b\\c\nd\te\rf");
+            }
+            other => panic!("expected string token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn string_preserves_multibyte_characters() {
+        let Lexed {
+            tokens,
+            diagnostics,
+        } = lex(r#""مرحبا café""#);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        match &tokens[0].kind {
+            TokenKind::Str(parts) => {
+                let StrSegment::Literal { text, .. } = &parts[0] else {
+                    panic!("expected literal segment");
+                };
+                assert_eq!(text, "مرحبا café");
             }
             other => panic!("expected string token, got {other:?}"),
         }
