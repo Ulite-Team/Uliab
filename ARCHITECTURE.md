@@ -215,8 +215,8 @@ for confirmation, not a silent pick):
   well-behaved plugin follows — a misbehaving or compromised plugin
   physically cannot reach outside what it was granted.
 - **Cross-platform for free.** The same `.wasm` artifact runs unmodified
-  on Amr's Linux/Hyprland machine and on any future CI runner — no
-  per-platform plugin builds to publish or cache.
+  on any development or CI machine — no per-platform plugin builds to
+  publish or cache.
 
 Trade-off worth naming honestly: calling into WASM has real (small)
 overhead versus a native `dylib` call, and a plugin cannot itself spawn
@@ -260,14 +260,12 @@ Appendix C) one layer up.
   miss. This directly parallels the existing Maven artifact cache design
   (old §10.2) but is a fully separate cache root — plugin artifacts and
   Maven artifacts are never comingled.
-- **Version compatibility & fallback** (this reuses a decision already
-  made for the `build-engine` project's plugin SDK, applied here): each
-  plugin declares which core plugin-ABI version range it targets. If the
-  installed tool is newer than a plugin's declared range, the tool keeps
-  using the plugin's last-known-compatible build rather than forcing an
-  upgrade or refusing to build — a plugin update is opt-in, not forced by
-  a core tool update. This is the concrete mechanism behind "the tool
-  won't break easily" (from the request that prompted this redesign): the
+- **Version compatibility & fallback**: each plugin declares which core
+  plugin-ABI version range it targets. If the installed tool is newer than
+  a plugin's declared range, the tool keeps using the plugin's
+  last-known-compatible build rather than forcing an upgrade or refusing
+  to build — a plugin update is opt-in, not forced by a core tool update.
+  This is the concrete mechanism behind "the tool won't break easily": the
   core's own release cadence and a given project's plugin versions are
   fully decoupled.
 
