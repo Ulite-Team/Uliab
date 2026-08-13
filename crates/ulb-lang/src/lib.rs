@@ -21,7 +21,7 @@ pub mod span;
 pub mod token;
 
 pub use diagnostic::{Diagnostic, Severity};
-pub use eval::{Definitions, EvalOutcome, Value};
+pub use eval::{Definitions, EvalEnvironment, EvalOutcome, Value};
 pub use lexer::{Lexed, lex};
 pub use parser::{Parsed, parse};
 pub use span::{LineIndex, Span};

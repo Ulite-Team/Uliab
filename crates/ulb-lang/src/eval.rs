@@ -128,6 +128,25 @@ pub struct Definitions {
     pub plugins: BTreeMap<String, Value>,
 }
 
+/// Values injected into an evaluation so it can run without a live
+/// process environment or filesystem (GRAMMAR.md Appendix C). Both maps
+/// are consulted before the real world: an injected `env` entry shadows
+/// `std::env::var` for `env("NAME")`, and an injected `props` entry —
+/// keyed by the path string exactly as written in the build file —
+/// shadows the filesystem for `props("path")`. A name/path with no
+/// injected entry falls back to the live environment, so a default
+/// [`EvalEnvironment`] reproduces the previous non-hermetic behavior
+/// exactly. Injected `props` values are raw `.properties` text, parsed
+/// the same way a file on disk would be.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EvalEnvironment {
+    /// Overrides for `env("NAME")` lookups, keyed by variable name.
+    pub env: BTreeMap<String, String>,
+    /// Overrides for `props("path")` lookups, keyed by the path string as
+    /// written in the build file.
+    pub props: BTreeMap<String, String>,
+}
+
 /// The result of evaluating one file: the resolved model plus every
 /// diagnostic raised during evaluation (in addition to any parse
 /// diagnostics the caller already has from [`crate::parser::parse`]).
@@ -170,6 +189,18 @@ pub struct EvalOutcome {
 /// assert!(defs.aliases.contains_key("coreKtx"));
 /// ```
 pub fn collect_definitions(file: &File, defs: &mut Definitions, diagnostics: &mut Vec<Diagnostic>) {
+    collect_definitions_with(file, defs, diagnostics, &EvalEnvironment::default());
+}
+
+/// Like [`collect_definitions`], but resolves alias/version expressions
+/// against the given [`EvalEnvironment`] so a `libs.ulb` that calls
+/// `env`/`props` can be collected hermetically.
+pub fn collect_definitions_with(
+    file: &File,
+    defs: &mut Definitions,
+    diagnostics: &mut Vec<Diagnostic>,
+    environment: &EvalEnvironment,
+) {
     // Pass 1: conventions, fns, `versions {}`, and plain alias assignments
     // — everything a same-file `bundle {}`/`plugins {}` block might need.
     for stmt in &file.statements {
@@ -188,7 +219,7 @@ pub fn collect_definitions(file: &File, defs: &mut Definitions, diagnostics: &mu
             StatementKind::BlockStmt { path, block } if path.head() == "versions" => {
                 for inner in &block.statements {
                     if let StatementKind::Assignment { path, value } = &inner.kind {
-                        let mut ev = Evaluator::new(defs);
+                        let mut ev = Evaluator::new(defs, environment);
                         let resolved = ev.eval_expr(value);
                         diagnostics.append(&mut ev.diagnostics);
                         if let Some(text) = resolved.as_display_string() {
@@ -207,7 +238,7 @@ pub fn collect_definitions(file: &File, defs: &mut Definitions, diagnostics: &mu
                 }
             }
             StatementKind::Assignment { path, value } if path.is_single() => {
-                let mut ev = Evaluator::new(defs);
+                let mut ev = Evaluator::new(defs, environment);
                 let resolved = ev.eval_expr(value);
                 diagnostics.append(&mut ev.diagnostics);
                 defs.aliases.insert(path.head().to_owned(), resolved);
@@ -224,7 +255,7 @@ pub fn collect_definitions(file: &File, defs: &mut Definitions, diagnostics: &mu
                 "bundle" => {
                     for inner in &block.statements {
                         if let StatementKind::Assignment { path, value } = &inner.kind {
-                            let mut ev = Evaluator::new(defs);
+                            let mut ev = Evaluator::new(defs, environment);
                             let resolved = ev.eval_expr(value);
                             diagnostics.append(&mut ev.diagnostics);
                             defs.aliases.insert(path.head().to_owned(), resolved);
@@ -234,7 +265,7 @@ pub fn collect_definitions(file: &File, defs: &mut Definitions, diagnostics: &mu
                 "plugins" => {
                     for inner in &block.statements {
                         if let StatementKind::Assignment { path, value } = &inner.kind {
-                            let mut ev = Evaluator::new(defs);
+                            let mut ev = Evaluator::new(defs, environment);
                             let resolved = ev.eval_expr(value);
                             diagnostics.append(&mut ev.diagnostics);
                             defs.plugins.insert(path.head().to_owned(), resolved);
@@ -279,7 +310,19 @@ pub fn collect_definitions(file: &File, defs: &mut Definitions, diagnostics: &mu
 /// ```
 #[must_use]
 pub fn evaluate_build(file: &File, defs: &Definitions) -> EvalOutcome {
-    let mut evaluator = Evaluator::new(defs);
+    evaluate_build_with(file, defs, &EvalEnvironment::default())
+}
+
+/// Like [`evaluate_build`], but with a hermetic [`EvalEnvironment`]
+/// injected so `env`/`props` lookups resolve deterministically instead of
+/// against the live process.
+#[must_use]
+pub fn evaluate_build_with(
+    file: &File,
+    defs: &Definitions,
+    environment: &EvalEnvironment,
+) -> EvalOutcome {
+    let mut evaluator = Evaluator::new(defs, environment);
     let mut target = BTreeMap::new();
     evaluator.eval_statements(&file.statements, &mut target);
     EvalOutcome {
@@ -317,21 +360,63 @@ pub fn evaluate_build(file: &File, defs: &Definitions) -> EvalOutcome {
 /// ```
 #[must_use]
 pub fn evaluate_project(conventions_src: &str, libs_src: &str, build_src: &str) -> EvalOutcome {
+    evaluate_project_with(
+        conventions_src,
+        libs_src,
+        build_src,
+        &EvalEnvironment::default(),
+    )
+}
+
+/// Like [`evaluate_project`], but with a hermetic [`EvalEnvironment`]
+/// injected so `env`/`props` lookups resolve deterministically instead of
+/// against the live process.
+///
+/// # Examples
+///
+/// ```
+/// use ulb_lang::eval::{EvalEnvironment, evaluate_project_with};
+///
+/// let mut env = EvalEnvironment::default();
+/// env.env.insert("KEY_PASSWORD".to_owned(), "hunter2".to_owned());
+/// env.props.insert(
+///     "signing.properties".to_owned(),
+///     "storeFile=release.keystore\n".to_owned(),
+/// );
+///
+/// let conventions = r#"
+///     convention signed {
+///         signing {
+///             storeFile props("signing.properties").storeFile
+///             keyPassword env("KEY_PASSWORD")
+///         }
+///     }
+/// "#;
+/// let outcome = evaluate_project_with(conventions, "", r#"apply "signed""#, &env);
+/// assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+/// ```
+#[must_use]
+pub fn evaluate_project_with(
+    conventions_src: &str,
+    libs_src: &str,
+    build_src: &str,
+    environment: &EvalEnvironment,
+) -> EvalOutcome {
     let mut diagnostics = Vec::new();
     let mut defs = Definitions::default();
 
     let conv_parsed = crate::parser::parse(conventions_src);
     diagnostics.extend(conv_parsed.diagnostics);
-    collect_definitions(&conv_parsed.file, &mut defs, &mut diagnostics);
+    collect_definitions_with(&conv_parsed.file, &mut defs, &mut diagnostics, environment);
 
     let libs_parsed = crate::parser::parse(libs_src);
     diagnostics.extend(libs_parsed.diagnostics);
-    collect_definitions(&libs_parsed.file, &mut defs, &mut diagnostics);
+    collect_definitions_with(&libs_parsed.file, &mut defs, &mut diagnostics, environment);
 
     let build_parsed = crate::parser::parse(build_src);
     diagnostics.extend(build_parsed.diagnostics);
 
-    let outcome = evaluate_build(&build_parsed.file, &defs);
+    let outcome = evaluate_build_with(&build_parsed.file, &defs, environment);
     diagnostics.extend(outcome.diagnostics);
 
     EvalOutcome {
@@ -378,14 +463,16 @@ fn insert_accumulating(target: &mut BTreeMap<String, Value>, key: String, value:
 
 struct Evaluator<'a> {
     defs: &'a Definitions,
+    env: &'a EvalEnvironment,
     locals: Vec<BTreeMap<String, Value>>,
     diagnostics: Vec<Diagnostic>,
 }
 
 impl<'a> Evaluator<'a> {
-    fn new(defs: &'a Definitions) -> Self {
+    fn new(defs: &'a Definitions, env: &'a EvalEnvironment) -> Self {
         Self {
             defs,
+            env,
             locals: Vec::new(),
             diagnostics: Vec::new(),
         }
@@ -789,6 +876,9 @@ impl<'a> Evaluator<'a> {
         let Some(name) = self.single_positional_string(args, span, "env(...)") else {
             return Value::Invalid("bad env() call".to_owned());
         };
+        if let Some(value) = self.env.env.get(&name) {
+            return Value::Str(value.clone());
+        }
         match std::env::var(&name) {
             Ok(value) => Value::Str(value),
             Err(_) => {
@@ -802,6 +892,9 @@ impl<'a> Evaluator<'a> {
         let Some(path) = self.single_positional_string(args, span, "props(...)") else {
             return Value::Invalid("bad props() call".to_owned());
         };
+        if let Some(contents) = self.env.props.get(&path) {
+            return Value::Properties(parse_properties(contents));
+        }
         match std::fs::read_to_string(&path) {
             Ok(contents) => Value::Properties(parse_properties(&contents)),
             Err(err) => {
@@ -1093,6 +1186,70 @@ mod tests {
                 .iter()
                 .any(|d| d.message.contains("is not set"))
         );
+    }
+
+    #[test]
+    fn injected_env_shadows_process_environment() {
+        let parsed = parse(r#"x env("PATH")"#);
+        let defs = Definitions::default();
+        let mut env = EvalEnvironment::default();
+        env.env.insert("PATH".to_owned(), "injected".to_owned());
+        let outcome = evaluate_build_with(&parsed.file, &defs, &env);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        let Value::Block(top) = outcome.model else {
+            panic!("expected Block");
+        };
+        assert_eq!(top["x"], Value::Str("injected".to_owned()));
+    }
+
+    #[test]
+    fn injected_env_supplies_variable_absent_from_process() {
+        let parsed = parse(r#"x env("ULB_EVAL_INJECTED_ONLY")"#);
+        let defs = Definitions::default();
+        let mut env = EvalEnvironment::default();
+        env.env
+            .insert("ULB_EVAL_INJECTED_ONLY".to_owned(), "from-map".to_owned());
+        let outcome = evaluate_build_with(&parsed.file, &defs, &env);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        let Value::Block(top) = outcome.model else {
+            panic!("expected Block");
+        };
+        assert_eq!(top["x"], Value::Str("from-map".to_owned()));
+    }
+
+    #[test]
+    fn injected_props_supply_member_access() {
+        let parsed = parse(r#"x props("signing.properties").storeFile"#);
+        let defs = Definitions::default();
+        let mut env = EvalEnvironment::default();
+        env.props.insert(
+            "signing.properties".to_owned(),
+            "storeFile=release.keystore\n".to_owned(),
+        );
+        let outcome = evaluate_build_with(&parsed.file, &defs, &env);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        let Value::Block(top) = outcome.model else {
+            panic!("expected Block");
+        };
+        assert_eq!(top["x"], Value::Str("release.keystore".to_owned()));
+    }
+
+    #[test]
+    fn props_without_injection_falls_back_to_filesystem() {
+        let dir =
+            std::env::temp_dir().join(format!("ulb-eval-props-fallback-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fallback.properties");
+        std::fs::write(&path, "key=value\n").unwrap();
+        let src = format!(r#"x props("{}").key"#, path.display());
+        let parsed = parse(&src);
+        let defs = Definitions::default();
+        let outcome = evaluate_build(&parsed.file, &defs);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        let Value::Block(top) = outcome.model else {
+            panic!("expected Block");
+        };
+        assert_eq!(top["x"], Value::Str("value".to_owned()));
     }
 
     #[test]

@@ -1,37 +1,30 @@
 plugin "android-application"
 
 apply "androidApp"
-apply "env-signing"
+apply "envSigning"
 
 android {
   namespace "com.example.app"
-  compileSdk 37
-  minSdk 24
-  targetSdk 37
   applicationId "com.example.app"
   versionCode 7
   versionName ver(major=0, minor=1, patch=2)
 }
 
 buildTypes {
-  debug { minifyEnabled false }
   release {
-    minifyEnabled true
     proguardFiles [ "proguard-rules.pro" ]
   }
 }
 
 productFlavors {
   dimension "tier"
-  free  { applicationIdSuffix ".free" }
-  paid  { applicationIdSuffix ".paid" }
+  free { applicationIdSuffix ".free" }
+  paid { applicationIdSuffix ".paid" }
 }
 
 signing {
-  storeFile   props("signing.properties").storeFile
   keyAlias    props("signing.properties").keyAlias
-  storePassword env("STORE_PASSWORD")
-  keyPassword   env("KEY_PASSWORD")
+  keyPassword env("KEY_PASSWORD")
 }
 
 deps {
@@ -45,6 +38,8 @@ commonMain.deps {
 androidMain.deps {
   implementation "org.jetbrains.compose.ui:ui" @ composeVersion
 }
+
+defaultDebug()
 
 task "printConfig" {
   description "Prints the resolved module configuration."

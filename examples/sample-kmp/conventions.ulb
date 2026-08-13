@@ -5,14 +5,13 @@ convention androidApp {
     targetSdk 37
   }
   buildTypes {
-    debug { minifyEnabled false }
     release { minifyEnabled true }
   }
 }
 
-convention env-signing {
+convention envSigning {
   signing {
-    storeFile   props("signing.properties").storeFile
+    storeFile     props("signing.properties").storeFile
     storePassword env("STORE_PASSWORD")
   }
 }
