@@ -1,0 +1,18 @@
+versions {
+  coreVersion = "1.15.0"
+  composeVersion = "1.8.0"
+}
+
+appcompat = "androidx.appcompat:appcompat:1.7.0"
+coreKtx   = "androidx.core:core-ktx" @ coreVersion
+ui        = "org.jetbrains.compose.ui:ui" @ composeVersion
+kotlinxCoroutines = "org.jetbrains.kotlinx:kotlinx-coroutines-core" @ "1.9.0"
+
+bundle {
+  ui = [ ui, appcompat ]
+}
+
+plugins {
+  androidApplication = "com.android.application" @ "8.7.0"
+  kotlinMultiplatform = "org.jetbrains.kotlin.multiplatform" @ "2.1.0"
+}

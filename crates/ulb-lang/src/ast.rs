@@ -5,8 +5,7 @@
 //! construct, so the evaluator and the LSP can walk the same tree. Nodes are
 //! value types (no links to parents); the tree is owned by [`File`].
 //!
-//! The parser (Phase 3) builds this AST from the token stream. Until then
-//! the types are exercised directly by construction tests.
+//! The parser builds this AST from the token stream (see `parser.rs`).
 
 use crate::span::Span;
 use crate::token::Number;
@@ -122,6 +121,14 @@ pub enum ExprKind {
     Not(Box<Expr>),
     /// Parenthesized expression (span preserved, value transparent).
     Group(Box<Expr>),
+    /// A node produced by parser error recovery inside an expression
+    /// position (e.g. a dotted callee `a.b(...)`, or a token that cannot
+    /// start any expression). Consumers must skip it rather than guess at
+    /// its meaning, mirroring [`StatementKind::Invalid`].
+    Invalid {
+        /// Why the node was recovered.
+        message: String,
+    },
 }
 
 /// One part of a string literal.
@@ -552,8 +559,16 @@ mod tests {
         );
         let not = Node::new(ExprKind::Not(Box::new(flag)), span(0, 6));
         let group = Node::new(ExprKind::Group(Box::new(reference)), span(0, 7));
-        let exprs = [str, call, member, list, versioned, binary, not, group];
-        assert_eq!(exprs.len(), 8);
+        let invalid = Node::new(
+            ExprKind::Invalid {
+                message: "dotted callee is invalid".to_owned(),
+            },
+            span(0, 5),
+        );
+        let exprs = [
+            str, call, member, list, versioned, binary, not, group, invalid,
+        ];
+        assert_eq!(exprs.len(), 9);
     }
 
     #[test]

@@ -1,0 +1,22 @@
+convention androidApp {
+  android {
+    compileSdk 37
+    minSdk 24
+    targetSdk 37
+  }
+  buildTypes {
+    debug { minifyEnabled false }
+    release { minifyEnabled true }
+  }
+}
+
+convention env-signing {
+  signing {
+    storeFile   props("signing.properties").storeFile
+    storePassword env("STORE_PASSWORD")
+  }
+}
+
+fn defaultDebug() {
+  buildTypes { debug { minifyEnabled false } }
+}
