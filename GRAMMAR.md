@@ -6,7 +6,7 @@ descent parser in `ulb-lang` and the `tree-sitter-ulb` grammar must both
 conform to it. When this document changes, every repository that implements
 literal:the language must be notified.
 
-**Status:** draft for review (Phase 1). Written before any parser code.
+**Status:** draft for review.
 
 ---
 
@@ -27,8 +27,9 @@ literal:the language must be notified.
    into a partial AST plus diagnostics (see §11).
 4. **One grammar, four file roles.** `settings.ulb`, `build.ulb`,
    `conventions.ulb`, and `libs.ulb` share a single grammar. Which
-   statements are *legal* in which role is enforced by the evaluator (see
-   §10), not by the parser — the LSP parses any `.ulb` file identically.
+   statements are *legal* in which role is enforced outside the parser —
+   partly by the evaluator, partly by the tool layer and the plugins a
+   module applies (see §10) — the LSP parses any `.ulb` file identically.
 
 ---
 
@@ -260,10 +261,10 @@ One per module (the `module` entries in `settings.ulb` locate them).
 |---|---|
 | `plugin "alias"` | apply a plugin by alias from `libs.ulb` `plugins {}` |
 | `apply "name"` | apply a `convention` from `conventions.ulb` |
-| `android { ... }` | Android configuration (Appendix A) |
-| `buildTypes { ... }` | build types (Appendix A) |
-| `productFlavors { ... }` | product flavors and dimensions (Appendix A) |
-| `signing { ... }` | signing config (Appendix A) |
+| `android { ... }` | Android configuration — keys owned by the `ulite/android` plugin (Appendix A) |
+| `buildTypes { ... }` | build types — plugin-owned (Appendix A) |
+| `productFlavors { ... }` | product flavors and dimensions — plugin-owned (Appendix A) |
+| `signing { ... }` | signing config — plugin-owned (Appendix A) |
 | `deps { ... }` | module dependencies |
 | `<sourceSet>.deps { ... }` | source-set-scoped dependencies (§6.4) |
 | `task "name" { ... }` | custom task (§6.5) |
@@ -274,7 +275,7 @@ One per module (the `module` entries in `settings.ulb` locate them).
 Example:
 
 ```
-plugin "android-application"
+plugin "android"
 
 apply "android-app"
 apply "env-signing"
@@ -391,7 +392,7 @@ Version catalog — the equivalent of `libs.versions.toml`'s `[versions]`,
 | `alias = "group:artifact:version"` | full coordinate |
 | `alias = "group:artifact" @ refOrString` | coordinate with version reference |
 | `bundle { NAME = [ alias1, alias2 ] }` | named group of library aliases |
-| `plugins { NAME = "group:artifact" @ refOrString }` | versioned plugin references |
+| `plugins { NAME = "vendor/name" @ refOrString }` | versioned plugin references (Ulite Team plugin registry — ARCHITECTURE.md §3.3/§3.6) |
 
 Example:
 
@@ -411,14 +412,17 @@ bundle {
 }
 
 plugins {
-  androidApplication = "com.android.application" @ "8.7.0"
-  kotlinMultiplatform = "org.jetbrains.kotlin.multiplatform" @ "2.1.0"
+  android = "ulite/android" @ "1.4.0"
+  kotlinJvm = "ulite/kotlin-jvm" @ "2.1.0"
 }
 ```
 
 An alias may only reference `@` a `versions {}` entry or an inline string.
 An alias whose value is a full coordinate may not also carry `@` (duplicate
-version — evaluator error).
+version — evaluator error). Plugin names resolve against the Ulite Team
+plugin registry, not a Maven repository (ARCHITECTURE.md §3.6); the
+evaluator treats them as opaque values — the tool layer performs the
+resolution when it loads plugins (ARCHITECTURE.md §9, step 5).
 
 ---
 
@@ -482,18 +486,28 @@ must evaluate to boolean; type mismatches are span-attached errors (§11).
 
 ---
 
-## 10. Role validation (evaluator, not parser)
+## 10. Role validation
 
-The parser accepts any `.ulb` file. The evaluator rejects role violations
-as source-span-attached errors:
+The parser accepts any `.ulb` file. Which statements are legal in which
+role is enforced outside the parser (the LSP parses every `.ulb` file
+identically and surfaces violations as semantic diagnostics, not parse
+errors):
 
-- `convention`/`fn` definitions only in `conventions.ulb`.
-- `task`, `plugin`, `android`, `buildTypes`, `productFlavors`, `signing`
-  only in `build.ulb` (or inside a `convention` in `conventions.ulb`).
-- `project`/`module`/`repositories`/`lspCompat` only in `settings.ulb`.
-- `versions`/`bundle`/`plugins`/alias assignments only in `libs.ulb`.
-- `apply "NAME"` with no matching `convention NAME` is an error
-  (the LSP surfaces this as a semantic diagnostic, not a parse error).
+- `convention`/`fn` definitions only in `conventions.ulb` — enforced by
+  the **core evaluator** (span-attached error).
+- `project`/`module`/`repositories`/`lspCompat` only in `settings.ulb` —
+  enforced by the tool layer (build pipeline, ARCHITECTURE.md §9).
+- `versions`/`bundle`/`plugins`/alias assignments only in `libs.ulb` —
+  enforced by the tool layer.
+- `task`/`plugin` statements only in `build.ulb` (or inside a `convention`
+  in `conventions.ulb`) — enforced by the tool layer.
+- `android`/`buildTypes`/`productFlavors`/`signing` blocks are **not**
+  core-validated: to the grammar and the evaluator they are ordinary
+  blocks (§5), and their placement and keys are owned by whichever plugin
+  claims them — the `ulite/android` plugin (ARCHITECTURE.md §5.2, and the
+  ownership note at the top of Appendix A).
+- `apply "NAME"` with no matching `convention NAME` is an error — the
+  evaluator reports it, and the LSP surfaces it as a semantic diagnostic.
 
 ---
 
@@ -528,6 +542,16 @@ Required diagnostic cases (each gets an assertion test in `ulb-lang`):
 ---
 
 ## Appendix A — `android {}`, `buildTypes {}`, `productFlavors {}`, `signing {}`
+
+> **Ownership note.** The tables in this appendix are *reference* material
+> for the plugin that owns these blocks; they are not a claim that the
+> core tool understands these keys. To the ulb grammar and evaluator,
+> `android {}`, `buildTypes {}`, `productFlavors {}`, and `signing {}` are
+> ordinary block statements (§5) whose contents resolve to a generic
+> `Value` block — the same as any other block. The `ulite/android` plugin
+> (ARCHITECTURE.md §5.2) claims these keys, validates and interprets them,
+> and publishes its own reference docs mirroring these tables. The core
+> parser and evaluator never interpret the keys inside them (§10).
 
 ### `android { ... }`
 
