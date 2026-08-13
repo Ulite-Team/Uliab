@@ -434,7 +434,13 @@ impl Parser {
         self.advance();
         let span = start.cover(str_span);
         match self.plain_string_text(&segments, str_span, "apply target") {
-            Some(name) => Statement::new(StatementKind::Apply { name }, span),
+            Some(name) => Statement::new(
+                StatementKind::Apply {
+                    name,
+                    name_span: str_span,
+                },
+                span,
+            ),
             None => Statement::new(
                 StatementKind::Invalid {
                     message: "apply target must be a plain string".to_owned(),
@@ -1030,10 +1036,11 @@ mod tests {
     #[test]
     fn parses_apply_statement() {
         let file = parse_ok(r#"apply "android-app""#);
-        let StatementKind::Apply { name } = &file.statements[0].kind else {
+        let StatementKind::Apply { name, name_span } = &file.statements[0].kind else {
             panic!("expected Apply");
         };
         assert_eq!(name, "android-app");
+        assert_eq!(*name_span, Span { start: 6, end: 19 });
     }
 
     #[test]

@@ -281,6 +281,9 @@ pub enum StatementKind {
     Apply {
         /// The convention name being applied.
         name: String,
+        /// Span of the target string literal (quotes included). This is
+        /// where hover and goto-definition act on an `apply` statement.
+        name_span: Span,
     },
     /// `path = value` (used in `libs.ulb` and version/bundle/plugin
     /// blocks).
@@ -466,6 +469,7 @@ mod tests {
             Statement::new(
                 StatementKind::Apply {
                     name: "android-app".to_owned(),
+                    name_span: span(6, 20),
                 },
                 span(0, 20),
             ),

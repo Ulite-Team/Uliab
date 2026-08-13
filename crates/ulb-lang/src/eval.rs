@@ -653,7 +653,7 @@ impl<'a> Evaluator<'a> {
                 };
                 tasks_map.insert(name.clone(), Value::Block(nested));
             }
-            StatementKind::Apply { name } => {
+            StatementKind::Apply { name, .. } => {
                 if let Some(block) = self.defs.conventions.get(name).cloned() {
                     self.eval_statements(&block.statements, target);
                 } else {
