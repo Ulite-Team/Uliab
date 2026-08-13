@@ -1,10 +1,15 @@
 # ulb — Architecture (ARCHITECTURE.md)
 
-System design for the ulb build tool, written before deep implementation so
-the design can be reviewed against the spec. GRAMMAR.md is the language
-spec; this document is how the pieces fit together.
+System design for the ulb build tool. GRAMMAR.md is the language spec;
+this document is how the pieces fit together.
 
-**Status:** draft for review (Phase 1). Written before any parser code.
+**Status:** revised design — the tool core is now target-agnostic. Java,
+Kotlin/JVM, Android, and Kotlin Multiplatform support are no longer built
+into the tool; they are official **plugins**, written in Rust, compiled
+once to WebAssembly, and distributed through Ulite Team's own plugin
+registry (never Gradle's, never Maven Central for plugin code). This is
+the single biggest architectural decision in the project so far — §3
+explains why and how.
 
 ---
 
@@ -12,22 +17,34 @@ spec; this document is how the pieces fit together.
 
 ### Goals
 
-1. Replace Gradle for the author's own multi-module Android / Kotlin
-   Multiplatform projects, with a declarative DSL whose control flow
-   (`if`/`else`, `env()`) is *native* — not simulated Kotlin execution.
-2. Ship a real task/variant/dependency engine under the DSL: parallel DAG
-   execution, flavor×buildType variant propagation, `api`/`implementation`
-   classpath correctness.
-3. Editor tooling as a day-one requirement: a tree-sitter grammar for
-   syntax presentation and an LSP built on the *same* typed AST the
+1. Replace Gradle for the author's own projects — plain Java, Kotlin/JVM,
+   Android, and Kotlin Multiplatform — using **one DSL and one core
+   engine** for all of them, with `if`/`else`/`env()` as native control
+   flow, not simulated Kotlin execution.
+2. Keep the core tool small, generic, and rarely-changing. Everything
+   that churns with the underlying ecosystems (a new AGP quirk, a new
+   Kotlin compiler flag, a new Android API level) lives in a plugin that
+   ships and versions independently — the core tool should almost never
+   need a release just because Android changed something.
+3. Ship a real task/variant/dependency engine: parallel DAG execution,
+   content-hash fingerprinting, and (where a plugin declares them)
+   variant propagation and classpath rules — engine-level concerns the
+   core provides as *services* plugins call into, not concerns the core
+   hardcodes per target.
+4. Editor tooling as a day-one requirement: a tree-sitter grammar for
+   syntax presentation and an LSP built on the same typed AST the
    evaluator uses, so semantic diagnostics always match real evaluation
    behavior.
 
 ### Non-goals (this pass)
 
 - No Gradle/`.kts` compatibility layer, no Kotlin-scripting bridge, no
-  `kotlinc` dependency in the tool itself.
-- No third-party plugin ecosystem; only conventions the author writes.
+  `kotlinc`-as-a-DSL-interpreter anywhere (kotlinc/javac/d8/aapt2 are
+  still invoked as external compiler *tools* by plugins — see §3.5 — just
+  never to interpret build configuration).
+- No third-party (non-Ulite-Team) plugin ecosystem yet — the plugin
+  *mechanism* is generic and could load anyone's plugin, but the plugin
+  *registry* only carries Ulite Team's own official plugins for now.
 - No general "any Android project" compatibility.
 - No remote/shared build cache (design leaves room for one).
 - No publishing (no maven-publish equivalent).
@@ -37,427 +54,497 @@ spec; this document is how the pieces fit together.
 
 ## 2. Repositories and crates
 
+Four repositories under `Ulite-Team`:
+
 | Repo | Contains | Role |
 |---|---|---|
-| `Ulite-Team/Uliab` | `ulb-lang` crate, `uliab` CLI (later), `GRAMMAR.md`, `ARCHITECTURE.md` | core |
-| `Ulite-Team/tree-sitter-ulb` | `grammar.js`, `highlights.scm`, `folds.scm`, `indents.scm` | editor syntax presentation |
-| `Ulite-Team/ulb-lsp` | `ulb-lsp` binary | LSP server |
+| `Uliab` | `ulb-lang` crate, `uliab` CLI, plugin host + task engine, `GRAMMAR.md`, `ARCHITECTURE.md` | target-agnostic core |
+| `tree-sitter-ulb` | `grammar.js`, `highlights.scm`, `folds.scm`, `indents.scm` | editor syntax presentation |
+| `ulb-lsp` | `ulb-lsp` binary | LSP server |
+| `ulb-plugins` | `jvm`, `android`, `kmp` plugin crates + the plugin registry index | official target plugins |
 
 ```
-┌─────────────────────────────── Uliab ───────────────────────────────┐
-│  ulb-lang  (lib crate)                                               │
-│  ┌────────┐  ┌────────┐  ┌─────────┐  ┌────────────┐               │
-│  │ lexer  │→ │ parser │→ │   AST   │→ │ evaluator  │ → ModuleModel │
-│  └────────┘  └────────┘  └─────────┘  └────────────┘               │
-│  (spans, error recovery)        (tree-walker, side-effect-free)     │
-│                                                                     │
-│  uliab CLI (later phase) — task engine, resolver, build pipeline    │
-└─────────────────────────────────────────────────────────────────────┘
-         │                                  │
-         │ path dep                         │ depends on GRAMMAR.md
-         ▼                                  ▼ (read-only reference)
-┌─────────────────┐              ┌─────────────────────┐
-│  ulb-lsp        │              │  tree-sitter-ulb    │
-│  tower-lsp      │              │  grammar.js + scm   │
-│  reuses parser  │              │  presentation only  │
-└─────────────────┘              └─────────────────────┘
+┌─────────────────────────────── Uliab ────────────────────────────────┐
+│  ulb-lang  (lib crate — unchanged by this redesign)                  │
+│  ┌────────┐  ┌────────┐  ┌─────────┐  ┌────────────┐                │
+│  │ lexer  │→ │ parser │→ │   AST   │→ │ evaluator  │ → generic Value │
+│  └────────┘  └────────┘  └─────────┘  └────────────┘   module model  │
+│                                                                       │
+│  uliab CLI: plugin host + task engine + resolver + fingerprinting    │
+│  — has ZERO hardcoded knowledge of "android", "compileSdk", APKs,    │
+│    dex, manifests, or KSP. All of that lives in a plugin (§3).       │
+└────────────────────────────────────────────────────────────────────┘
+    │ path dep         │ loads *.wasm at runtime, sandboxed (§3.4)
+    ▼                  ▼
+┌─────────────────┐   ┌─────────────────────────────────────────┐
+│  ulb-lsp        │   │  ulb-plugins/{jvm,android,kmp}           │
+│  reuses parser  │   │  Rust source → compiled once to .wasm    │
+└─────────────────┘   │  published to the Ulite Team registry    │
+                       └─────────────────────────────────────────┘
+┌─────────────────────┐
+│  tree-sitter-ulb    │  (depends on GRAMMAR.md conceptually only)
+│  presentation only  │
+└─────────────────────┘
 ```
 
-Dependency direction: `ulb-lang` is a standalone library with **zero**
-CLI/build-tool dependencies. `ulb-lsp` depends on `ulb-lang` via path
-during development (published/vendored once versioning exists).
-`tree-sitter-ulb` depends on `GRAMMAR.md` conceptually only — it is kept in
-sync by hand (see §11).
+**Why this doesn't touch `ulb-lang` at all:** the evaluator already
+resolves `android { compileSdk 37 }` into a *generic* nested `Value::Block`
+— it never hardcoded a `compileSdk: u32` field anywhere. The DSL's
+"contextual identifiers" design (GRAMMAR.md §4: `android`, `buildTypes`,
+`compileSdk`, … are plain identifiers, not reserved words) means the
+language was already plugin-friendly before this redesign existed; this
+document is about who gets to *assign meaning* to those keys downstream,
+not about reworking the parser/evaluator.
 
 ---
 
-## 3. `ulb-lang` crate
+## 3. The plugin system
 
-### 3.1 Lexer
+### 3.1 What moves out of the core
 
-- Token stream with `SourceSpan` (byte range) on every token.
-- Tokens: `IDENT`, `NUMBER`, `STRING`, `BOOL`, reserved words, symbols
-  (`{ } ( ) [ ] = , . @ ! == != < <= > >= && ||`), comments (kept as
-  tokens for LSP tokenization, ignored by the parser).
-- String lexing tracks `${`...`}` interpolation nesting (GRAMMAR.md §3).
+Everything in the old §5, §7, §8, §9 (variant matrix, KMP source-set
+hierarchy, manifest merging, KSP) and the Android-specific parts of the
+old §3.5's `ModuleModel` (an `android`/`buildTypes`/`flavors` field) is
+**not core tool knowledge anymore**. The core only ever produces the
+generic `Value::Block` the evaluator already builds (`eval.rs`); a plugin
+is the thing that looks at `top["android"]`, decides what the keys inside
+it mean, and turns them into tasks.
 
-### 3.2 Parser
+What the core *does* keep, because it's genuinely target-agnostic:
 
-- Hand-written recursive descent; no parser-generator dependency.
-- Dispatches per GRAMMAR.md §5.1 — every choice decided by current token
-  or one-token lookahead.
-- **Never fail-fast:** produces a partial AST plus diagnostics on malformed
-  input (panic-mode, token-level recovery to the next statement start).
-  Recovered nodes are marked `invalid`. Deterministic: same input →
-  same AST + diagnostics. This is the single most important requirement
-  for the LSP, which parses live, mid-edit source.
-- Diagnostic type carries `file:line:col` span, severity, message.
-  Rendered text: `file:line:col: error: <message>` (GRAMMAR.md §11).
+- The DSL itself (lexer/parser/evaluator, unchanged).
+- The task DAG engine: topological + parallel scheduling, fingerprinting,
+  UP-TO-DATE caching (old §4 — a plugin *registers* tasks into this
+  engine; the engine doesn't know or care what a task's `run` action is).
+- The Maven dependency resolver (`deps { implementation "..." }` — POM
+  fetching, transitive resolution, `api`/`implementation` classpath
+  visibility rules) — every JVM-family plugin (jvm/android/kmp) needs the
+  same resolver, so it stays core rather than being reimplemented three
+  times.
+- The plugin host itself (§3.3–§3.5) and the plugin registry client
+  (§3.6).
 
-### 3.3 AST
+### 3.2 A plugin, concretely
 
-- Typed, spans on every node, exactly one node type per grammar rule.
-- Owned by `ulb-lang`; no internals leaked. Public types are documented
-literal:  with rustdoc and doc-tests.
+A plugin is a Rust crate compiled to a `.wasm` module (target
+`wasm32-wasip2` — see §3.4 for why WASM specifically) that implements a
+small, fixed set of host-callable entry points:
 
-### 3.4 Evaluator
+```rust
+// Illustrative shape of the plugin ABI's Rust-side trait — the actual
+// wasm boundary is the C-ABI-ish export list in §3.4, this is what a
+// plugin author writes against via a `ulb-plugin-sdk` crate that hides
+// the wasm/FFI plumbing.
+pub trait UlbPlugin {
+    /// e.g. "android", version "1.4.0" — checked against the tool's
+    /// plugin-ABI version (§3.7) before the plugin is loaded at all.
+    fn manifest(&self) -> PluginManifest;
 
-- Tree-walking interpreter over the AST. Resolves `convention`/`apply`,
-  `fn` helpers, `env()`/`props()` builtins, version catalog references,
-  `if`/`else`; produces a `ModuleModel`.
-- Deterministic and side-effect-free except `env()`/`props()`.
-- Errors are span-attached compile-time-style errors (unknown convention,
-  unknown alias, type mismatch, missing env var) — never silent fallback.
-- Role validation per GRAMMAR.md §10 (which statements are legal in which
-  file role).
-
-### 3.5 ModuleModel (evaluation output)
-
-Per-module resolved configuration, ready for the task engine:
-
-```
-ModuleModel
-├── module: ModuleName            (from settings.ulb module list)
-├── plugins: [PluginRef]          (from libs.ulb plugins {} + build.ulb plugin "")
-├── android: AndroidConfig        (Appendix A of GRAMMAR.md)
-├── buildTypes: {name → BuildTypeConfig}
-├── flavors: {name → FlavorConfig}, dimensions: [String]
-├── signing: SigningConfig        (resolved from env()/props())
-├── deps:
-│   ├── module: {scope → [Dep]}           api/implementation/...
-│   └── sourceSets: {name → {scope → [Dep]}}   commonMain.deps, androidMain.deps...
-├── tasks: {name → TaskDef}       (dependsOn, run actions)
-├── conventionsApplied: [String]
-└── source: SourceSpan             (where this model came from)
+    /// Given the module's resolved config block (e.g. `top["android"]`,
+    /// `top["buildTypes"]`) and the already-resolved dependency graph,
+    /// validate the keys this plugin owns and register tasks + their
+    /// inputs/outputs/dependsOn edges into the task DAG. This is the
+    /// plugin's only way to affect the build — it cannot run arbitrary
+    /// code outside the actions in §3.5.
+    fn configure(&self, module: &ModuleConfig, host: &mut TaskRegistrar) -> Result<(), PluginError>;
+}
 ```
 
-The `ModuleModel` is the contract between the evaluator and every
-downstream consumer (task engine, variant resolver, classpath builder).
+A plugin does **not** get a raw filesystem/network/process handle. It
+gets `host: &mut TaskRegistrar` — a narrow, capability-based API for:
+registering a task with a set of *declared* inputs/outputs (for
+fingerprinting) and a *declared* action (§3.5: run an allowlisted
+external tool with an argument list the plugin computes, or a `copy`),
+and reading specific already-resolved values out of `ModuleConfig`
+(resolved classpaths, resolved deps, the generic config `Value` tree).
+This mirrors the DSL's own "closed action set" philosophy (GRAMMAR.md
+§7) at the plugin layer: a plugin can be *wrong*, but it can't be
+*unsafe* in ways the host didn't explicitly allow.
+
+### 3.3 How a plugin gets applied
+
+`libs.ulb`'s existing `plugins {}` syntax (GRAMMAR.md §6.4 — this needed
+**no grammar change**, only a semantic reinterpretation) now names an
+Ulite Team plugin, not a Maven/AGP coordinate:
+
+```
+plugins {
+  android = "ulite/android" @ "1.4.0"
+  kotlinJvm = "ulite/kotlin-jvm" @ "2.1.0"
+}
+```
+
+`build.ulb`'s existing `plugin "alias"` pair statement (GRAMMAR.md
+Appendix C) applies one:
+
+```
+plugin "android"
+```
+
+At evaluation time this is still just a `Pair` in the generic `Value`
+tree, exactly as before (`top["plugin"] = Value::Str("android")` or a
+`Value::List` if repeated — see `eval.rs`'s accumulate rule). The *tool*
+(not the evaluator) reads that list after evaluation, resolves each name
+against `libs.ulb`'s `plugins {}` table to get a registry coordinate +
+version, and loads the corresponding plugin (§3.6) before building the
+task DAG.
+
+### 3.4 Why WebAssembly, not a native `.so`/`.dylib`
+
+This was the open design question worth being explicit about (flagged
+for confirmation, not a silent pick):
+
+- **No ABI drift.** Rust has no stable ABI across compiler versions —a
+  plugin compiled with one `rustc` and a tool built with a different one
+  is undefined behavior if loaded as a native `dylib` via `extern "C"`.
+  WASM's binary format is stable regardless of which Rust version
+  produced it; a plugin published once keeps working as the core tool's
+  own toolchain moves forward.
+- **"Not compiled, understood by the tool" is literal, not aspirational.**
+  The plugin author compiles once (`cargo build --target wasm32-wasip2`)
+  when they publish it. Every user of the tool just *runs* that
+  already-compiled artifact through an embedded WASM runtime
+  (`wasmtime`) — no local Rust toolchain, no per-user compilation step,
+  near-native execution speed (WASM is a compiled bytecode format, not
+  an interpreted scripting language — this is why plugin execution is
+  "Rust speed", genuinely, not just Rust-flavored).
+- **Sandboxing for free.** A `.wasm` module has no ambient filesystem,
+  network, or process access unless the host explicitly grants it via
+  WASI capabilities. This is what makes the capability-based
+  `TaskRegistrar` API (§3.2) enforceable rather than just a convention a
+  well-behaved plugin follows — a misbehaving or compromised plugin
+  physically cannot reach outside what it was granted.
+- **Cross-platform for free.** The same `.wasm` artifact runs unmodified
+  on Amr's Linux/Hyprland machine and on any future CI runner — no
+  per-platform plugin builds to publish or cache.
+
+Trade-off worth naming honestly: calling into WASM has real (small)
+overhead versus a native `dylib` call, and a plugin cannot itself spawn
+arbitrary subprocesses — every external tool invocation (`kotlinc`,
+`javac`, `d8`, `aapt2`) has to go through a host-provided "run this
+allowlisted tool with these arguments" capability (§3.5), which is
+slightly more ceremony for plugin authors than `std::process::Command`
+would be. Both trade-offs are accepted as the right price for ABI
+stability and sandboxing.
+
+### 3.5 External toolchain invocation
+
+Plugins still need `kotlinc`, `javac`, `d8`, `aapt2`, KSP, etc. — these
+are not reimplemented in Rust/WASM. The host exposes exactly one relevant
+capability:
+
+```rust
+fn run_tool(&mut self, tool: AllowlistedTool, args: Vec<String>, cwd: &Path)
+    -> Result<ToolOutput, PluginError>;
+```
+
+`AllowlistedTool` is a closed enum the *core* defines and a plugin
+manifest must declare which tools it needs (checked at load time, so a
+plugin can't silently start invoking something new after being
+installed). The plugin computes *what* to run (e.g. every `kotlinc` flag
+for a given module + variant); the host actually spawns the process. This
+is the same "plugin decides, host executes" split as `TaskRegistrar`
+(§3.2) and mirrors the DSL's own `copy`/`exec` design (GRAMMAR.md
+Appendix C) one layer up.
+
+### 3.6 Plugin registry & resolution
+
+- A plugin coordinate (`"ulite/android"` in the example above) resolves
+  against `ulb-plugins/registry/index.json` (or similar — format TBD,
+  not yet built) in the `ulb-plugins` repo: `name → { versions: [...],
+  download_url_per_version }`, mirroring how `libs.ulb`'s Maven
+  coordinates resolve against Maven repos, but *never touching* Maven
+  Central, Google Maven, or the Gradle Plugin Portal.
+- Local plugin cache: `~/.cache/uliab/plugins/<name>/<version>/plugin.wasm`
+  — checked first; the tool only fetches from the registry on a cache
+  miss. This directly parallels the existing Maven artifact cache design
+  (old §10.2) but is a fully separate cache root — plugin artifacts and
+  Maven artifacts are never comingled.
+- **Version compatibility & fallback** (this reuses a decision already
+  made for the `build-engine` project's plugin SDK, applied here): each
+  plugin declares which core plugin-ABI version range it targets. If the
+  installed tool is newer than a plugin's declared range, the tool keeps
+  using the plugin's last-known-compatible build rather than forcing an
+  upgrade or refusing to build — a plugin update is opt-in, not forced by
+  a core tool update. This is the concrete mechanism behind "the tool
+  won't break easily" (from the request that prompted this redesign): the
+  core's own release cadence and a given project's plugin versions are
+  fully decoupled.
+
+### 3.7 Plugin-ABI versioning
+
+The `UlbPlugin` trait (§3.2) and the `TaskRegistrar`/`run_tool`
+capability surface (§3.2, §3.5) together are "the plugin ABI." It is
+versioned independently of the core tool's own version (semver, with the
+compatibility/fallback behavior from §3.6). Growing the ABI (a new
+capability, a new field on `ModuleConfig`) is additive-only within a
+major version; anything else is a major-version bump, which is exactly
+the kind of change that should be rare precisely because plugins — not
+the core — absorb almost all day-to-day churn (§1 goal 2).
 
 ---
 
 ## 4. Task graph & execution engine
 
-Tasks are first-class graph nodes: `clean`, `test`, `lint`, `assemble`,
-`bundle` (AAB), plus user-defined `task "name"` from `build.ulb`.
+Unchanged from before this redesign, except tasks are now always
+*plugin-registered* rather than ever core-hardcoded — `clean`/`test`
+etc. are conventions plugins are expected to register under, not special
+cases the engine knows about.
 
 ### 4.1 Model
 
 - **Task** = name, module, inputs (file set + content-hash fingerprints),
-  outputs (file set), dependencies (edges), run actions (closed action
-  set: `copy`, allowlisted `exec`).
-- The **task graph** is the transitive closure of `dependsOn` edges across
-  all modules. Edges are directed, acyclic (cycle = resolution error with
-  the cycle path in the message).
+  outputs (file set), dependencies (edges), a run action from the closed
+  set the engine understands: `copy`, `run_tool` (§3.5) with an
+  allowlisted tool + args.
+- The **task graph** is the transitive closure of `dependsOn` edges
+  across all modules and all plugins active on those modules. Edges are
+  directed, acyclic (cycle = resolution error with the cycle path in the
+  message).
 
-### 4.2 Execution model (decided: topo + parallel + fingerprinting)
+### 4.2 Execution model (topo + parallel + fingerprinting)
 
 1. **Topological order** over the full task DAG.
 2. **Parallelism:** independent branches (no dependency relationship) run
-   concurrently. Concurrency is bounded by a worker pool sized to
-   `nproc`. Scheduling is deterministic: the DAG is partitioned into
-   waves; within a wave, task order is stable (declaration order) so
-   builds are reproducible.
+   concurrently, bounded by a worker pool sized to `nproc`. The DAG is
+   partitioned into waves; within a wave, task order is stable
+   (declaration order) so builds are reproducible.
 3. **UP-TO-DATE:** a task is skipped iff every input fingerprint matches
-   the recorded fingerprints of the last successful run (see §10) and all
-   of its dependencies ran UP-TO-DATE. Otherwise it runs and records new
-   fingerprints.
-4. **Failure semantics:** a failing task marks the build failed; dependents
-   are not started; already-scheduled independent tasks continue to
-   completion (their outputs remain valid). No partial-success reporting.
-
-### 4.3 Task run actions
-
-The `run {}` body is a closed set of built-in actions (`copy`, allowlisted
-`exec`) — no arbitrary code. `copy(from=..., to=...)` and
-`exec(command=..., args=[...])` execute as part of the task, inside a
-sandboxed working directory per module.
+   the recorded fingerprints of the last successful run (§?.? below) and
+   all of its dependencies ran UP-TO-DATE.
+4. **Failure semantics:** a failing task marks the build failed;
+   dependents are not started; already-scheduled independent tasks
+   continue to completion. No partial-success reporting.
 
 ---
 
-## 5. Build variants
+## 5. What the official plugins each own
 
-### 5.1 Variant matrix
+This section replaces the old hardcoded §5/§7/§8/§9 — it now describes
+what `ulb-plugins/jvm`, `ulb-plugins/android`, and `ulb-plugins/kmp` are
+each *responsible for designing and shipping*, not core-tool behavior.
+Each plugin publishes its own reference doc (mirroring GRAMMAR.md
+Appendix A's tables, but plugin-owned) describing exactly which keys it
+understands inside the blocks it claims.
 
-A variant = one build type × one flavor per dimension. With
-`dimension "tier"` and flavors `free`/`paid`, and build types
-`debug`/`release`, the matrix is `freeDebug`, `freeRelease`, `paidDebug`,
-`paidRelease`. A flavor block may declare which dimension it belongs to
-(GRAMMAR.md Appendix A); a variant is valid iff it contains exactly one
-flavor per declared dimension.
+### 5.1 `ulite/jvm` — plain Java & Kotlin/JVM
 
-Variant names follow `{flavor}{BuildType}` (e.g. `paidRelease`); the
-"default" variant (no flavors) is just `debug`/`release`.
+- Owns: compiling `.java`/`.kt` sources with `javac`/`kotlinc` (via
+  `run_tool`, §3.5), packaging a `.jar`, registering `compile`/`test`/
+  `assemble` tasks.
+- Owns the `api`/`implementation`/`runtimeOnly`/`compileOnly`/`ksp`/
+  `testImplementation` dependency-scope *semantics* on top of the core
+  resolver's already-generic `deps {}` parsing (GRAMMAR.md Appendix B —
+  the DSL syntax for these scopes is core/shared; what each scope *means*
+  for a classpath is jvm-plugin behavior, reused by android/kmp below).
+- Owns KSP invocation (generate → compile → package ordering) — KSP is a
+  Kotlin-ecosystem concern, not an Android-specific one, so it lives here
+  and `ulite/android` depends on `ulite/jvm` to get it rather than
+  reimplementing it.
 
-### 5.2 Per-variant source sets
+### 5.2 `ulite/android` — depends on `ulite/jvm`
 
-Source sets layer over `src/main/kotlin`:
+- Owns everything under `android {}`, `buildTypes {}`, `productFlavors
+  {}`, `signing {}` (the old GRAMMAR.md Appendix A tables move to this
+  plugin's own docs — GRAMMAR.md itself no longer claims these keys as
+  core language, see the note at the top of that document's Appendix A).
+- Owns the variant matrix (build type × flavor dimensions), per-variant
+  source-set layering, and down-module variant propagation — the old §5
+  content, now android-plugin-owned logic that calls into the *core*
+  task engine (§4) the same way any other plugin does.
+- Owns manifest merging (old §8) and dex/APK/AAR packaging via `aapt2`/
+  `d8` (`run_tool`).
+- Declares a dependency on `ulite/jvm` in its own plugin manifest (§3.2)
+  so the tool loads both and `ulite/android` can call into `ulite/jvm`'s
+  registered compile tasks rather than re-implementing compilation.
 
-```
-src/main/kotlin
-src/{variant}/kotlin            (e.g. src/paidRelease/kotlin)
-src/{flavor}/kotlin             (e.g. src/paid/kotlin)
-src/{buildType}/kotlin          (e.g. src/release/kotlin)
-```
+### 5.3 `ulite/kmp` — depends on `ulite/jvm`, optionally `ulite/android`
 
-Precedence (lowest → highest): `main` < `flavor` < `buildType` <
-`variant`. The same layering applies to `res`, `AndroidManifest.xml` (see
-§8), and `assets`.
-
-### 5.3 Down-module variant propagation
-
-When an app module is built for `paidRelease`, its library dependencies
-must build for `release` (not `debug`). Rules:
-
-- Propagate the **build type** down module edges (libraries have no
-  flavors of their own by default).
-- A library may itself declare flavors; then the app's flavor selection
-  is matched by **flavor name** across dimensions, and build type by
-  build type. Unmatched combinations are a resolution error naming both
-  variants.
-- The propagation is computed as part of variant resolution *before*
-  any task is scheduled: each (module × variant) pair is a first-class
-  node in the build plan.
+- Owns the KMP source-set hierarchy (old §7): `commonMain` →
+  `androidMain`/`iosMain`/`desktopMain`/…, default hierarchy matching
+  Kotlin's published defaults or an explicit one declared in `build.ulb`.
+- Owns per-source-set `deps {}` scoping (`commonMain.deps { }` — DSL
+  syntax already exists per GRAMMAR.md §6.4; resolving which deps are
+  visible to which platform source set is `ulite/kmp` behavior).
+- For a KMP module's Android target specifically, delegates to
+  `ulite/android`; for other native targets (iOS, desktop), delegates to
+  whatever future plugins own those toolchains (not designed yet —
+  explicitly out of scope this pass, same as the old document's stance).
 
 ---
 
-## 6. Multi-module dependency graph
+## 6. Multi-module dependency graph (core)
+
+Unchanged and still core, because every plugin needs it:
 
 ### 6.1 Graph model
 
-`settings.ulb` declares the module list; each `build.ulb`'s
-`deps {}` block declares project-module dependencies (syntax for module
-references in `deps {}` is deferred to the module-graph phase — the
-`ModuleModel.deps` shape already carries them).
+`settings.ulb` declares the module list; each `build.ulb`'s `deps {}`
+block declares project-module dependencies (module-reference syntax
+inside `deps {}` is still deferred — the resolver's internal shape
+already accommodates it, same status as before this redesign).
 
-### 6.2 `api` vs `implementation` classpath rules
+### 6.2 `api` vs `implementation` classpath rules (core resolver, jvm-family-wide)
 
 - **`implementation`** dependencies of a module appear on that module's
-  compile classpath and runtime classpath, but **not** on the compile
-  classpath of its consumers.
-- **`api`** dependencies appear on the module's compile/runtime classpath
-  *and* are transitively visible on consumers' compile classpath.
-- The compile classpath of a module = module deps (`api`+`implementation`)
-  + transitively all `api` edges of those deps. The runtime classpath =
-  transitive closure of `api`+`implementation` (with conflict resolution,
-  see §10.3).
+  compile/runtime classpath but not on consumers' compile classpath.
+- **`api`** dependencies are transitively visible on consumers' compile
+  classpath too.
+- Compile classpath = module deps (`api`+`implementation`) + transitively
+  all `api` edges of those deps. Runtime classpath = transitive closure
+  of `api`+`implementation` (conflict resolution: highest version wins,
+  §10.3 below).
+- This lives in the *core* resolver (not a plugin) because `ulite/jvm`,
+  `ulite/android`, and `ulite/kmp` all need identical classpath-visibility
+  semantics — duplicating it per plugin would be exactly the kind of
+  churn-multiplier this redesign exists to avoid.
 
 ### 6.3 Parallel independent branches
 
-Module subtrees with no dependency relationship are scheduled in parallel
-by the task engine (§4.2). The module graph is computed as a DAG
-(cycle → error with path), and the task DAG is derived from it.
+Module subtrees with no dependency relationship are scheduled in
+parallel by the task engine (§4.2).
 
 ---
 
-## 7. KMP source-set hierarchy
+## 7. Dependency resolution, repositories & cache (core)
 
-Source sets form a tree, mirroring Kotlin's default hierarchy:
+### 7.1 Maven repositories (unchanged)
 
-```
-commonMain
-├── androidMain
-├── iosMain
-└── desktopMain
-```
+- Built-in defaults: Google Maven then Maven Central.
+- `settings.ulb` `repositories { maven "url" }` entries are additive,
+  tried in declared order before falling back to defaults.
+- This is entirely separate from **plugin** resolution (§3.6), which
+  never touches Maven — two independent coordinate spaces, two
+  independent caches, on purpose (a compromised or malformed Maven repo
+  should never be able to serve something the tool loads as a plugin).
 
-- The default hierarchy matches Kotlin's published defaults; an explicit
-  hierarchy can be declared in `build.ulb` (syntax deferred to the phase
-  that implements KMP support — the `ModuleModel.sourceSets` field is
-  already shaped for it).
-- `deps {}` can be scoped per source set: `commonMain.deps { ... }`,
-  `androidMain.deps { ... }` (GRAMMAR.md §6.4). Resolution rules follow
-  the hierarchy: a dep declared on `commonMain` is visible to all
-  platform source sets; a platform-scoped dep is visible only there.
-- Compilation: each leaf source set compiles against its ancestors'
-  outputs + deps; platform code sees common + platform deps, never a
-  sibling platform's.
+### 7.2 Maven artifact cache layout
 
----
+- Default: `~/.cache/uliab/modules`, content-addressed, independent of
+  Gradle's layout.
+- `lspCompat true` (opt-in, `settings.ulb`): additionally hardlinks
+  resolved artifacts into Gradle's cache path for LSPs that expect it
+  (e.g. `kmp-lsp`) — no storage duplication, Gradle's layout never
+  becomes the source of truth.
 
-## 8. Manifest merging
+### 7.3 Conflict resolution
 
-For Android application/library modules, real manifest merging across
-dependencies and variants, using AGP's precedence rules for the common
-cases:
-
-1. The **application** module's manifest wins over library manifests.
-2. **Variant** manifest overlays **main** (`src/{variant}/AndroidManifest.xml`
-   over `src/main/AndroidManifest.xml`).
-3. Library manifests merge attributes/elements into the app manifest;
-   conflicting explicit values are an error (no silent override) unless
-   declared with a `tools:replace`-equivalent construct.
-4. `minSdk`/`targetSdk`/`package` mismatches between modules are
-   validation errors.
-
-Manifest merging is a later phase; the pipeline reserves the stage (see
-§12).
-
----
-
-## 9. KSP / annotation processing
-
-Compose and Room depend on KSP, so the compile pipeline needs a KSP step:
-
-- `ksp(...)` dependencies (GRAMMAR.md Appendix B) form an
-  annotation-processor classpath.
-- Pipeline per module+variant: **generate** (run KSP) → **compile**
-  (kotlinc) → **package**. KSP outputs are inputs to compilation.
-- KSP runs *before* compilation of the same module and *after* its
-  project dependencies have been compiled (their generated sources are
-  available).
-- Invokes the KSP compiler plugin as an external tool (this is the one
-  place the pipeline shells out to the Kotlin ecosystem); the DSL itself
-  never exposes arbitrary execution.
-
----
-
-## 10. Dependency resolution, repositories & cache
-
-### 10.1 Repositories
-
-- Built-in defaults: **Google Maven** then **Maven Central**.
-- `settings.ulb` `repositories { maven "url" }` entries are **additive**,
-  tried in declared order *before* falling back to defaults (spec §12).
-
-### 10.2 Cache layout
-
-- Default artifact cache: `~/.cache/uliab/modules`, structured for
-  content-addressed lookups (group/artifact/version + resolved files).
-  Fully independent of Gradle's layout.
-- **`lspCompat true`** (settings.ulb, opt-in): resolved artifacts are
-  additionally **hardlinked** into
-  `~/.gradle/caches/modules-2/files-2.1/...` so LSPs that expect Gradle's
-  layout (e.g. kmp-lsp) can find them — no storage duplication, Gradle's
-  layout never becomes the source of truth. (Hardlink = one inode, two
-  directory entries; falls back to symlink/copy where filesystem forbids
-  hardlinks, logged as a warning.)
-
-### 10.3 Conflict resolution
-
-Same group:artifact with different versions → highest version wins
+Same `group:artifact` at different versions → highest version wins
 (declared constraint order on tiebreak); conflicts are recorded as info
-diagnostics. Exact conflicts between declared versions are surfaced, not
-silently downgraded.
+diagnostics, never silently downgraded.
 
 ---
 
-## 11. Editor tooling: tree-sitter vs LSP
+## 8. Editor tooling: tree-sitter vs LSP
 
-The split is deliberate:
+Unchanged by this redesign — plugins affect what the *evaluator's
+output* means, not the syntax grammar or the LSP's use of the AST.
 
 | Concern | Owner |
 |---|---|
 | syntax highlighting, folding, indentation, structural editing | `tree-sitter-ulb` |
 | parse + semantic diagnostics, hover, goto-definition, completion | `ulb-lsp` |
 
-The LSP does **not** use tree-sitter for analysis. It walks the same typed
-AST + spans from `ulb-lang` that the evaluator uses, so semantic
-diagnostics (unknown convention, unknown alias, unknown variant) are
-guaranteed to match what evaluation would do — the LSP is a live preview
-of the evaluator, not a parallel implementation.
+The LSP does **not** use tree-sitter for analysis; it walks the same
+typed AST + spans from `ulb-lang` the evaluator uses. One consequence of
+this redesign worth flagging: some semantic diagnostics (e.g. "unknown
+key inside `android {}`") now depend on which plugin's manifest is
+active for a given `build.ulb`, not on a fixed core table — `ulb-lsp`
+will need to load the same plugin manifests (not the full WASM
+execution, just the declared-keys metadata from §3.2's `manifest()`) to
+offer that specific diagnostic. Not designed in detail yet; noted here so
+it isn't lost.
 
-### 11.1 `ulb-lsp` (tower-lsp, tokio)
-
-Day-one capabilities (skeleton in Phase 5, full set per spec §5):
-
-- **Diagnostics:** parse errors (as-you-type via
-  `textDocument/didChange`, re-parse with the error-recovering parser);
-  unknown convention / unknown alias / unknown identifier; unknown variant
-  (flavor×buildType combination that does not exist); deprecation warnings
-  (yellow squiggle pointing at the newer version when a referenced
-  convention/plugin is deprecated).
-- **Hover:** resolved value of a `libs.ulb` alias (actual
-  group:artifact:version); resolved convention contents on `apply "name"`.
-- **Go-to-definition:** `apply "android-app"` → the `convention
-  android-app { }` block in `conventions.ulb`; alias references →
-  `libs.ulb`.
-- **Completion:** convention names, library aliases, DSL keywords, and
-  block-scoped valid keys (inside `android {}` only android keys).
-
-Deprioritized (future, not built this pass): rename-symbol, find-all-
-references across large workspaces, semantic tokens beyond basic
-tree-sitter highlighting.
-
-### 11.2 Grammar sync-by-hand risk (known tradeoff)
+### 8.1 Grammar sync-by-hand risk (unchanged)
 
 `tree-sitter-ulb/grammar.js` is maintained by hand against
-`Uliab/GRAMMAR.md` — there is no generated shared source of truth. This is
-accepted for this pass (spec §4). Mitigations:
-
-- GRAMMAR.md is written specifically to be mechanically portable (§8 of
-  GRAMMAR.md), so drift is cheap to detect.
-- Any grammar change in `Uliab` produces a `PROGRESS.md` entry in
-literal:  `tree-sitter-ulb` (and vice versa).
-- The `tree-sitter-ulb` test suite parses the same example files as
-  `ulb-lang`'s snapshot tests, so a mismatch fails loudly.
+`Uliab/GRAMMAR.md`. Mitigations unchanged from before: GRAMMAR.md is
+written for mechanical portability (GRAMMAR.md §8); a grammar change in
+literal:one repo produces a `PROGRESS.md` entry in the others; the
+`tree-sitter-ulb` test suite parses the same example files as
+`ulb-lang`'s snapshot tests.
 
 ---
 
-## 12. End-to-end build pipeline
+## 9. End-to-end build pipeline
 
 ```
 1. Parse+eval settings.ulb         → project name, modules, repos, lspCompat
-2. Parse+eval libs.ulb             → version catalog (aliases, bundles, plugins)
+2. Parse+eval libs.ulb             → version catalog + plugin coordinates
 3. Parse+eval conventions.ulb      → convention + fn tables
-4. For each module: parse+eval build.ulb → ModuleModel (apply, if/env, props)
-5. Validate role rules (GRAMMAR.md §10) + cross-module references
-6. Compute variant matrix (build types × flavors), validate
-7. Propagate variants down module edges (§5.3)
-8. Build module graph, apply api/implementation classpath rules (§6)
-9. Resolve external deps against repos → cache (+ optional lspCompat links)
-10. Derive task DAG; fingerprint inputs; schedule waves (topo, parallel, UP-TO-DATE)
-11. Per module+variant: KSP generate → compile → package; manifest merge (§8)
-12. assemble/bundle outputs; record fingerprints for next build
+4. For each module: parse+eval build.ulb → generic Value module model
+5. Resolve `plugin "..."` references against libs.ulb's plugins {} table
+6. Load each referenced plugin (cache hit, or fetch from the registry — §3.6)
+7. Each plugin's configure() validates its owned keys in the module model
+   and registers tasks into the core task engine (§3.2, §4)
+8. Resolve external Maven deps against repos → cache (§7) — core, shared
+   by every plugin active on the module
+9. Derive the full task DAG (§4); fingerprint inputs; schedule waves
+10. Execute: each task's action runs via `run_tool`/`copy` (§3.5) inside
+    a sandboxed working directory
+11. Record fingerprints for the next build
 ```
 
-Steps 1–9 are the "configuration phase" (deterministic, side-effect-free
-except cache reads/writes). Steps 10–12 are the "execution phase".
+Steps 1–8 are the "configuration phase" (deterministic, side-effect-free
+except cache reads/writes and plugin-loading I/O). Steps 9–11 are the
+"execution phase." This is the same two-phase shape as before the
+redesign; what changed is that steps 5–8 didn't exist as *core*
+responsibilities before (they were folded into hardcoded Android logic).
 
 ---
 
-## 13. Fingerprinting & UP-TO-DATE caching
+## 10. Fingerprinting & UP-TO-DATE caching (core)
 
 - Every `.ulb` file is content-hashed (SHA-256) at configuration time.
-- A task's **input fingerprint** = hash of (its module's resolved
-  `ModuleModel` + every `.ulb` file it depends on through conventions/
-  catalog + the resolved dependency graph + its file inputs + the
-  compiler/plugin versions). Content-addressed, not timestamp-based.
-- Outputs are recorded with the fingerprint that produced them; a task is
-  UP-TO-DATE when its current input fingerprint equals the recorded one
-  and all dependencies are UP-TO-DATE (§4.2). This is designed in from
-  the start (spec §14), not bolted on.
+- A task's **input fingerprint** = hash of (the module's resolved config
+  block relevant to that task + every `.ulb` file it depends on through
+  conventions/catalog + the resolved dependency graph + its declared file
+  inputs + the plugin version + tool versions it invokes). Content-
+  addressed, not timestamp-based.
+- A task is UP-TO-DATE when its current input fingerprint equals the
+  recorded one and all dependencies are UP-TO-DATE (§4.2).
 - No remote cache this pass; the fingerprint format should not preclude
   one later.
 
 ---
 
-## 14. Crate/phase roadmap
+## 11. Crate/phase roadmap
 
 | Phase | Scope | Deliverable |
 |---|---|---|
 | 1 (done) | GRAMMAR.md + ARCHITECTURE.md | design lock, review |
-| 2 | `ulb-lang` workspace + lexer + AST | tokens, spans, one test per construct |
-| 3 | `ulb-lang` parser + error recovery | partial AST + diagnostics, snapshot + malformed tests |
-| 4 | `ulb-lang` evaluator + worked example | ModuleModel, conventions/fn/env, end-to-end example |
-| 5 | `tree-sitter-ulb` | grammar.js + highlights/folds/indents, proven on same fixtures |
-| 6 | `ulb-lsp` skeleton | tower-lsp: didChange parse diagnostics + unknown-convention |
-| 7+ | CLI + task engine, variants, module graph, KMP, manifest merge, KSP, resolver/cache, fingerprinting | production pipeline (designed above) |
+| 2 (done) | `ulb-lang` workspace + lexer + AST | tokens, spans, one test per construct |
+| 3 (done) | `ulb-lang` parser + error recovery | partial AST + diagnostics, snapshot + malformed tests |
+| 4 (done) | `ulb-lang` evaluator + worked example | generic `Value` model, conventions/fn/env, end-to-end example |
+| 4.5 (new, not started) | This redesign's follow-up: update GRAMMAR.md's Appendix A framing + §10 role table to stop claiming android/buildTypes/etc. as core language | GRAMMAR.md edit, no code |
+| 5 | `tree-sitter-ulb` | grammar.js + highlights/folds/indents |
+| 6 | `ulb-lsp` skeleton | didChange parse diagnostics + unknown-convention |
+| 7a (new) | `uliab` CLI: plugin host + WASM runtime embedding + registry client (§3) | can load and call a trivial "hello world" plugin |
+| 7b (new) | Core task engine (§4) + fingerprinting (§10), target-agnostic | can schedule/execute a task graph a test plugin registers |
+| 7c (new) | Core Maven resolver + classpath rules (§6, §7) | `deps {}` resolves to a real classpath, shared by any plugin |
+| 8a (new) | `ulite/jvm` plugin | builds a plain Java or Kotlin/JVM module end-to-end |
+| 8b (new) | `ulite/android` plugin (depends on 8a) | builds a real Android module end-to-end |
+| 8c (new) | `ulite/kmp` plugin (depends on 8a, 8b) | builds a real KMP module end-to-end |
 
-Phases 2–6 are sequential because each depends on the previous; 7+ can be
-partly parallelized once `ulb-lang` is stable.
+Phases 2–6 are sequential (each depends on the previous). 7a/7b/7c can be
+worked in parallel once 4 is stable, since they're independent core
+services. 8a must land before 8b/8c (both depend on it); 8b and 8c can
+then proceed in parallel. This replaces the old single "7+" bucket, which
+was hiding most of the project's remaining size behind one line.
 
 ---
 
-## 15. Out of scope & deferred (explicit)
+## 12. Out of scope & deferred (explicit)
 
-From spec §"Explicitly OUT of scope": Gradle/.kts compat, Kotlin-scripting
-bridge, kotlinc in the tool, third-party plugin ecosystem, general Android
-compat, remote cache, publishing.
+From the original spec: Gradle/.kts compat, Kotlin-scripting bridge,
+kotlinc-as-DSL-interpreter, third-party (non-Ulite-Team) plugin registry
+sources, general Android compat, remote cache, publishing, LSP rename/
+find-all-references/advanced semantic tokens.
 
-From spec §5: LSP rename, find-all-references, advanced semantic tokens.
-
-Deferred to later phases (tracked in PROGRESS.md, designed above):
-explicit KMP hierarchy declaration syntax (§7), module-project dep
-declaration syntax in `deps {}` (§6), manifest merge, KSP step, resolver
-+ cache + lspCompat links, task engine, CLI.
+New from this redesign, explicitly not designed yet:
+- The plugin registry's actual index format/hosting (§3.6 says "TBD").
+- `ulb-lsp` loading plugin manifests for plugin-owned diagnostics (§8).
+- Non-JVM KMP native targets (iOS, desktop) beyond "delegates to a future
+  plugin, not designed" (§5.3).
+- Module-project dependency declaration syntax inside `deps {}` (§6.1,
+  deferred since before this redesign).
