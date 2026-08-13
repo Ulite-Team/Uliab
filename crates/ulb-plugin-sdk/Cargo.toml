@@ -1,0 +1,9 @@
+[package]
+name = "ulb-plugin-sdk"
+description = "Single source of truth for the plugin ABI (WIT interface and version constants)"
+edition.workspace = true
+version.workspace = true
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true

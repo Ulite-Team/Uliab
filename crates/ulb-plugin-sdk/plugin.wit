@@ -1,0 +1,30 @@
+package ulite:ulb;
+
+/// The interface every plugin component exports.
+interface ulb-plugin {
+    /// Identity and ABI compatibility a plugin declares about itself. The
+    /// host reads this before any other call and refuses to load a plugin
+    /// whose `abi-version` is outside the range the host supports
+    /// (ARCHITECTURE.md §3.7).
+    record plugin-manifest {
+        /// Plugin identifier, e.g. "ulite/android".
+        name: string,
+        /// Plugin version, e.g. "1.4.0".
+        version: string,
+        /// Plugin-ABI version this plugin was built against, e.g. "0.1".
+        abi-version: string,
+    }
+
+    /// Declares the plugin's identity and ABI compatibility.
+    manifest: func() -> plugin-manifest;
+
+    /// Runs the plugin against `input` and returns the result. This is the
+    /// single entry point for the initial ABI; later ABI versions replace
+    /// it with a `configure(module-config, task-registrar)` shape.
+    run: func(input: string) -> string;
+}
+
+/// A plugin component: exactly one world exporting `ulb-plugin`.
+world plugin {
+    export ulb-plugin;
+}
