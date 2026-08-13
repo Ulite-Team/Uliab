@@ -8,8 +8,9 @@ literal://! from the exact WIT text in the sdk crate, so the host
 
 use std::path::Path;
 
-use wasmtime::component::{Component, Linker};
+use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store};
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView, p2};
 
 /// Generated host bindings for the `ulb-plugin` world.
 ///
@@ -29,7 +30,27 @@ mod bindings {
 /// A loaded plugin component, bound to the store it was instantiated in.
 struct LoadedPlugin {
     plugin: bindings::Plugin,
-    store: Store<()>,
+    store: Store<HostCtx>,
+}
+
+/// The per-store state: a WASI context plus the resource table it needs.
+///
+/// The wasip2 std runtime imports `wasi:io/poll` and friends even in a
+/// pure-compute plugin, so the host exposes a WASI view (ARCHITECTURE.md
+/// §3.3). The plugin ABI itself defines no resources yet; the table stays
+/// empty until the ABI grows a resource-bearing entry point.
+struct HostCtx {
+    wasi: WasiCtx,
+    table: ResourceTable,
+}
+
+impl WasiView for HostCtx {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
+    }
 }
 
 /// Errors that can occur while loading or running a plugin.
@@ -106,10 +127,23 @@ impl PluginHost {
     fn load(&self, path: &Path) -> Result<LoadedPlugin, HostError> {
         let component = Component::from_file(&self.engine, path)
             .map_err(|error| HostError::Load(error.to_string()))?;
-        let linker = Linker::new(&self.engine);
-        // No resource types in the 0.1 ABI, so nothing to root on the
-        // linker yet.
-        let mut store = Store::new(&self.engine, ());
+        let mut linker = Linker::new(&self.engine);
+        // The wasip2 std runtime imports wasi:io/poll (and friends) even in
+        // a pure-compute plugin, so the linker carries a WASI view. The
+        // 0.1 ABI itself defines no resources; plugin-facing imports will
+        // be rooted here once the ABI grows.
+        p2::add_to_linker_sync::<HostCtx>(&mut linker)
+            .map_err(|error| HostError::Load(error.to_string()))?;
+        let mut store = Store::new(
+            &self.engine,
+            HostCtx {
+                wasi: WasiCtxBuilder::new()
+                    .inherit_stdout()
+                    .inherit_stderr()
+                    .build(),
+                table: ResourceTable::new(),
+            },
+        );
         let plugin = bindings::Plugin::instantiate(&mut store, &component, &linker)
             .map_err(|error| HostError::Load(error.to_string()))?;
         Ok(LoadedPlugin { plugin, store })
