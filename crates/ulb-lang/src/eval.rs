@@ -7,6 +7,15 @@
 //! explicitly allowed to touch the outside world (`env`, `props`) — see
 //! GRAMMAR.md Appendix C.
 //!
+//! For editor tooling, the lint-mode entry points
+//! ([`collect_definitions_lint`], [`evaluate_build_lint`]) treat `env`/`props`
+//! lookups that have no injected [`EvalEnvironment`] entry as *unresolved*:
+//! they return an invalid value without consulting the process or filesystem
+//! and without raising a diagnostic. That keeps name/type/arity diagnostics
+//! available hermetically — an editor cannot verify a build-time environment,
+//! so it should not report its absence as an error. Injected entries still
+//! resolve, so lint mode remains deterministic.
+//!
 //! # Two-pass model
 //!
 //! `conventions.ulb` and `libs.ulb` declare things that are *globally
@@ -192,6 +201,33 @@ pub fn collect_definitions(file: &File, defs: &mut Definitions, diagnostics: &mu
     collect_definitions_with(file, defs, diagnostics, &EvalEnvironment::default());
 }
 
+/// Like [`collect_definitions`], but resolves alias/version expressions in
+/// lint mode: `env`/`props` lookups with no injected [`EvalEnvironment`]
+/// entry resolve to an unresolved value without touching the process or
+/// filesystem and without raising a diagnostic. Use this in editor tooling,
+/// where a missing environment variable or properties file cannot be
+/// meaningfully verified at edit time.
+///
+/// # Examples
+///
+/// ```
+/// use ulb_lang::eval::{collect_definitions_lint, Definitions};
+/// use ulb_lang::parser::parse;
+///
+/// let libs = parse(r#"alias = env("ULB_LINT_UNSET_X")"#);
+/// let mut defs = Definitions::default();
+/// let mut diagnostics = Vec::new();
+/// collect_definitions_lint(&libs.file, &mut defs, &mut diagnostics);
+/// assert!(diagnostics.is_empty());
+/// ```
+pub fn collect_definitions_lint(
+    file: &File,
+    defs: &mut Definitions,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    collect_definitions_impl(file, defs, diagnostics, &EvalEnvironment::default(), true);
+}
+
 /// Like [`collect_definitions`], but resolves alias/version expressions
 /// against the given [`EvalEnvironment`] so a `libs.ulb` that calls
 /// `env`/`props` can be collected hermetically.
@@ -200,6 +236,18 @@ pub fn collect_definitions_with(
     defs: &mut Definitions,
     diagnostics: &mut Vec<Diagnostic>,
     environment: &EvalEnvironment,
+) {
+    collect_definitions_impl(file, defs, diagnostics, environment, false);
+}
+
+/// Shared implementation of definition collection; `lint` selects whether
+/// unresolvable `env`/`props` lookups are reported (see [`EvalEnvironment`]).
+fn collect_definitions_impl(
+    file: &File,
+    defs: &mut Definitions,
+    diagnostics: &mut Vec<Diagnostic>,
+    environment: &EvalEnvironment,
+    lint: bool,
 ) {
     // Pass 1: conventions, fns, `versions {}`, and plain alias assignments
     // — everything a same-file `bundle {}`/`plugins {}` block might need.
@@ -219,7 +267,7 @@ pub fn collect_definitions_with(
             StatementKind::BlockStmt { path, block } if path.head() == "versions" => {
                 for inner in &block.statements {
                     if let StatementKind::Assignment { path, value } = &inner.kind {
-                        let mut ev = Evaluator::new(defs, environment);
+                        let mut ev = Evaluator::with_lint(defs, environment, lint);
                         let resolved = ev.eval_expr(value);
                         diagnostics.append(&mut ev.diagnostics);
                         if let Some(text) = resolved.as_display_string() {
@@ -238,7 +286,7 @@ pub fn collect_definitions_with(
                 }
             }
             StatementKind::Assignment { path, value } if path.is_single() => {
-                let mut ev = Evaluator::new(defs, environment);
+                let mut ev = Evaluator::with_lint(defs, environment, lint);
                 let resolved = ev.eval_expr(value);
                 diagnostics.append(&mut ev.diagnostics);
                 defs.aliases.insert(path.head().to_owned(), resolved);
@@ -255,7 +303,7 @@ pub fn collect_definitions_with(
                 "bundle" => {
                     for inner in &block.statements {
                         if let StatementKind::Assignment { path, value } = &inner.kind {
-                            let mut ev = Evaluator::new(defs, environment);
+                            let mut ev = Evaluator::with_lint(defs, environment, lint);
                             let resolved = ev.eval_expr(value);
                             diagnostics.append(&mut ev.diagnostics);
                             defs.aliases.insert(path.head().to_owned(), resolved);
@@ -265,7 +313,7 @@ pub fn collect_definitions_with(
                 "plugins" => {
                     for inner in &block.statements {
                         if let StatementKind::Assignment { path, value } = &inner.kind {
-                            let mut ev = Evaluator::new(defs, environment);
+                            let mut ev = Evaluator::with_lint(defs, environment, lint);
                             let resolved = ev.eval_expr(value);
                             diagnostics.append(&mut ev.diagnostics);
                             defs.plugins.insert(path.head().to_owned(), resolved);
@@ -322,7 +370,56 @@ pub fn evaluate_build_with(
     defs: &Definitions,
     environment: &EvalEnvironment,
 ) -> EvalOutcome {
-    let mut evaluator = Evaluator::new(defs, environment);
+    evaluate_build_impl(file, defs, environment, false)
+}
+
+/// Like [`evaluate_build`], but in lint mode: `env`/`props` lookups with no
+/// injected [`EvalEnvironment`] entry resolve to an unresolved value without
+/// touching the process or filesystem and without raising a diagnostic. Use
+/// this in editor tooling, where a missing environment variable or
+/// properties file cannot be meaningfully verified at edit time.
+///
+/// Name resolution, arity checks, type checks, and role validation behave
+/// exactly as in [`evaluate_build`].
+///
+/// # Examples
+///
+/// ```
+/// use ulb_lang::eval::{evaluate_build_lint, Definitions};
+/// use ulb_lang::parser::parse;
+///
+/// let defs = Definitions::default();
+///
+/// // An unset environment variable is unresolved, not an error.
+/// let build = parse(r#"x env("ULB_LINT_UNSET_X")"#);
+/// let outcome = evaluate_build_lint(&build.file, &defs);
+/// assert!(outcome.diagnostics.is_empty());
+///
+/// // But a genuinely unknown reference still is.
+/// let build = parse(r#"x ghostAlias"#);
+/// let outcome = evaluate_build_lint(&build.file, &defs);
+/// assert!(
+///     outcome
+///         .diagnostics
+///         .iter()
+///         .any(|d| d.message.contains("unknown reference"))
+/// );
+/// ```
+#[must_use]
+pub fn evaluate_build_lint(file: &File, defs: &Definitions) -> EvalOutcome {
+    evaluate_build_impl(file, defs, &EvalEnvironment::default(), true)
+}
+
+/// Shared implementation of build evaluation; `lint` selects whether
+/// unresolvable `env`/`props` lookups are reported (see
+/// [`evaluate_build_lint`]).
+fn evaluate_build_impl(
+    file: &File,
+    defs: &Definitions,
+    environment: &EvalEnvironment,
+    lint: bool,
+) -> EvalOutcome {
+    let mut evaluator = Evaluator::with_lint(defs, environment, lint);
     let mut target = BTreeMap::new();
     evaluator.eval_statements(&file.statements, &mut target);
     EvalOutcome {
@@ -466,15 +563,20 @@ struct Evaluator<'a> {
     env: &'a EvalEnvironment,
     locals: Vec<BTreeMap<String, Value>>,
     diagnostics: Vec<Diagnostic>,
+    lint: bool,
 }
 
 impl<'a> Evaluator<'a> {
-    fn new(defs: &'a Definitions, env: &'a EvalEnvironment) -> Self {
+    /// Constructs an evaluator; `lint` makes un-injected `env`/`props`
+    /// lookups resolve to an unresolved value without touching the world
+    /// or reporting a diagnostic (see [`evaluate_build_lint`]).
+    fn with_lint(defs: &'a Definitions, env: &'a EvalEnvironment, lint: bool) -> Self {
         Self {
             defs,
             env,
             locals: Vec::new(),
             diagnostics: Vec::new(),
+            lint,
         }
     }
 
@@ -879,6 +981,9 @@ impl<'a> Evaluator<'a> {
         if let Some(value) = self.env.env.get(&name) {
             return Value::Str(value.clone());
         }
+        if self.lint {
+            return Value::Invalid("unresolved environment variable".to_owned());
+        }
         match std::env::var(&name) {
             Ok(value) => Value::Str(value),
             Err(_) => {
@@ -894,6 +999,9 @@ impl<'a> Evaluator<'a> {
         };
         if let Some(contents) = self.env.props.get(&path) {
             return Value::Properties(parse_properties(contents));
+        }
+        if self.lint {
+            return Value::Invalid("unresolved properties file".to_owned());
         }
         match std::fs::read_to_string(&path) {
             Ok(contents) => Value::Properties(parse_properties(&contents)),
@@ -1186,6 +1294,83 @@ mod tests {
                 .iter()
                 .any(|d| d.message.contains("is not set"))
         );
+    }
+
+    #[test]
+    fn lint_mode_does_not_consult_process_environment() {
+        let parsed = parse(r#"x env("ULB_EVAL_DEFINITELY_UNSET_XYZ")"#);
+        let defs = Definitions::default();
+        let outcome = evaluate_build_lint(&parsed.file, &defs);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+    }
+
+    #[test]
+    fn lint_mode_does_not_read_the_filesystem() {
+        let parsed = parse(r#"x props("/definitely/absent/ulb-props-file.properties").key"#);
+        let defs = Definitions::default();
+        let outcome = evaluate_build_lint(&parsed.file, &defs);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+    }
+
+    #[test]
+    fn lint_mode_still_reports_unknown_references() {
+        let parsed = parse(r#"x ghostAlias"#);
+        let defs = Definitions::default();
+        let outcome = evaluate_build_lint(&parsed.file, &defs);
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("unknown reference"))
+        );
+    }
+
+    #[test]
+    fn lint_mode_still_reports_arity_errors() {
+        let mut defs = Definitions::default();
+        defs.functions.insert(
+            "helper".to_owned(),
+            (
+                vec![],
+                Block {
+                    statements: vec![],
+                    span: Span::empty(0),
+                },
+            ),
+        );
+        let parsed = parse("helper(1, 2)");
+        let outcome = evaluate_build_lint(&parsed.file, &defs);
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("expected 0 argument"))
+        );
+    }
+
+    #[test]
+    fn lint_mode_honors_injected_environment() {
+        let parsed = parse(r#"x env("ULB_EVAL_LINT_INJECTED")"#);
+        let defs = Definitions::default();
+        let mut env = EvalEnvironment::default();
+        env.env
+            .insert("ULB_EVAL_LINT_INJECTED".to_owned(), "from-map".to_owned());
+        let outcome = evaluate_build_impl(&parsed.file, &defs, &env, true);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        let Value::Block(top) = outcome.model else {
+            panic!("expected Block");
+        };
+        assert_eq!(top["x"], Value::Str("from-map".to_owned()));
+    }
+
+    #[test]
+    fn collect_definitions_lint_is_hermetic() {
+        let parsed = parse(r#"alias = env("ULB_EVAL_DEFINITELY_UNSET_XYZ")"#);
+        let mut defs = Definitions::default();
+        let mut diagnostics = Vec::new();
+        collect_definitions_lint(&parsed.file, &mut defs, &mut diagnostics);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(defs.aliases.contains_key("alias"));
     }
 
     #[test]
