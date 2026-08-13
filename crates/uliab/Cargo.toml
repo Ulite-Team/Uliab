@@ -1,0 +1,13 @@
+[package]
+name = "uliab"
+description = "The ulb build tool CLI: loads and runs wasm32-wasip2 plugins in an embedded wasmtime host"
+edition.workspace = true
+version.workspace = true
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+ulb-plugin-sdk = { path = "../ulb-plugin-sdk" }
+wasmtime = "47"
+
+[lints]
+workspace = true
