@@ -250,6 +250,34 @@ pub struct Classpath {
     pub android_test_runtime: Vec<PathBuf>,
 }
 
+impl Classpath {
+    /// Serializes the classpath to the JSON object handed to plugins as the
+    /// `classpath` key of their configuration: one array of jar paths per
+    /// bucket, named as the buckets are in GRAMMAR.md Appendix B
+    /// (`compile`, `runtime`, `processor`, `testCompile`, `testRuntime`,
+    /// `androidTestCompile`, `androidTestRuntime`). The output is
+    /// deterministic: each bucket is already sorted by
+    /// (`group`, `artifact`) when built by [`Resolver`].
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        let path_list = |paths: &[PathBuf]| -> Vec<serde_json::Value> {
+            paths
+                .iter()
+                .map(|path| serde_json::Value::String(path.display().to_string()))
+                .collect()
+        };
+        serde_json::json!({
+            "compile": path_list(&self.compile),
+            "runtime": path_list(&self.runtime),
+            "processor": path_list(&self.processor),
+            "testCompile": path_list(&self.test_compile),
+            "testRuntime": path_list(&self.test_runtime),
+            "androidTestCompile": path_list(&self.android_test_compile),
+            "androidTestRuntime": path_list(&self.android_test_runtime),
+        })
+    }
+}
+
 /// The outcome of a [`Resolver::resolve`] run: the classpath plus
 /// informational notes (conflicts resolved, children skipped, unsupported
 /// packaging) that a caller may surface to the user.
@@ -1551,6 +1579,48 @@ mod tests {
             .resolve(&[declared(MavenScope::Implementation, "com.example:one:1.0")])
             .expect("refetches and recovers");
         assert_eq!(std::fs::read(jar_path).unwrap(), b"one-1.0");
+    }
+
+    #[test]
+    fn classpath_serializes_to_a_bucketed_json_object() {
+        let classpath = Classpath {
+            compile: vec![PathBuf::from("/c/a.jar"), PathBuf::from("/c/b.jar")],
+            runtime: vec![PathBuf::from("/c/a.jar")],
+            processor: vec![],
+            test_compile: vec![PathBuf::from("/c/t.jar")],
+            test_runtime: vec![PathBuf::from("/c/t.jar")],
+            android_test_compile: vec![],
+            android_test_runtime: vec![],
+        };
+        let json = classpath.to_json();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "compile": ["/c/a.jar", "/c/b.jar"],
+                "runtime": ["/c/a.jar"],
+                "processor": [],
+                "testCompile": ["/c/t.jar"],
+                "testRuntime": ["/c/t.jar"],
+                "androidTestCompile": [],
+                "androidTestRuntime": [],
+            })
+        );
+    }
+
+    #[test]
+    fn empty_classpath_serializes_to_all_empty_buckets() {
+        let json = Classpath::default().to_json();
+        for bucket in [
+            "compile",
+            "runtime",
+            "processor",
+            "testCompile",
+            "testRuntime",
+            "androidTestCompile",
+            "androidTestRuntime",
+        ] {
+            assert_eq!(json[bucket], serde_json::json!([]), "bucket {bucket}");
+        }
     }
 
     #[test]

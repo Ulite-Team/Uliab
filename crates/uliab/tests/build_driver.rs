@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use uliab::driver::{BuildOptions, build_project};
+use uliab::maven::MavenRepo;
 use uliab::registry::RegistrySource;
 
 /// The workspace root, i.e. the directory two levels above this crate.
@@ -94,6 +95,7 @@ impl TestProject {
         BuildOptions {
             registry: Some(RegistrySource::File(self.dir.join("index.json"))),
             cache_dir: Some(self.dir.join(".cache")),
+            repos: None,
         }
     }
 }
@@ -165,4 +167,52 @@ fn driver_reports_a_project_that_declares_no_plugins() {
 
     let error = build_project(&project.dir, &project.options()).expect_err("no plugins");
     assert!(error.contains("declares no plugins"), "{error}");
+}
+
+#[test]
+fn deps_are_resolved_and_reach_the_plugin() {
+    let fixture = build_fixture("ulb-plugin-fixture");
+    let project = TestProject::new("deps", &fixture);
+
+    // A local Maven repository carrying one jar artifact.
+    let repo = project.dir.join("repo");
+    let artifact_dir = repo.join("com/example/libs/1.0");
+    std::fs::create_dir_all(&artifact_dir).expect("repo dir");
+    std::fs::write(
+        artifact_dir.join("libs-1.0.pom"),
+        "<?xml version=\"1.0\"?><project><modelVersion>4.0.0</modelVersion>\
+         <groupId>com.example</groupId><artifactId>libs</artifactId><version>1.0</version>\
+         </project>",
+    )
+    .expect("write pom");
+    std::fs::write(artifact_dir.join("libs-1.0.jar"), b"jar contents").expect("write jar");
+
+    let source = project.dir.join("in.txt");
+    let output = project.dir.join("out.txt");
+    let classpath_output = project.dir.join("copied.jar");
+    project.write("in.txt", "hello");
+    project.write(
+        "build.ulb",
+        &format!(
+            "deps {{\n  implementation \"com.example:libs:1.0\"\n}}\n\
+             source = {:?}\noutput = {:?}\nclasspathOutput = {:?}\n",
+            source.display().to_string(),
+            output.display().to_string(),
+            classpath_output.display().to_string(),
+        ),
+    );
+    project.write(
+        "libs.ulb",
+        "plugins {\n  fixture = \"ulite/fixture\" @ \"0.1.0\"\n}\n",
+    );
+
+    let mut options = project.options();
+    options.repos = Some(vec![MavenRepo::Custom(repo.display().to_string())]);
+    let first = build_project(&project.dir, &options).expect("first build");
+    assert_eq!((first.ran, first.up_to_date), (3, 0));
+    assert_eq!(project.read("copied.jar"), b"jar contents");
+
+    // Unchanged sources: the classpath-copy task is up-to-date like the rest.
+    let second = build_project(&project.dir, &options).expect("second build");
+    assert_eq!((second.ran, second.up_to_date), (0, 3));
 }

@@ -178,6 +178,7 @@ fn cmd_build(args: &[String]) -> ExitCode {
     let build_options = BuildOptions {
         registry: options.registry.as_deref().map(parse_registry_source),
         cache_dir: options.cache_dir.clone(),
+        repos: None,
     };
     match build_project(project_dir, &build_options) {
         Ok(result) => {

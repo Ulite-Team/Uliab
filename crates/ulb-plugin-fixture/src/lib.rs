@@ -5,8 +5,12 @@
 //! given the module's configuration as JSON — `{"source": <file>,
 //! "output": <file>}` — it registers a `stage` task that copies the source
 //! to the output and an independent `announce` task that runs the
-//! allowlisted `echo` tool. The `uliab` integration tests build this crate
-//! for `wasm32-wasip2` and drive it through [`uliab::host::PluginHost`] to
+//! allowlisted `echo` tool. When the configuration also carries the
+//! host-resolved `classpath` object and a `classpathOutput` path, it
+//! registers a `copy-classpath` task that copies the first compile jar
+//! there, proving a plugin can consume the jars the host resolved for its
+//! `deps {}` block. The `uliab` integration tests build this crate for
+//! `wasm32-wasip2` and drive it through [`uliab::host::PluginHost`] to
 //! prove configure -> task graph -> execute end to end.
 #![allow(unsafe_code)]
 
@@ -65,6 +69,30 @@ impl exports::ulite::ulb::ulb_plugin::Guest for Fixture {
                 cwd: ".".to_owned(),
             }),
         })?;
+
+        let compile_jar = config
+            .get("classpath")
+            .and_then(|classpath| classpath.get("compile"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|jars| jars.first())
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let classpath_output = config
+            .get("classpathOutput")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        if let (Some(compile_jar), Some(classpath_output)) = (compile_jar, classpath_output) {
+            task_registrar::register_task(&Task {
+                name: "copy-classpath".to_owned(),
+                inputs: Vec::new(),
+                outputs: vec![classpath_output.clone()],
+                depends_on: Vec::new(),
+                action: Action::CopyFile(CopyArgs {
+                    source: compile_jar,
+                    destination: classpath_output,
+                }),
+            })?;
+        }
 
         Ok(())
     }

@@ -41,6 +41,9 @@ pub struct BuildOptions {
     /// Cache directory for resolved plugin artifacts. `None` uses the
     /// registry's default cache location.
     pub cache_dir: Option<PathBuf>,
+    /// Repositories for resolving the project's `deps {}` block. `None`
+    /// uses Google Maven then Maven Central (ARCHITECTURE.md §7.1).
+    pub repos: Option<Vec<MavenRepo>>,
 }
 
 /// Evaluates `dir` as a ulb project and runs the task graphs its plugins
@@ -49,16 +52,20 @@ pub struct BuildOptions {
 /// The module model (the evaluated `build.ulb` top level) is serialized to
 /// JSON and passed to each plugin's `configure` entry, so a plugin sees the
 /// resolved configuration block its manifest declares itself for
-/// (ARCHITECTURE.md §9 step 7). Every plugin's graph is merged into one
-/// build; tasks are keyed by their `module` (the plugin name) and name, so
-/// plugins cannot collide unless they register identical identities. The
-/// merged graph is validated (unknown dependency, cycle) and executed
-/// incrementally: unchanged tasks are skipped and the fingerprint store is
-/// persisted to `<dir>/.uliab/state.json`.
+/// (ARCHITECTURE.md §9 step 7). The project's `deps {}` block is resolved
+/// host-side first and the resulting classpath is folded into that JSON as
+/// a `classpath` key, so a plugin can embed the jar paths into its task
+/// actions without resolving them itself. Every plugin's graph is merged
+/// into one build; tasks are keyed by their `module` (the plugin name) and
+/// name, so plugins cannot collide unless they register identical
+/// identities. The merged graph is validated (unknown dependency, cycle)
+/// and executed incrementally: unchanged tasks are skipped and the
+/// fingerprint store is persisted to `<dir>/.uliab/state.json`.
 ///
 /// The fingerprint context folds every resolved plugin's `name@version`
-/// and a content-addressed hash of the model JSON, so upgrading a plugin or
-/// editing the project sources reruns affected tasks.
+/// and a content-addressed hash of the configuration JSON (which includes
+/// the resolved classpath), so upgrading a plugin, editing the project
+/// sources, or changing the resolved dependencies reruns affected tasks.
 ///
 /// # Errors
 ///
@@ -133,6 +140,7 @@ pub struct BuildOptions {
 /// let options = BuildOptions {
 ///     registry: Some(RegistrySource::File(index)),
 ///     cache_dir: Some(project.join(".cache")),
+///     repos: None,
 /// };
 /// let first = build_project(&project, &options).expect("first build");
 /// assert_eq!((first.ran, first.up_to_date), (2, 0));
@@ -161,8 +169,41 @@ pub fn build_project(dir: &Path, options: &BuildOptions) -> Result<BuildResult, 
     }
 
     let model_json = module_model_to_json(&outcome.model)?;
-    let model_text = model_json.to_string();
-    let config_hash = hex(&Sha256::digest(model_text.as_bytes()));
+    let repos = options
+        .repos
+        .clone()
+        .unwrap_or_else(|| vec![maven::MavenRepo::Google, maven::MavenRepo::Central]);
+    let classpath = match &outcome.model {
+        Value::Block(entries) if entries.contains_key("deps") => {
+            let resolution = resolve_model_deps(&outcome.model, &repos, options.cache_dir.clone())?;
+            for note in &resolution.notes {
+                eprintln!("note: {note}");
+            }
+            resolution.classpath
+        }
+        Value::Block(_) => maven::Classpath::default(),
+        other => {
+            return Err(format!(
+                "the module model of {} is not a block (found {})",
+                dir.display(),
+                value_kind(other)
+            ));
+        }
+    };
+
+    // The classpath is resolved host-side and handed to every plugin as a
+    // `classpath` key of its configuration, so a compiler or runner plugin
+    // can embed the jar paths into its task actions without resolving them
+    // itself. The hash that fingerprints the build covers the classpath
+    // too, so a jar that changes without its version changing (a SNAPSHOT,
+    // say) still reruns affected tasks.
+    let mut plugin_config = model_json;
+    plugin_config
+        .as_object_mut()
+        .expect("the module model serialized to an object")
+        .insert("classpath".to_owned(), classpath.to_json());
+    let config_text = plugin_config.to_string();
+    let config_hash = hex(&Sha256::digest(config_text.as_bytes()));
 
     let libs = read_libs_plugins(dir)?;
     if libs.plugins.is_empty() {
@@ -187,7 +228,7 @@ pub fn build_project(dir: &Path, options: &BuildOptions) -> Result<BuildResult, 
             eprintln!("warning: {warning}");
         }
         let plugin_graph = host
-            .configure(&resolved.path, &resolved.name, &model_text)
+            .configure(&resolved.path, &resolved.name, &config_text)
             .map_err(|error| format!("configuring {label}: {error}"))?;
         for task in plugin_graph.tasks() {
             graph
@@ -348,14 +389,23 @@ pub fn resolve_project_deps(
         ));
     }
 
-    let deps_block = match &outcome.model {
+    resolve_model_deps(&outcome.model, repos, cache_dir)
+}
+
+/// Resolves the `deps {}` block of an evaluated module model, erroring when
+/// the model declares none.
+fn resolve_model_deps(
+    model: &Value,
+    repos: &[MavenRepo],
+    cache_dir: Option<PathBuf>,
+) -> Result<maven::Resolution, String> {
+    let deps_block = match model {
         Value::Block(entries) => entries
             .get("deps")
-            .ok_or_else(|| format!("{} does not declare a deps {{}} block", dir.display()))?,
+            .ok_or_else(|| "the model does not declare a deps {} block".to_owned())?,
         other => {
             return Err(format!(
-                "the module model of {} is not a block (found {})",
-                dir.display(),
+                "the module model is not a block (found {})",
                 value_kind(other)
             ));
         }
