@@ -250,16 +250,45 @@ Appendix C) one layer up.
 ### 3.6 Plugin registry & resolution
 
 - A plugin coordinate (`"ulite/android"` in the example above) resolves
-  against `ulb-plugins/registry/index.json` (or similar — format TBD,
-  not yet built) in the `ulb-plugins` repo: `name → { versions: [...],
-  download_url_per_version }`, mirroring how `libs.ulb`'s Maven
-  coordinates resolve against Maven repos, but *never touching* Maven
-  Central, Google Maven, or the Gradle Plugin Portal.
+  against `ulb-plugins/registry/index.json` in the `ulb-plugins` repo,
+  mirroring how `libs.ulb`'s Maven coordinates resolve against Maven
+  repos, but *never touching* Maven Central, Google Maven, or the Gradle
+  Plugin Portal.
+- **Index format.** `index.json` is a single document with a
+  `schema_version` and a `plugins` table keyed by plugin name; each entry
+  maps version strings to an ABI range and an artifact URL:
+
+  ```json
+  {
+    "schema_version": 1,
+    "plugins": {
+      "ulite/hello": {
+        "versions": {
+          "0.1.0": {
+            "abi": { "min": "0.1", "max": "0.1" },
+            "artifact_url": "…/hello_plugin.wasm"
+          }
+        }
+      }
+    }
+  }
+  ```
+
+  `abi` is the plugin-ABI range that build declares support for
+  (§3.7) — the value the tool's compatibility/fallback logic keys on.
+  `artifact_url` is an HTTP(S) URL or a `file://`/relative filesystem path
+  (the local forms exist so the client can be tested and run without a
+  network). Before an artifact is cached, the tool instantiates it and
+  cross-checks its `manifest` entry against the index row: name and
+  version must match the coordinate and the reported ABI version must lie
+  inside the declared range.
 - Local plugin cache: `~/.cache/uliab/plugins/<name>/<version>/plugin.wasm`
-  — checked first; the tool only fetches from the registry on a cache
-  miss. This directly parallels the existing Maven artifact cache design
-  (old §10.2) but is a fully separate cache root — plugin artifacts and
-  Maven artifacts are never comingled.
+  plus an `abi.json` recording the ABI range the cached build was verified
+  under — checked first; the tool only fetches from the registry on a
+  cache miss. A cached build whose recorded range no longer contains the
+  host ABI (the tool was upgraded) is refetched. This directly parallels
+  the Maven artifact cache design but is a fully separate cache root —
+  plugin artifacts and Maven artifacts are never comingled.
 - **Version compatibility & fallback**: each plugin declares which core
   plugin-ABI version range it targets. If the installed tool is newer than
   a plugin's declared range, the tool keeps using the plugin's

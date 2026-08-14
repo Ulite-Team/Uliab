@@ -421,8 +421,10 @@ An alias may only reference `@` a `versions {}` entry or an inline string.
 An alias whose value is a full coordinate may not also carry `@` (duplicate
 version — evaluator error). Plugin names resolve against the Ulite Team
 plugin registry, not a Maven repository (ARCHITECTURE.md §3.6); the
-evaluator treats them as opaque values — the tool layer performs the
-resolution when it loads plugins (ARCHITECTURE.md §9, step 5).
+evaluator treats them as opaque values — the tool layer resolves them
+(`uliab plugins resolve` reads the `plugins {}` table and downloads each
+referenced build into the local plugin cache, ARCHITECTURE.md §9,
+steps 5–6).
 
 ---
 
