@@ -127,6 +127,12 @@ impl PluginHost {
     fn load(&self, path: &Path) -> Result<LoadedPlugin, HostError> {
         let component = Component::from_file(&self.engine, path)
             .map_err(|error| HostError::Load(error.to_string()))?;
+        self.instantiate(component)
+    }
+
+    /// Instantiates an already-loaded component into a store with a WASI
+    /// view and the plugin ABI rooted in the linker.
+    fn instantiate(&self, component: Component) -> Result<LoadedPlugin, HostError> {
         let mut linker = Linker::new(&self.engine);
         // The wasip2 std runtime imports wasi:io/poll (and friends) even in
         // a pure-compute plugin, so the linker carries a WASI view. The
@@ -147,6 +153,24 @@ impl PluginHost {
         let plugin = bindings::Plugin::instantiate(&mut store, &component, &linker)
             .map_err(|error| HostError::Load(error.to_string()))?;
         Ok(LoadedPlugin { plugin, store })
+    }
+
+    /// Reads a plugin's `manifest` entry from a component held in memory.
+    ///
+    /// Used by the registry client to verify a downloaded artifact before
+    /// it is written to the cache ([`crate::registry::Registry`]). The
+    /// component is instantiated but never run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError::Load`] when the bytes are not a valid
+    /// `ulb-plugin` component and [`HostError::Call`] when the `manifest`
+    /// entry point fails.
+    pub fn manifest_of_bytes(&self, wasm: &[u8]) -> Result<PluginManifest, HostError> {
+        let component = Component::from_binary(&self.engine, wasm)
+            .map_err(|error| HostError::Load(error.to_string()))?;
+        let mut plugin = self.instantiate(component)?;
+        plugin.manifest()
     }
 
     /// Verifies the plugin's reported ABI version against the host's.

@@ -6,11 +6,16 @@ version.workspace = true
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+ulb-lang = { path = "../ulb-lang" }
 ulb-plugin-sdk = { path = "../ulb-plugin-sdk" }
 wasmtime = "47"
 # The wasm32-wasip2 std runtime imports wasi:io/poll (and friends) even in a
 # pure-compute plugin, so the linker must be able to satisfy those imports.
 wasmtime-wasi = "47"
+# Registry index + artifact fetching for the plugin registry client.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "3"
 
 [lints]
 workspace = true
