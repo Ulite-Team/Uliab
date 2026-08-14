@@ -131,13 +131,13 @@ fn sample_kmp_evaluates_to_expected_model() {
     assert_eq!(signing["keyPassword"], Value::Str("hunter2".to_owned()));
 
     // deps {} accumulates repeated implementation pairs; a versioned alias
-    // resolves to a full coordinate.
+    // and a full-coordinate alias both resolve to a Coordinate.
     let deps = block(top, "deps");
     assert_eq!(
         coordinate_list(deps, "implementation"),
         vec![
             Value::Coordinate("androidx.core:core-ktx:1.15.0".to_owned()),
-            Value::Str("androidx.appcompat:appcompat:1.7.0".to_owned()),
+            Value::Coordinate("androidx.appcompat:appcompat:1.7.0".to_owned()),
         ]
     );
 

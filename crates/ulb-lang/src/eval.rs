@@ -242,6 +242,31 @@ pub fn collect_definitions_with(
 
 /// Shared implementation of definition collection; `lint` selects whether
 /// unresolvable `env`/`props` lookups are reported (see [`EvalEnvironment`]).
+/// Returns whether `s` has the shape of a full Maven coordinate
+/// (`group:artifact:version`): exactly two colons with every segment
+/// non-empty. This is the same shape [`Evaluator::eval_versioned`]
+/// produces when it appends a version to a `group:artifact` base.
+fn is_full_coordinate(s: &str) -> bool {
+    let mut segments = s.split(':');
+    segments.next().is_some_and(|first| !first.is_empty())
+        && segments.next().is_some_and(|middle| !middle.is_empty())
+        && segments.next().is_some_and(|last| !last.is_empty())
+        && segments.next().is_none()
+}
+
+/// Classifies an evaluated `libs.ulb` alias value: a plain string that
+/// already is a full coordinate becomes a [`Value::Coordinate`] so the
+/// version catalog's coordinate forms (GRAMMAR.md §6.3) carry a distinct
+/// type end to end. Any other value passes through unchanged.
+fn classify_libs_alias(value: Value) -> Value {
+    if let Value::Str(text) = &value
+        && is_full_coordinate(text)
+    {
+        return Value::Coordinate(text.clone());
+    }
+    value
+}
+
 fn collect_definitions_impl(
     file: &File,
     defs: &mut Definitions,
@@ -287,7 +312,7 @@ fn collect_definitions_impl(
             }
             StatementKind::Assignment { path, value } if path.is_single() => {
                 let mut ev = Evaluator::with_lint(defs, environment, lint);
-                let resolved = ev.eval_expr(value);
+                let resolved = classify_libs_alias(ev.eval_expr(value));
                 diagnostics.append(&mut ev.diagnostics);
                 defs.aliases.insert(path.head().to_owned(), resolved);
             }
@@ -304,7 +329,7 @@ fn collect_definitions_impl(
                     for inner in &block.statements {
                         if let StatementKind::Assignment { path, value } = &inner.kind {
                             let mut ev = Evaluator::with_lint(defs, environment, lint);
-                            let resolved = ev.eval_expr(value);
+                            let resolved = classify_libs_alias(ev.eval_expr(value));
                             diagnostics.append(&mut ev.diagnostics);
                             defs.aliases.insert(path.head().to_owned(), resolved);
                         }
@@ -1094,17 +1119,23 @@ impl<'a> Evaluator<'a> {
 
     fn eval_versioned(&mut self, base: &Expr, version: &VersionRef, span: Span) -> Value {
         let base_value = self.eval_expr(base);
-        let Value::Str(coordinate) = base_value else {
-            if !matches!(base_value, Value::Invalid(_)) {
-                self.error(
-                    base.span,
-                    format!(
-                        "'@' base must be a string coordinate, got {}",
-                        value_kind_name(&base_value)
-                    ),
-                );
+        let coordinate = match &base_value {
+            Value::Str(text) => text.clone(),
+            // A full-coordinate alias already resolves to a Coordinate; the
+            // colon check below rejects it as a duplicate version.
+            Value::Coordinate(text) => text.clone(),
+            _ => {
+                if !matches!(base_value, Value::Invalid(_)) {
+                    self.error(
+                        base.span,
+                        format!(
+                            "'@' base must be a string coordinate, got {}",
+                            value_kind_name(&base_value)
+                        ),
+                    );
+                }
+                return Value::Invalid("bad versioned base".to_owned());
             }
-            return Value::Invalid("bad versioned base".to_owned());
         };
         if coordinate.matches(':').count() >= 2 {
             self.error(
@@ -1797,6 +1828,84 @@ mod tests {
             panic!("expected __actions__ list");
         };
         assert_eq!(actions.len(), 2);
+    }
+
+    #[test]
+    fn full_coordinate_alias_classifies_as_coordinate() {
+        let outcome = evaluate_project(
+            "",
+            "appcompat = \"androidx.appcompat:appcompat:1.7.0\"\n",
+            "deps {\n  implementation appcompat\n}\n",
+        );
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        let Value::Block(top) = outcome.model else {
+            panic!("expected Block model");
+        };
+        let Value::Block(deps) = &top["deps"] else {
+            panic!("expected deps Block");
+        };
+        assert_eq!(
+            deps["implementation"],
+            Value::Coordinate("androidx.appcompat:appcompat:1.7.0".to_owned())
+        );
+    }
+
+    #[test]
+    fn two_colon_string_in_build_block_stays_str() {
+        // The coordinate classifier applies to libs.ulb aliases only; a
+        // colon-shaped string elsewhere in the model is ordinary text.
+        let outcome = evaluate_project("", "", "message \"a:b:c\"\n");
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        let Value::Block(top) = outcome.model else {
+            panic!("expected Block model");
+        };
+        assert_eq!(top["message"], Value::Str("a:b:c".to_owned()));
+    }
+
+    #[test]
+    fn versioning_a_full_coordinate_alias_reports_duplicate_version() {
+        let libs = "appcompat = \"androidx.appcompat:appcompat:1.7.0\"\n";
+        let outcome = evaluate_project("", libs, "x = appcompat @ \"2.0.0\"\n");
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("already carries a version")),
+            "{:?}",
+            outcome.diagnostics
+        );
+    }
+
+    #[test]
+    fn bundle_of_full_coordinate_alias_yields_coordinates() {
+        let libs = concat!(
+            "appcompat = \"androidx.appcompat:appcompat:1.7.0\"\n",
+            "bundle {\n  ui = [ appcompat ]\n}\n",
+        );
+        let outcome = evaluate_project("", libs, "deps {\n  implementation ui\n}\n");
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        let Value::Block(top) = outcome.model else {
+            panic!("expected Block model");
+        };
+        let Value::Block(deps) = &top["deps"] else {
+            panic!("expected deps Block");
+        };
+        assert_eq!(
+            deps["implementation"],
+            Value::List(vec![Value::Coordinate(
+                "androidx.appcompat:appcompat:1.7.0".to_owned()
+            )])
+        );
+    }
+
+    #[test]
+    fn is_full_coordinate_accepts_only_three_segments() {
+        assert!(is_full_coordinate("g:a:v"));
+        assert!(!is_full_coordinate("g:a"));
+        assert!(!is_full_coordinate("g:a:v:w"));
+        assert!(!is_full_coordinate("g::v"));
+        assert!(!is_full_coordinate(":a:v"));
+        assert!(!is_full_coordinate("g:a:"));
     }
 
     #[test]
