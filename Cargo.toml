@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/ulb-lang", "crates/ulb-plugin-sdk", "crates/uliab"]
+members = [
+    "crates/ulb-lang",
+    "crates/ulb-plugin-sdk",
+    "crates/ulb-plugin-fixture",
+    "crates/ulb-plugin-legacy-fixture",
+    "crates/uliab",
+]
 
 [workspace.package]
 edition = "2024"

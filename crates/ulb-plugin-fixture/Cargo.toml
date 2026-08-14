@@ -1,0 +1,17 @@
+[package]
+name = "ulb-plugin-fixture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Test plugin exercising the configure ABI; built for wasm32-wasip2 by the uliab integration tests"
+
+[dependencies]
+serde_json = "1"
+ulb-plugin-sdk = { path = "../ulb-plugin-sdk" }
+wit-bindgen = "0.51.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true

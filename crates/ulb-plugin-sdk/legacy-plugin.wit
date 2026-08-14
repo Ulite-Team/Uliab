@@ -1,0 +1,23 @@
+package ulite:ulb;
+
+/// The `ulb-plugin` world as it was before the `configure` entry point
+/// and the `task-registrar` import were added: a component exports only
+/// `manifest` and `run`. This is a frozen snapshot of the ABI at
+/// `0.1`; the host keeps a binding to it so a component built against it
+/// still loads and runs after the ABI grows (the full world in
+/// `plugin.wit` requires the `configure` export, which an older component
+/// does not have). New components export the extra entry point, which a
+/// legacy-world instantiation simply ignores.
+interface ulb-plugin {
+    record plugin-manifest {
+        name: string,
+        version: string,
+        abi-version: string,
+    }
+    manifest: func() -> plugin-manifest;
+    run: func(input: string) -> string;
+}
+
+world plugin {
+    export ulb-plugin;
+}

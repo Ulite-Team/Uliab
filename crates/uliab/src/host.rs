@@ -37,9 +37,32 @@ mod bindings {
     });
 }
 
-/// A loaded plugin component, bound to the store it was instantiated in.
+/// Host bindings for the pre-`configure` `ulb-plugin` world
+/// (`legacy-plugin.wit` in the sdk crate). The full world requires the
+/// `configure` export, which a component built against the older ABI does
+/// not have, so [`PluginHost::run`] and `manifest_of_bytes` instantiate
+/// against this world instead: a legacy-world instantiation only asks for
+/// `manifest` and `run`, and a newer component that exports both still
+/// satisfies it (its extra `configure` export is ignored).
+mod legacy_bindings {
+    #![allow(unsafe_code)]
+    wasmtime::component::bindgen!({
+        path: "../ulb-plugin-sdk/legacy-plugin.wit",
+        world: "plugin",
+    });
+}
+
+/// A loaded plugin component bound to the full (current) world, used by
+/// [`PluginHost::configure`].
 struct LoadedPlugin {
     plugin: bindings::Plugin,
+    store: Store<HostCtx>,
+}
+
+/// A loaded plugin component bound to the legacy (pre-`configure`) world,
+/// used by [`PluginHost::run`] and `manifest_of_bytes`.
+struct LoadedLegacyPlugin {
+    plugin: legacy_bindings::Plugin,
     store: Store<HostCtx>,
 }
 
@@ -196,7 +219,7 @@ impl PluginHost {
     /// instantiating the component, and [`HostError::Call`] if a plugin
     /// entry point traps or the ABI check fails.
     pub fn run(&self, path: &Path, input: &str) -> Result<String, HostError> {
-        let mut plugin = self.load(path)?;
+        let mut plugin = self.load_legacy(path)?;
         let manifest = plugin
             .manifest()
             .map_err(|error| HostError::Call(error.to_string()))?;
@@ -224,13 +247,65 @@ impl PluginHost {
     /// instantiating the component, [`HostError::Call`] if a plugin entry
     /// point traps, the ABI check fails, the plugin rejects the
     /// configuration, or the registered graph cannot be scheduled.
+    ///
+    /// # Examples
+    ///
+    /// Configuring requires a real component, so the example builds the
+    /// workspace's `ulb-plugin-fixture` for `wasm32-wasip2` and drives the
+    /// graph it registers through the executor:
+    ///
+    /// ```rust
+    /// use std::path::PathBuf;
+    /// use std::process::Command;
+    ///
+    /// use uliab::host::PluginHost;
+    /// use uliab::task::{Executor, FingerprintContext, FingerprintStore};
+    ///
+    /// let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    ///     .parent().unwrap().parent().unwrap().to_path_buf();
+    /// let built = Command::new("cargo")
+    ///     .args(["build", "-p", "ulb-plugin-fixture", "--target", "wasm32-wasip2"])
+    ///     .current_dir(&workspace)
+    ///     .status().expect("build the fixture plugin");
+    /// assert!(built.success());
+    /// let target = std::env::var_os("CARGO_TARGET_DIR")
+    ///     .map(PathBuf::from)
+    ///     .unwrap_or_else(|| workspace.join("target"));
+    /// let fixture = target.join("wasm32-wasip2/debug/ulb_plugin_fixture.wasm");
+    ///
+    /// let workdir = std::env::temp_dir().join(format!(
+    ///     "uliab-configure-doc-{}", std::process::id()
+    /// ));
+    /// std::fs::create_dir_all(&workdir).unwrap();
+    /// std::fs::write(workdir.join("in.txt"), "hello").unwrap();
+    /// let config = format!(
+    ///     r#"{{"source": {:?}, "output": {:?}}}"#,
+    ///     workdir.join("in.txt").display().to_string(),
+    ///     workdir.join("out.txt").display().to_string(),
+    /// );
+    ///
+    /// let host = PluginHost::new().expect("engine");
+    /// let graph = host
+    ///     .configure(&fixture, "app", &config)
+    ///     .expect("plugin configures");
+    /// let ctx = FingerprintContext {
+    ///     plugin_version: "0.1.0".to_owned(),
+    ///     config_hash: "doc".to_owned(),
+    /// };
+    /// let mut store = FingerprintStore::load(workdir.join("state.json")).unwrap();
+    /// let result = Executor::new([uliab::task::AllowlistedTool::Echo])
+    ///     .execute(&graph, &ctx, &mut store)
+    ///     .expect("schedules");
+    /// assert_eq!(result.ran, 2);
+    /// assert_eq!(std::fs::read(workdir.join("out.txt")).unwrap(), b"hello");
+    /// ```
     pub fn configure(
         &self,
         path: &Path,
         module: &str,
         config_json: &str,
     ) -> Result<TaskGraph, HostError> {
-        let mut plugin = self.load(path)?;
+        let mut plugin = self.load_full(path)?;
         let manifest = plugin
             .manifest()
             .map_err(|error| HostError::Call(error.to_string()))?;
@@ -265,16 +340,26 @@ impl PluginHost {
         Ok(state.graph)
     }
 
-    /// Reads and instantiates the component in `path`.
-    fn load(&self, path: &Path) -> Result<LoadedPlugin, HostError> {
+    /// Reads and instantiates the component in `path` against the full
+    /// (current) world.
+    fn load_full(&self, path: &Path) -> Result<LoadedPlugin, HostError> {
         let component = Component::from_file(&self.engine, path)
             .map_err(|error| HostError::Load(error.to_string()))?;
-        self.instantiate(component)
+        self.instantiate_full(component)
     }
 
-    /// Instantiates an already-loaded component into a store with a WASI
-    /// view and the plugin ABI rooted in the linker.
-    fn instantiate(&self, component: Component) -> Result<LoadedPlugin, HostError> {
+    /// Reads and instantiates the component in `path` against the legacy
+    /// (pre-`configure`) world.
+    fn load_legacy(&self, path: &Path) -> Result<LoadedLegacyPlugin, HostError> {
+        let component = Component::from_file(&self.engine, path)
+            .map_err(|error| HostError::Load(error.to_string()))?;
+        self.instantiate_legacy(component)
+    }
+
+    /// The shared linker and store for one instantiation: a WASI view for
+    /// the wasip2 std runtime plus the task-registrar import, bound for
+    /// every component even though only the full world references it.
+    fn store_and_linker(&self) -> Result<(Linker<HostCtx>, Store<HostCtx>), HostError> {
         let mut linker = Linker::new(&self.engine);
         // The wasip2 std runtime imports wasi:io/poll (and friends) even in
         // a pure-compute plugin, so the linker carries a WASI view.
@@ -289,7 +374,7 @@ impl PluginHost {
             |host| host,
         )
         .map_err(|error| HostError::Load(error.to_string()))?;
-        let mut store = Store::new(
+        let store = Store::new(
             &self.engine,
             HostCtx {
                 wasi: WasiCtxBuilder::new()
@@ -300,9 +385,24 @@ impl PluginHost {
                 registrar: None,
             },
         );
+        Ok((linker, store))
+    }
+
+    /// Instantiates an already-loaded component into a store with a WASI
+    /// view and the full plugin ABI rooted in the linker.
+    fn instantiate_full(&self, component: Component) -> Result<LoadedPlugin, HostError> {
+        let (linker, mut store) = self.store_and_linker()?;
         let plugin = bindings::Plugin::instantiate(&mut store, &component, &linker)
             .map_err(|error| HostError::Load(error.to_string()))?;
         Ok(LoadedPlugin { plugin, store })
+    }
+
+    /// Instantiates an already-loaded component against the legacy world.
+    fn instantiate_legacy(&self, component: Component) -> Result<LoadedLegacyPlugin, HostError> {
+        let (linker, mut store) = self.store_and_linker()?;
+        let plugin = legacy_bindings::Plugin::instantiate(&mut store, &component, &linker)
+            .map_err(|error| HostError::Load(error.to_string()))?;
+        Ok(LoadedLegacyPlugin { plugin, store })
     }
 
     /// Reads a plugin's `manifest` entry from a component held in memory.
@@ -319,7 +419,7 @@ impl PluginHost {
     pub fn manifest_of_bytes(&self, wasm: &[u8]) -> Result<PluginManifest, HostError> {
         let component = Component::from_binary(&self.engine, wasm)
             .map_err(|error| HostError::Load(error.to_string()))?;
-        let mut plugin = self.instantiate(component)?;
+        let mut plugin = self.instantiate_legacy(component)?;
         plugin.manifest()
     }
 
@@ -342,6 +442,22 @@ impl PluginHost {
 }
 
 impl LoadedPlugin {
+    /// Calls the plugin's `manifest` entry point.
+    fn manifest(&mut self) -> Result<PluginManifest, HostError> {
+        let manifest = self
+            .plugin
+            .ulite_ulb_ulb_plugin()
+            .call_manifest(&mut self.store)
+            .map_err(|error| HostError::Call(error.to_string()))?;
+        Ok(PluginManifest {
+            name: manifest.name,
+            version: manifest.version,
+            abi_version: manifest.abi_version,
+        })
+    }
+}
+
+impl LoadedLegacyPlugin {
     /// Calls the plugin's `manifest` entry point.
     fn manifest(&mut self) -> Result<PluginManifest, HostError> {
         let manifest = self

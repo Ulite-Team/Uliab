@@ -1,0 +1,15 @@
+[package]
+name = "ulb-plugin-legacy-fixture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Test plugin built against the pre-configure ABI; proves additive ABI growth keeps old components instantiable"
+
+[dependencies]
+wit-bindgen = "0.51.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
