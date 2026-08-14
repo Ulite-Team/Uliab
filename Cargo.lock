@@ -1615,6 +1615,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
  "ulb-lang",
  "ulb-plugin-sdk",
  "ureq",
