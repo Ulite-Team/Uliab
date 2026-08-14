@@ -22,6 +22,7 @@ use ulb_lang::eval::Value;
 use ulb_lang::token::Number;
 
 use crate::host::PluginHost;
+use crate::maven::{self, MavenRepo};
 use crate::project::{self, read_libs_plugins};
 use crate::registry::{Registry, RegistrySource};
 use crate::task::{
@@ -267,6 +268,117 @@ fn module_model_to_json(model: &Value) -> Result<serde_json::Value, String> {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Resolves the `deps {}` block of the project at `dir` into a classpath,
+/// consulting `repos` in order and caching artifacts under `cache_dir` (or
+/// the default cache location when `None`).
+///
+/// The project's `deps {}` block is read from the evaluated module model
+/// and resolved with [`maven::Resolver`] (ARCHITECTURE.md §6, §7). The
+/// repositories are an explicit argument so callers that resolve against
+/// local repositories stay offline; the CLI passes the default set.
+///
+/// # Errors
+///
+/// Returns a description when a project file cannot be read or fails to
+/// parse or evaluate, when the model declares no `deps {}` block or the
+/// block is malformed, or when resolution fails (see
+/// [`maven::ResolveError`]).
+///
+/// # Examples
+///
+/// A local repository carries `example:one:1.0`, which depends on
+/// `example:two:1.0`. Resolving the project's `deps {}` block materializes
+/// both jars on the compile and runtime classpaths:
+///
+/// ```rust
+/// use std::fs;
+/// use uliab::driver::resolve_project_deps;
+/// use uliab::maven::MavenRepo;
+///
+/// let dir = std::env::temp_dir().join(format!(
+///     "uliab-deps-doc-{}", std::process::id()
+/// ));
+/// let _ = fs::remove_dir_all(&dir);
+/// let repo = dir.join("repo");
+/// fs::create_dir_all(repo.join("com/example/one/1.0")).unwrap();
+/// fs::create_dir_all(repo.join("com/example/two/1.0")).unwrap();
+/// fs::write(repo.join("com/example/one/1.0/one-1.0.pom"), r#"<?xml version="1.0"?>
+/// <project><modelVersion>4.0.0</modelVersion>
+/// <groupId>com.example</groupId><artifactId>one</artifactId><version>1.0</version>
+/// <dependencies><dependency>
+///   <groupId>com.example</groupId><artifactId>two</artifactId><version>1.0</version>
+/// </dependency></dependencies></project>"#).unwrap();
+/// fs::write(repo.join("com/example/two/1.0/two-1.0.pom"), r#"<?xml version="1.0"?>
+/// <project><modelVersion>4.0.0</modelVersion>
+/// <groupId>com.example</groupId><artifactId>two</artifactId><version>1.0</version>
+/// </project>"#).unwrap();
+/// fs::write(repo.join("com/example/one/1.0/one-1.0.jar"), b"one").unwrap();
+/// fs::write(repo.join("com/example/two/1.0/two-1.0.jar"), b"two").unwrap();
+/// fs::write(dir.join("build.ulb"), "deps {\n  implementation \"com.example:one:1.0\"\n}\n").unwrap();
+/// fs::write(dir.join("libs.ulb"), "").unwrap();
+///
+/// let repos = vec![MavenRepo::Custom(repo.display().to_string())];
+/// let resolution = resolve_project_deps(&dir, &repos, Some(dir.join("cache"))).expect("resolves");
+/// assert_eq!(resolution.classpath.compile.len(), 2);
+/// assert_eq!(resolution.classpath.runtime.len(), 2);
+/// assert!(resolution.classpath.compile[0].ends_with("one-1.0.jar"));
+/// ```
+pub fn resolve_project_deps(
+    dir: &Path,
+    repos: &[MavenRepo],
+    cache_dir: Option<PathBuf>,
+) -> Result<maven::Resolution, String> {
+    let conventions = read_source(dir, "conventions.ulb", false)?;
+    let libs = read_source(dir, "libs.ulb", true)?;
+    let build = read_source(dir, "build.ulb", true)?;
+
+    let outcome = ulb_lang::eval::evaluate_project(&conventions, &libs, &build);
+    if !outcome.diagnostics.is_empty() {
+        let messages = outcome
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "evaluating {}: {messages}",
+            dir.join("build.ulb").display()
+        ));
+    }
+
+    let deps_block = match &outcome.model {
+        Value::Block(entries) => entries
+            .get("deps")
+            .ok_or_else(|| format!("{} does not declare a deps {{}} block", dir.display()))?,
+        other => {
+            return Err(format!(
+                "the module model of {} is not a block (found {})",
+                dir.display(),
+                value_kind(other)
+            ));
+        }
+    };
+    let declared = maven::parse_deps_block(deps_block)?;
+    let resolver = maven::Resolver::new(repos.to_vec(), cache_dir);
+    resolver
+        .resolve(&declared)
+        .map_err(|error| error.to_string())
+}
+
+fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Str(_) => "a string",
+        Value::Number(_) => "a number",
+        Value::Bool(_) => "a boolean",
+        Value::List(_) => "a list",
+        Value::Version(_) => "a version",
+        Value::Properties(_) => "properties",
+        Value::Coordinate(_) => "a coordinate",
+        Value::Block(_) => "a block",
+        Value::Invalid(_) => "an unresolved value",
+    }
 }
 
 #[cfg(test)]

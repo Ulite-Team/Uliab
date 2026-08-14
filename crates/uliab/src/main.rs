@@ -16,12 +16,16 @@
 //!   module model, and executes the registered task graphs incrementally
 //!   (ARCHITECTURE.md §9), printing how many tasks ran versus were skipped
 //!   as up-to-date.
+//! - `uliab deps resolve [--project DIR] [--cache-dir DIR]` — resolves the
+//!   project's `deps {}` block into a classpath (ARCHITECTURE.md §6, §7)
+//!   against the default repositories, and prints the jars per bucket.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use uliab::driver::{BuildOptions, DEFAULT_REGISTRY, build_project};
+use uliab::driver::{BuildOptions, DEFAULT_REGISTRY, build_project, resolve_project_deps};
 use uliab::host::PluginHost;
+use uliab::maven::MavenRepo;
 use uliab::project::{self, read_libs_plugins};
 use uliab::registry::{Registry, RegistrySource};
 
@@ -31,14 +35,16 @@ fn main() -> ExitCode {
         Some("run") => cmd_run(&args[1..]),
         Some("plugins") => cmd_plugins(&args[1..]),
         Some("build") => cmd_build(&args[1..]),
+        Some("deps") => cmd_deps(&args[1..]),
         _ => {
-            eprintln!("usage: uliab <run|plugins|build> …");
+            eprintln!("usage: uliab <run|plugins|build|deps> …");
             eprintln!("  uliab run <plugin.wasm> [input]");
             eprintln!("  uliab plugins list [--project DIR]");
             eprintln!(
                 "  uliab plugins resolve [--project DIR] [--registry SOURCE] [--cache-dir DIR]"
             );
             eprintln!("  uliab build [--project DIR] [--registry SOURCE] [--cache-dir DIR]");
+            eprintln!("  uliab deps resolve [--project DIR] [--cache-dir DIR]");
             ExitCode::from(2)
         }
     }
@@ -188,6 +194,69 @@ fn cmd_build(args: &[String]) -> ExitCode {
                 "build finished: {} ran, {} up-to-date{skipped}",
                 result.ran, result.up_to_date
             );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Resolves the project's `deps {}` block and prints the jars of each
+/// classpath bucket (ARCHITECTURE.md §6, §7).
+fn cmd_deps(args: &[String]) -> ExitCode {
+    let sub = match args.first().map(String::as_str) {
+        Some("resolve") => "resolve",
+        _ => {
+            eprintln!("usage: uliab deps <resolve> [options]");
+            return ExitCode::from(2);
+        }
+    };
+    let options = parse_options(&args[1..]);
+    let Some(project_dir) = options.project_dir.as_ref() else {
+        eprintln!("error: --project DIR is required");
+        return ExitCode::FAILURE;
+    };
+    if !project_dir.is_dir() {
+        eprintln!(
+            "error: project directory '{}' does not exist",
+            project_dir.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    debug_assert_eq!(sub, "resolve");
+
+    let repos = vec![MavenRepo::Google, MavenRepo::Central];
+    match resolve_project_deps(project_dir, &repos, options.cache_dir.clone()) {
+        Ok(resolution) => {
+            for note in &resolution.notes {
+                eprintln!("note: {note}");
+            }
+            let buckets = [
+                ("compile", &resolution.classpath.compile),
+                ("runtime", &resolution.classpath.runtime),
+                ("processor", &resolution.classpath.processor),
+                ("testCompile", &resolution.classpath.test_compile),
+                ("testRuntime", &resolution.classpath.test_runtime),
+                (
+                    "androidTestCompile",
+                    &resolution.classpath.android_test_compile,
+                ),
+                (
+                    "androidTestRuntime",
+                    &resolution.classpath.android_test_runtime,
+                ),
+            ];
+            for (name, jars) in buckets {
+                if jars.is_empty() {
+                    continue;
+                }
+                println!("{name}:");
+                for jar in jars {
+                    println!("  {}", jar.display());
+                }
+            }
             ExitCode::SUCCESS
         }
         Err(error) => {

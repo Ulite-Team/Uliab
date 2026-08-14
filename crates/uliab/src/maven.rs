@@ -1,0 +1,1568 @@
+//! The Maven dependency resolver: turns a project's `deps {}` block into a
+//! concrete classpath of jar files (ARCHITECTURE.md §6, §7).
+//!
+//! A [`Resolver`] expands the declared dependencies transitively by
+//! downloading POMs from its repository list, picks one version per
+//! `group:artifact` by the highest-version rule (§7.3), and partitions the
+//! surviving nodes into classpath buckets that mirror the Gradle scope
+//! semantics of GRAMMAR.md Appendix B:
+//!
+//! - `compile` — declared `api`/`implementation`/`compileOnly` plus the
+//!   compile-scope children of `api`/`implementation` deps, transitively;
+//!   `compileOnly` deps contribute only their own jar (§6.2).
+//! - `runtime` — the full transitive closure of `api`/`implementation`/
+//!   `runtimeOnly` deps.
+//! - `processor` — `ksp` deps and their closure.
+//! - `test_compile`/`test_runtime` — `testImplementation` deps layered on
+//!   top of the main `compile`/`runtime` classpaths.
+//! - `android_test_compile`/`android_test_runtime` — the same for
+//!   `androidTestImplementation`.
+//!
+//! The `api` vs `implementation` distinction only changes what consumers of
+//! a module see, which is realized at the multi-module layer (§6.1); for a
+//! single module both contribute the same jars to its own classpaths.
+//!
+//! Version comparison follows Maven's ordering: dot/hyphen-separated
+//! numeric segments compare by value and the common qualifiers rank
+//! `alpha < beta < milestone < rc < snapshot < release < sp`. A POM child
+//! whose version is absent or a `${property}` is skipped with an
+//! informational note — parent POMs and `dependencyManagement` are not yet
+//! consulted (§7's resolver is resolved against a flat POM set for now).
+//!
+//! Artifacts are cached content-addressed under the resolver's cache
+//! directory (default `~/.cache/uliab/modules`): a jar/POM is only reused
+//! from the cache when its recorded SHA-256 matches the file on disk, and a
+//! mismatch triggers a refetch. Repositories are tried in order, so a local
+//! filesystem repository (plain path or `file://`) in front of the default
+//! repositories keeps resolution offline for tests.
+
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
+
+use ulb_lang::eval::Value;
+
+/// The default Google Maven repository (ARCHITECTURE.md §7.1).
+pub const GOOGLE_MAVEN: &str = "https://dl.google.com/dl/android/maven2";
+/// The default Maven Central repository (ARCHITECTURE.md §7.1).
+pub const MAVEN_CENTRAL: &str = "https://repo1.maven.org/maven2";
+
+/// A repository a resolver can fetch POMs and jars from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MavenRepo {
+    /// The Google Maven repository (`https://dl.google.com/dl/android/maven2`).
+    Google,
+    /// Maven Central (`https://repo1.maven.org/maven2`).
+    Central,
+    /// An explicit repository: an `https://`/`http://` URL, a `file://`
+    /// URL, or a plain filesystem path. Repositories are tried in order,
+    /// so a local repository placed first keeps resolution offline.
+    Custom(String),
+}
+
+impl MavenRepo {
+    fn base(&self) -> &str {
+        match self {
+            MavenRepo::Google => GOOGLE_MAVEN,
+            MavenRepo::Central => MAVEN_CENTRAL,
+            MavenRepo::Custom(url) => url,
+        }
+    }
+
+    /// The repository-relative layout Maven uses: `group/artifact/version/…`.
+    fn url_for(&self, rel_path: &str) -> String {
+        let base = self.base();
+        if base.ends_with('/') {
+            format!("{base}{rel_path}")
+        } else {
+            format!("{base}/{rel_path}")
+        }
+    }
+}
+
+/// A dependency scope in `deps {}` (GRAMMAR.md Appendix B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MavenScope {
+    /// Visible to this module's compile classpath and to consumers.
+    Api,
+    /// Visible to this module's compile and runtime classpaths only.
+    Implementation,
+    /// Runtime classpath only.
+    RuntimeOnly,
+    /// Compile classpath only, no transitive children.
+    CompileOnly,
+    /// Annotation-processing (KSP) classpath.
+    Ksp,
+    /// Unit-test classpaths.
+    TestImplementation,
+    /// Instrumented-test classpaths.
+    AndroidTestImplementation,
+}
+
+impl MavenScope {
+    /// Parses a `deps {}` key into a scope.
+    pub fn from_name(name: &str) -> Option<MavenScope> {
+        match name {
+            "api" => Some(MavenScope::Api),
+            "implementation" => Some(MavenScope::Implementation),
+            "runtimeOnly" => Some(MavenScope::RuntimeOnly),
+            "compileOnly" => Some(MavenScope::CompileOnly),
+            "ksp" => Some(MavenScope::Ksp),
+            "testImplementation" => Some(MavenScope::TestImplementation),
+            "androidTestImplementation" => Some(MavenScope::AndroidTestImplementation),
+            _ => None,
+        }
+    }
+}
+
+/// A resolved `group:artifact:version` coordinate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dependency {
+    /// The Maven group.
+    pub group: String,
+    /// The Maven artifact.
+    pub artifact: String,
+    /// The version.
+    pub version: String,
+}
+
+impl Dependency {
+    /// Parses a `"group:artifact:version"` coordinate string.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description when the string is not three `:`-separated
+    /// non-empty parts.
+    pub fn parse(coordinate: &str) -> Result<Dependency, String> {
+        let mut parts = coordinate.split(':');
+        let group = parts.next().unwrap_or_default();
+        let artifact = parts.next().unwrap_or_default();
+        let version = parts.next().unwrap_or_default();
+        if parts.next().is_some() || group.is_empty() || artifact.is_empty() || version.is_empty() {
+            return Err(format!(
+                "invalid coordinate '{coordinate}': expected 'group:artifact:version'"
+            ));
+        }
+        Ok(Dependency {
+            group: group.to_owned(),
+            artifact: artifact.to_owned(),
+            version: version.to_owned(),
+        })
+    }
+}
+
+/// A declared dependency and the scope it was declared under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredDep {
+    /// The scope this dependency belongs to.
+    pub scope: MavenScope,
+    /// The resolved coordinate.
+    pub dependency: Dependency,
+}
+
+/// Parses the evaluated `deps {}` block of a module model.
+///
+/// The block is keyed by scope (Appendix B); each value is a coordinate
+/// string (`"group:artifact:version"`), a resolved [`Value::Coordinate`],
+/// or a list of them (repeated keys accumulate into lists upstream).
+///
+/// # Errors
+///
+/// Returns a description when a scope is unknown, a value is not a
+/// coordinate, or a coordinate is malformed.
+pub fn parse_deps_block(block: &Value) -> Result<Vec<DeclaredDep>, String> {
+    let entries = match block {
+        Value::Block(entries) => entries,
+        _ => return Err("deps must be a block".to_owned()),
+    };
+    let mut deps = Vec::new();
+    for (scope_name, value) in entries {
+        let scope = MavenScope::from_name(scope_name).ok_or_else(|| {
+            format!(
+                "unknown dependency scope '{scope_name}' (expected api, implementation, \
+                 runtimeOnly, compileOnly, ksp, testImplementation, or androidTestImplementation)"
+            )
+        })?;
+        match value {
+            Value::List(items) => {
+                for item in items {
+                    deps.push(DeclaredDep {
+                        scope,
+                        dependency: parse_coordinate_value(item, scope_name)?,
+                    });
+                }
+            }
+            other => deps.push(DeclaredDep {
+                scope,
+                dependency: parse_coordinate_value(other, scope_name)?,
+            }),
+        }
+    }
+    Ok(deps)
+}
+
+fn parse_coordinate_value(value: &Value, scope: &str) -> Result<Dependency, String> {
+    let coordinate = match value {
+        Value::Str(text) => text,
+        Value::Coordinate(text) => text,
+        other => {
+            return Err(format!(
+                "dependency in '{scope}' must be a coordinate string, found {}",
+                kind(other)
+            ));
+        }
+    };
+    Dependency::parse(coordinate)
+}
+
+fn kind(value: &Value) -> &'static str {
+    match value {
+        Value::Str(_) => "string",
+        Value::Number(_) => "number",
+        Value::Bool(_) => "boolean",
+        Value::List(_) => "list",
+        Value::Version(_) => "version",
+        Value::Properties(_) => "properties",
+        Value::Coordinate(_) => "coordinate",
+        Value::Block(_) => "block",
+        Value::Invalid(_) => "an unresolved value",
+    }
+}
+
+/// The classpath a project's dependencies resolve to.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Classpath {
+    /// Jars needed to compile the module.
+    pub compile: Vec<PathBuf>,
+    /// Jars needed to run the module.
+    pub runtime: Vec<PathBuf>,
+    /// Jars needed to run annotation processing.
+    pub processor: Vec<PathBuf>,
+    /// Jars needed to compile unit tests.
+    pub test_compile: Vec<PathBuf>,
+    /// Jars needed to run unit tests.
+    pub test_runtime: Vec<PathBuf>,
+    /// Jars needed to compile instrumented tests.
+    pub android_test_compile: Vec<PathBuf>,
+    /// Jars needed to run instrumented tests.
+    pub android_test_runtime: Vec<PathBuf>,
+}
+
+/// The outcome of a [`Resolver::resolve`] run: the classpath plus
+/// informational notes (conflicts resolved, children skipped, unsupported
+/// packaging) that a caller may surface to the user.
+#[derive(Debug, Clone)]
+pub struct Resolution {
+    /// The resolved classpath.
+    pub classpath: Classpath,
+    /// Human-readable notes about choices made during resolution.
+    pub notes: Vec<String>,
+}
+
+/// Errors produced while resolving dependencies.
+#[derive(Debug, Clone)]
+pub enum ResolveError {
+    /// An artifact could not be found in any configured repository.
+    NotFound { artifact: String },
+    /// Fetching or reading an artifact failed for a non-404 reason.
+    Fetch { artifact: String, message: String },
+    /// A POM could not be parsed.
+    Parser { artifact: String, message: String },
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolveError::NotFound { artifact } => {
+                write!(formatter, "could not find {artifact} in any repository")
+            }
+            ResolveError::Fetch { artifact, message } => {
+                write!(formatter, "fetching {artifact}: {message}")
+            }
+            ResolveError::Parser { artifact, message } => {
+                write!(formatter, "parsing POM for {artifact}: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ResolveError {}
+
+/// Resolves `deps {}` declarations into a classpath (ARCHITECTURE.md §6,
+/// §7). Repositories are consulted in order; artifacts are cached under
+/// `cache_dir` (default `~/.cache/uliab/modules`) and reused only when
+/// their recorded SHA-256 still matches.
+#[derive(Debug, Clone)]
+pub struct Resolver {
+    repos: Vec<MavenRepo>,
+    cache_dir: PathBuf,
+}
+
+impl Resolver {
+    /// Creates a resolver that consults `repos` in order and caches under
+    /// `cache_dir` (or the default cache location when `None`).
+    pub fn new(repos: Vec<MavenRepo>, cache_dir: Option<PathBuf>) -> Resolver {
+        Resolver {
+            repos,
+            cache_dir: cache_dir.unwrap_or_else(default_cache_dir),
+        }
+    }
+
+    /// Resolves `declared` into a classpath, downloading POMs and jars
+    /// into the cache on a miss.
+    ///
+    /// The graph of all reachable versions is expanded first and then
+    /// collapsed by the highest-version rule (§7.3), so a transitive
+    /// dependency of a dependency participates in conflict resolution like
+    /// any other occurrence of its `group:artifact`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResolveError::NotFound`] when an artifact is absent from
+    /// every repository, [`ResolveError::Fetch`] when a download or cache
+    /// read fails, and [`ResolveError::Parser`] when a POM is malformed.
+    ///
+    /// # Examples
+    ///
+    /// A local repository carries `example:one:1.0`, whose POM depends on
+    /// `example:two:1.0`. Declaring `one` as an `implementation` dependency
+    /// puts both jars on the compile classpath (the compile-scope child of
+    /// an `implementation` dep is visible to this module, §6.2) and on
+    /// runtime:
+    ///
+    /// ```rust
+    /// use std::fs;
+    /// use uliab::maven::{DeclaredDep, Dependency, MavenRepo, MavenScope, Resolver};
+    ///
+    /// let dir = std::env::temp_dir().join(format!(
+    ///     "uliab-maven-doc-{}", std::process::id()
+    /// ));
+    /// let _ = fs::remove_dir_all(&dir);
+    /// let repo = dir.join("repo");
+    /// let one_pom = "com/example/one/1.0/one-1.0.pom";
+    /// let two_pom = "com/example/two/1.0/two-1.0.pom";
+    /// fs::create_dir_all(repo.join("com/example/one/1.0")).unwrap();
+    /// fs::create_dir_all(repo.join("com/example/two/1.0")).unwrap();
+    /// fs::write(repo.join(one_pom), r#"<?xml version="1.0"?>
+    /// <project><modelVersion>4.0.0</modelVersion>
+    /// <groupId>com.example</groupId><artifactId>one</artifactId><version>1.0</version>
+    /// <dependencies><dependency>
+    ///   <groupId>com.example</groupId><artifactId>two</artifactId><version>1.0</version>
+    /// </dependency></dependencies></project>"#).unwrap();
+    /// fs::write(repo.join(two_pom), r#"<?xml version="1.0"?>
+    /// <project><modelVersion>4.0.0</modelVersion>
+    /// <groupId>com.example</groupId><artifactId>two</artifactId><version>1.0</version>
+    /// </project>"#).unwrap();
+    /// fs::write(repo.join("com/example/one/1.0/one-1.0.jar"), b"one").unwrap();
+    /// fs::write(repo.join("com/example/two/1.0/two-1.0.jar"), b"two").unwrap();
+    ///
+    /// let resolver = Resolver::new(
+    ///     vec![MavenRepo::Custom(repo.display().to_string())],
+    ///     Some(dir.join("cache")),
+    /// );
+    /// let declared = vec![DeclaredDep {
+    ///     scope: MavenScope::Implementation,
+    ///     dependency: Dependency::parse("com.example:one:1.0").unwrap(),
+    /// }];
+    /// let resolution = resolver.resolve(&declared).expect("resolves");
+    /// let jars: Vec<_> = resolution.classpath.compile.iter()
+    ///     .filter_map(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned())
+    ///     .collect();
+    /// assert_eq!(jars, vec!["one-1.0.jar", "two-1.0.jar"]);
+    /// ```
+    pub fn resolve(&self, declared: &[DeclaredDep]) -> Result<Resolution, ResolveError> {
+        let mut session = Session::new(self);
+        for dep in declared {
+            let dependency = &dep.dependency;
+            session.expand(&dependency.group, &dependency.artifact, &dependency.version)?;
+        }
+        let winners = session.winners();
+        let classpath = session.classpath(declared, &winners)?;
+        Ok(Resolution {
+            classpath,
+            notes: session.notes,
+        })
+    }
+
+    fn fetch_cached(
+        &self,
+        group: &str,
+        artifact: &str,
+        version: &str,
+        extension: &str,
+    ) -> Result<(PathBuf, Vec<u8>), ResolveError> {
+        let rel = format!(
+            "{}/{}/{}/{}-{}.{}",
+            group.replace('.', "/"),
+            artifact,
+            version,
+            artifact,
+            version,
+            extension
+        );
+        let cache_file = self.cache_dir.join(&rel);
+        if let Some(bytes) = verified_cached(&cache_file) {
+            return Ok((cache_file, bytes));
+        }
+        let bytes = self.fetch_from_repos(&rel)?;
+        write_cached(&cache_file, &bytes);
+        Ok((cache_file, bytes))
+    }
+
+    fn fetch_from_repos(&self, rel: &str) -> Result<Vec<u8>, ResolveError> {
+        let mut first_failure: Option<String> = None;
+        for repo in &self.repos {
+            match fetch_one(repo, rel) {
+                Ok(bytes) => return Ok(bytes),
+                Err(FetchError::Miss) => {}
+                Err(FetchError::Fail(message)) => {
+                    first_failure.get_or_insert(message);
+                }
+            }
+        }
+        Err(match first_failure {
+            Some(message) => ResolveError::Fetch {
+                artifact: rel.to_owned(),
+                message,
+            },
+            None => ResolveError::NotFound {
+                artifact: rel.to_owned(),
+            },
+        })
+    }
+}
+
+impl Default for Resolver {
+    /// The default resolver consults Google Maven then Maven Central.
+    fn default() -> Resolver {
+        Resolver::new(vec![MavenRepo::Google, MavenRepo::Central], None)
+    }
+}
+
+enum FetchError {
+    Miss,
+    Fail(String),
+}
+
+fn fetch_one(repo: &MavenRepo, rel: &str) -> Result<Vec<u8>, FetchError> {
+    let url = repo.url_for(rel);
+    if !url.contains("://") || url.starts_with("file://") {
+        let path = url.strip_prefix("file://").unwrap_or(&url);
+        return match std::fs::read(path) {
+            Ok(bytes) => Ok(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(FetchError::Miss),
+            Err(error) => Err(FetchError::Fail(error.to_string())),
+        };
+    }
+    match ureq::get(&url).call() {
+        Ok(response) => response
+            .into_body()
+            .read_to_vec()
+            .map_err(|error| FetchError::Fail(format!("reading response body: {error}"))),
+        Err(ureq::Error::StatusCode(404)) => Err(FetchError::Miss),
+        Err(ureq::Error::StatusCode(code)) => Err(FetchError::Fail(format!("HTTP {code}"))),
+        Err(other) => Err(FetchError::Fail(other.to_string())),
+    }
+}
+
+/// Reads a cached artifact, returning `None` when it is missing or does not
+/// match its recorded SHA-256. The digest is stored in a sibling
+/// `<file>.sha256` so a POM and its jar (which share `<artifact>-<version>`
+/// up to their extension) never collide.
+fn verified_cached(path: &Path) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(path).ok()?;
+    let recorded = std::fs::read_to_string(sha_path(path)).ok()?;
+    if recorded.trim() != hex(&Sha256::digest(&bytes)) {
+        return None;
+    }
+    Some(bytes)
+}
+
+fn write_cached(path: &Path, bytes: &[u8]) {
+    if let Some(parent) = path.parent()
+        && std::fs::create_dir_all(parent).is_err()
+    {
+        return;
+    }
+    let digest = hex(&Sha256::digest(bytes));
+    if std::fs::write(path, bytes).is_err() || std::fs::write(sha_path(path), digest).is_err() {
+        // A failed cache write must not fail resolution: the artifact is
+        // already in hand, and the cache is purely an acceleration.
+    }
+}
+
+fn sha_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.sha256", path.display()))
+}
+
+fn default_cache_dir() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home)
+            .join(".cache")
+            .join("uliab")
+            .join("modules"),
+        None => PathBuf::from(".cache").join("uliab").join("modules"),
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Compares two Maven versions under Maven's ordering.
+///
+/// Versions are split on `.` and `-` (plus `_` and `+`, which Maven treats
+/// as separators) into numeric and string segments; numeric segments
+/// compare by value and string segments by qualifier rank, where the known
+/// qualifiers order `alpha < beta < milestone < rc < snapshot < release <
+/// sp`, unknown qualifiers sort above the known set and then
+/// lexicographically, and a numeric segment outranks any qualifier. Missing
+/// trailing segments compare as the release: `"1.0" == "1.0.0"`,
+/// `"1.0-snapshot" < "1.0"`, `"2.10.0" > "2.1.0"`.
+pub fn compare_maven_versions(a: &str, b: &str) -> Ordering {
+    compare_tokens(&split_tokens(a), &split_tokens(b))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum VersionToken {
+    Num(i64),
+    Str(String),
+}
+
+fn split_tokens(version: &str) -> Vec<VersionToken> {
+    let mut tokens = Vec::new();
+    for part in version.replace(['_', '+'], "-").split(['.', '-']) {
+        if part.is_empty() {
+            continue;
+        }
+        let mut alpha = String::new();
+        let mut number = String::new();
+        let mut numeric = None;
+        for character in part.chars() {
+            let is_numeric = character.is_ascii_digit();
+            match (numeric, is_numeric) {
+                (Some(true), false) => {
+                    tokens.push(VersionToken::Num(number.parse().unwrap_or(0)));
+                    number.clear();
+                }
+                (Some(false), true) => {
+                    tokens.push(VersionToken::Str(std::mem::take(&mut alpha)));
+                }
+                _ => {}
+            }
+            if is_numeric {
+                number.push(character);
+            } else {
+                alpha.push(character);
+            }
+            numeric = Some(is_numeric);
+        }
+        if !number.is_empty() {
+            tokens.push(VersionToken::Num(number.parse().unwrap_or(0)));
+        }
+        if !alpha.is_empty() {
+            tokens.push(VersionToken::Str(alpha));
+        }
+    }
+    tokens
+}
+
+fn compare_tokens(a: &[VersionToken], b: &[VersionToken]) -> Ordering {
+    let length = a.len().max(b.len());
+    for index in 0..length {
+        let ordering = match (a.get(index), b.get(index)) {
+            (Some(left), Some(right)) => compare_token(left, right),
+            (Some(left), None) => compare_with_release(left),
+            (None, Some(right)) => compare_with_release(right).reverse(),
+            (None, None) => Ordering::Equal,
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    Ordering::Equal
+}
+
+fn compare_token(left: &VersionToken, right: &VersionToken) -> Ordering {
+    match (left, right) {
+        (VersionToken::Num(a), VersionToken::Num(b)) => a.cmp(b),
+        (VersionToken::Num(_), VersionToken::Str(_)) => Ordering::Greater,
+        (VersionToken::Str(_), VersionToken::Num(_)) => Ordering::Less,
+        (VersionToken::Str(a), VersionToken::Str(b)) => {
+            match (qualifier_rank(a), qualifier_rank(b)) {
+                (Some(rank_a), Some(rank_b)) if rank_a != rank_b => rank_a.cmp(&rank_b),
+                _ => a.cmp(b),
+            }
+        }
+    }
+}
+
+/// A token compared against a missing (release-padded) counterpart.
+fn compare_with_release(token: &VersionToken) -> Ordering {
+    match token {
+        VersionToken::Num(value) => value.cmp(&0),
+        VersionToken::Str(qualifier) => match qualifier_rank(qualifier) {
+            Some(rank) => rank.cmp(&RELEASE_RANK),
+            None => Ordering::Greater,
+        },
+    }
+}
+
+const RELEASE_RANK: i32 = 5;
+
+/// Ranks the known Maven qualifiers, lower ranking being older. Unknown
+/// qualifiers return `None` and sort above the known set.
+fn qualifier_rank(qualifier: &str) -> Option<i32> {
+    match qualifier.to_ascii_lowercase().as_str() {
+        "alpha" | "a" => Some(0),
+        "beta" | "b" => Some(1),
+        "milestone" | "m" => Some(2),
+        "rc" | "cr" => Some(3),
+        "snapshot" => Some(4),
+        "" | "final" | "release" | "ga" => Some(RELEASE_RANK),
+        "sp" => Some(6),
+        _ => None,
+    }
+}
+
+/// The dependency edges parsed from a POM.
+#[derive(Debug)]
+struct PomDependency {
+    group: String,
+    artifact: String,
+    version: Option<String>,
+    scope: PomScope,
+    optional: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PomScope {
+    Compile,
+    Runtime,
+    /// `test`, `provided`, or `system`: not part of a consumer's graph.
+    Skip,
+}
+
+#[derive(Debug)]
+struct PomProject {
+    packaging: String,
+    deps: Vec<PomDependency>,
+}
+
+/// Parses a POM's packaging and its direct `compile`/`runtime`-scoped
+/// dependencies. `test`/`provided`/`system` and `optional` dependencies are
+/// dropped, as are dependencies that are not part of a consumer's graph.
+fn parse_pom(bytes: &[u8]) -> Result<PomProject, String> {
+    let mut reader = quick_xml::Reader::from_reader(bytes);
+    reader.config_mut().trim_text(true);
+    let mut buffer = Vec::new();
+
+    let mut stack: Vec<String> = Vec::new();
+    let mut packaging = "jar".to_owned();
+    let mut in_management = false;
+    let mut in_dependencies = false;
+    let mut current: Option<PomDependency> = None;
+    let mut field: Option<String> = None;
+    let mut deps = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(quick_xml::events::Event::Start(element)) => {
+                let name = element.name().as_ref().to_vec();
+                let name = String::from_utf8_lossy(&name).into_owned();
+                let parent = stack.last().cloned();
+                stack.push(name.clone());
+                field = None;
+                match name.as_str() {
+                    "packaging" if parent.as_deref() == Some("project") => field = Some(name),
+                    "dependencyManagement" => in_management = true,
+                    "dependencies" if !in_management && parent.as_deref() == Some("project") => {
+                        in_dependencies = true;
+                    }
+                    "dependency"
+                        if in_dependencies
+                            && parent.as_deref() == Some("dependencies")
+                            && current.is_none() =>
+                    {
+                        current = Some(PomDependency {
+                            group: String::new(),
+                            artifact: String::new(),
+                            version: None,
+                            scope: PomScope::Compile,
+                            optional: false,
+                        });
+                    }
+                    "groupId" | "artifactId" | "version" | "scope" | "optional"
+                        if current.is_some() && parent.as_deref() == Some("dependency") =>
+                    {
+                        field = Some(name);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(quick_xml::events::Event::Text(text)) => {
+                let content = text
+                    .unescape()
+                    .map_err(|error| format!("decoding text: {error}"))?
+                    .into_owned();
+                if content.trim().is_empty() {
+                    continue;
+                }
+                let field_name = field.as_deref();
+                let Some(dependency) = current.as_mut() else {
+                    if field_name == Some("packaging") {
+                        packaging = content;
+                    }
+                    continue;
+                };
+                match field_name {
+                    Some("groupId") => dependency.group = content,
+                    Some("artifactId") => dependency.artifact = content,
+                    Some("version") => {
+                        dependency.version = Some(content);
+                    }
+                    Some("scope") => {
+                        dependency.scope = match content.as_str() {
+                            "runtime" => PomScope::Runtime,
+                            "test" | "provided" | "system" => PomScope::Skip,
+                            _ => PomScope::Compile,
+                        };
+                    }
+                    Some("optional") => dependency.optional = content == "true",
+                    _ => {}
+                }
+            }
+            Ok(quick_xml::events::Event::End(element)) => {
+                let name = element.name().as_ref().to_vec();
+                let name = String::from_utf8_lossy(&name).into_owned();
+                if field.as_deref() == Some(name.as_str()) {
+                    field = None;
+                }
+                stack.pop();
+                match name.as_str() {
+                    "dependency" => {
+                        if let Some(dependency) = current.take()
+                            && !dependency.optional
+                            && dependency.scope != PomScope::Skip
+                            && !dependency.group.is_empty()
+                            && !dependency.artifact.is_empty()
+                        {
+                            deps.push(dependency);
+                        }
+                    }
+                    "dependencies" => in_dependencies = false,
+                    "dependencyManagement" => in_management = false,
+                    _ => {}
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => return Err(format!("reading XML: {error}")),
+        }
+    }
+    Ok(PomProject { packaging, deps })
+}
+
+/// A node in the expanded dependency graph: one concrete version of one
+/// `group:artifact`.
+#[derive(Debug)]
+struct GraphNode {
+    packaging: String,
+    edges: Vec<PomEdge>,
+}
+
+/// A resolved compile/runtime-scoped child edge.
+#[derive(Debug)]
+struct PomEdge {
+    group: String,
+    artifact: String,
+    scope: PomScope,
+}
+
+struct Session<'a> {
+    resolver: &'a Resolver,
+    graph: BTreeMap<(String, String), BTreeMap<String, GraphNode>>,
+    order: Vec<(String, String, String)>,
+    seen: BTreeSet<(String, String, String)>,
+    notes: Vec<String>,
+}
+
+impl<'a> Session<'a> {
+    fn new(resolver: &'a Resolver) -> Session<'a> {
+        Session {
+            resolver,
+            graph: BTreeMap::new(),
+            order: Vec::new(),
+            seen: BTreeSet::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    /// Fetches the POM for `group:artifact:version`, parses it, and records
+    /// its node plus the POM of every resolvable child, recursively.
+    fn expand(&mut self, group: &str, artifact: &str, version: &str) -> Result<(), ResolveError> {
+        let key = (group.to_owned(), artifact.to_owned(), version.to_owned());
+        if self.seen.contains(&key) {
+            return Ok(());
+        }
+        self.seen.insert(key.clone());
+
+        let (_, pom_bytes) = self
+            .resolver
+            .fetch_cached(group, artifact, version, "pom")?;
+        let pom = parse_pom(&pom_bytes).map_err(|message| ResolveError::Parser {
+            artifact: format!("{group}:{artifact}:{version}"),
+            message,
+        })?;
+
+        let mut node = GraphNode {
+            packaging: pom.packaging,
+            edges: Vec::new(),
+        };
+        for dependency in pom.deps {
+            let version = match dependency.version {
+                None => {
+                    self.notes.push(format!(
+                        "{}:{} declares no version; its dependencies are not followed",
+                        dependency.group, dependency.artifact
+                    ));
+                    continue;
+                }
+                Some(version) if version.contains("${") => {
+                    self.notes.push(format!(
+                        "{}:{}:{} uses a property version; parent POMs and \
+                         dependencyManagement are not consulted yet",
+                        dependency.group, dependency.artifact, version
+                    ));
+                    continue;
+                }
+                Some(version) => version,
+            };
+            self.expand(&dependency.group, &dependency.artifact, &version)?;
+            node.edges.push(PomEdge {
+                group: dependency.group,
+                artifact: dependency.artifact,
+                scope: dependency.scope,
+            });
+        }
+
+        self.graph
+            .entry((group.to_owned(), artifact.to_owned()))
+            .or_default()
+            .insert(version.to_owned(), node);
+        self.order.push(key);
+        Ok(())
+    }
+
+    /// Picks the winning version per `group:artifact` by the
+    /// highest-version rule, recording a note for each loser. Ties keep the
+    /// first-discovered version.
+    fn winners(&mut self) -> BTreeMap<(String, String), String> {
+        let mut winners = BTreeMap::new();
+        for (group, artifact) in self.graph.keys() {
+            let mut chosen: Option<&str> = None;
+            for (order_group, order_artifact, version) in &self.order {
+                if order_group != group || order_artifact != artifact {
+                    continue;
+                }
+                chosen = Some(match chosen {
+                    None => version,
+                    Some(current)
+                        if compare_maven_versions(version, current) == Ordering::Greater =>
+                    {
+                        version
+                    }
+                    Some(current) => current,
+                });
+            }
+            let chosen = chosen.expect("every group in the graph was discovered in order");
+            winners.insert((group.clone(), artifact.clone()), chosen.to_owned());
+            for (order_group, order_artifact, version) in &self.order {
+                if order_group == group && order_artifact == artifact && version != chosen {
+                    self.notes.push(format!(
+                        "{order_group}:{order_artifact}:{version} superseded by {chosen}"
+                    ));
+                }
+            }
+        }
+        winners
+    }
+
+    fn winner_node(
+        &self,
+        winners: &BTreeMap<(String, String), String>,
+        group: &str,
+        artifact: &str,
+    ) -> Option<&GraphNode> {
+        let version = winners.get(&(group.to_owned(), artifact.to_owned()))?;
+        self.graph
+            .get(&(group.to_owned(), artifact.to_owned()))?
+            .get(version)
+    }
+
+    /// Builds the classpath buckets from the winning nodes.
+    fn classpath(
+        &mut self,
+        declared: &[DeclaredDep],
+        winners: &BTreeMap<(String, String), String>,
+    ) -> Result<Classpath, ResolveError> {
+        let roots = |scopes: &[MavenScope]| -> Vec<(String, String)> {
+            declared
+                .iter()
+                .filter(|dep| scopes.contains(&dep.scope))
+                .map(|dep| {
+                    (
+                        dep.dependency.group.clone(),
+                        dep.dependency.artifact.clone(),
+                    )
+                })
+                .collect()
+        };
+
+        let compile_only = roots(&[MavenScope::CompileOnly]);
+        let mut compile = self.bucket(
+            winners,
+            &roots(&[MavenScope::Api, MavenScope::Implementation]),
+            Some(PomScope::Compile),
+        );
+        for (group, artifact) in &compile_only {
+            let version = winners
+                .get(&(group.clone(), artifact.clone()))
+                .expect("a declared dependency was expanded");
+            let packaging = self
+                .winner_node(winners, group, artifact)
+                .map(|node| node.packaging.clone())
+                .unwrap_or_else(|| "jar".to_owned());
+            compile.insert(
+                (group.clone(), artifact.clone()),
+                (version.clone(), packaging),
+            );
+        }
+
+        let test_roots = roots(&[MavenScope::TestImplementation]);
+        let android_test_roots = roots(&[MavenScope::AndroidTestImplementation]);
+        let runtime = self.bucket(
+            winners,
+            &roots(&[
+                MavenScope::Api,
+                MavenScope::Implementation,
+                MavenScope::RuntimeOnly,
+            ]),
+            None,
+        );
+        let processor = self.bucket(winners, &roots(&[MavenScope::Ksp]), None);
+        let test_compile = self.bucket(winners, &test_roots, Some(PomScope::Compile));
+        let test_runtime = self.bucket(winners, &test_roots, None);
+        let android_test_compile =
+            self.bucket(winners, &android_test_roots, Some(PomScope::Compile));
+        let android_test_runtime = self.bucket(winners, &android_test_roots, None);
+
+        Ok(Classpath {
+            compile: self.materialize(&compile)?,
+            runtime: self.materialize(&runtime)?,
+            processor: self.materialize(&processor)?,
+            test_compile: self.materialize(&merge(compile.clone(), test_compile))?,
+            test_runtime: self.materialize(&merge(runtime.clone(), test_runtime))?,
+            android_test_compile: self.materialize(&merge(compile, android_test_compile))?,
+            android_test_runtime: self.materialize(&merge(runtime, android_test_runtime))?,
+        })
+    }
+
+    /// The reachable winner nodes from `roots`, following only
+    /// `edge_scope` edges when given (compile classpaths) or all edges when
+    /// `None` (runtime classpaths).
+    fn bucket(
+        &self,
+        winners: &BTreeMap<(String, String), String>,
+        roots: &[(String, String)],
+        edge_scope: Option<PomScope>,
+    ) -> BTreeMap<(String, String), (String, String)> {
+        let mut reachable = BTreeSet::new();
+        let mut queue: VecDeque<(String, String)> = roots.iter().cloned().collect();
+        while let Some((group, artifact)) = queue.pop_front() {
+            if !reachable.insert((group.clone(), artifact.clone())) {
+                continue;
+            }
+            let Some(node) = self.winner_node(winners, &group, &artifact) else {
+                continue;
+            };
+            for edge in &node.edges {
+                if edge_scope.is_none_or(|scope| edge.scope == scope) {
+                    queue.push_back((edge.group.clone(), edge.artifact.clone()));
+                }
+            }
+        }
+        reachable
+            .into_iter()
+            .map(|(group, artifact)| {
+                let version = winners[&(group.clone(), artifact.clone())].clone();
+                let packaging = self
+                    .winner_node(winners, &group, &artifact)
+                    .map(|node| node.packaging.clone())
+                    .unwrap_or_else(|| "jar".to_owned());
+                ((group, artifact), (version, packaging))
+            })
+            .collect()
+    }
+
+    /// Downloads the jar for every node in `set`, returning their paths in
+    /// deterministic (`group`, `artifact`) order. Nodes whose packaging is
+    /// not a plain jar contribute no file; unsupported packaging is noted.
+    fn materialize(
+        &mut self,
+        set: &BTreeMap<(String, String), (String, String)>,
+    ) -> Result<Vec<PathBuf>, ResolveError> {
+        let mut jars = Vec::new();
+        for ((group, artifact), (version, packaging)) in set {
+            match packaging.as_str() {
+                "pom" => {}
+                "jar" => {
+                    let (path, _) = self
+                        .resolver
+                        .fetch_cached(group, artifact, version, "jar")?;
+                    jars.push(path);
+                }
+                other => self.notes.push(format!(
+                    "{group}:{artifact}:{version} uses packaging '{other}'; only jar \
+                     artifacts are materialized for now"
+                )),
+            }
+        }
+        Ok(jars)
+    }
+}
+
+fn merge(
+    base: BTreeMap<(String, String), (String, String)>,
+    extra: BTreeMap<(String, String), (String, String)>,
+) -> BTreeMap<(String, String), (String, String)> {
+    let mut merged = base;
+    for (key, value) in extra {
+        merged.entry(key).or_insert(value);
+    }
+    merged
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn repo_pom(
+        group: &str,
+        artifact: &str,
+        version: &str,
+        children: &[(&str, &str, &str)],
+    ) -> String {
+        let mut pom = format!(
+            "<?xml version=\"1.0\"?><project><modelVersion>4.0.0</modelVersion>\
+             <groupId>{group}</groupId><artifactId>{artifact}</artifactId><version>{version}</version>"
+        );
+        if !children.is_empty() {
+            pom.push_str("<dependencies>");
+            for (child, child_version, scope) in children {
+                let child_group = child.split(':').next().unwrap();
+                let child_artifact = child.split(':').nth(1).unwrap();
+                let scope_tag = if scope.is_empty() {
+                    String::new()
+                } else {
+                    format!("<scope>{scope}</scope>")
+                };
+                pom.push_str(&format!(
+                    "<dependency><groupId>{child_group}</groupId>\
+                     <artifactId>{child_artifact}</artifactId><version>{child_version}</version>{scope_tag}</dependency>"
+                ));
+            }
+            pom.push_str("</dependencies>");
+        }
+        pom.push_str("</project>");
+        pom
+    }
+
+    fn write_artifact(root: &Path, group: &str, artifact: &str, version: &str, pom: &str) {
+        let rel = format!(
+            "{}/{}/{}/{}-{}",
+            group.replace('.', "/"),
+            artifact,
+            version,
+            artifact,
+            version
+        );
+        std::fs::create_dir_all(root.join(&rel)).unwrap();
+        std::fs::write(root.join(format!("{rel}.pom")), pom).unwrap();
+        std::fs::write(
+            root.join(format!("{rel}.jar")),
+            format!("{artifact}-{version}"),
+        )
+        .unwrap();
+    }
+
+    struct LocalRepo {
+        root: PathBuf,
+    }
+
+    impl LocalRepo {
+        fn new() -> LocalRepo {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "uliab-maven-test-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            LocalRepo { root }
+        }
+
+        fn add(&self, group: &str, artifact: &str, version: &str, children: &[(&str, &str, &str)]) {
+            write_artifact(
+                &self.root,
+                group,
+                artifact,
+                version,
+                &repo_pom(group, artifact, version, children),
+            );
+        }
+
+        fn resolver(&self) -> Resolver {
+            Resolver::new(
+                vec![MavenRepo::Custom(self.root.display().to_string())],
+                Some(self.root.join("cache")),
+            )
+        }
+    }
+
+    fn declared(scope: MavenScope, coordinate: &str) -> DeclaredDep {
+        DeclaredDep {
+            scope,
+            dependency: Dependency::parse(coordinate).unwrap(),
+        }
+    }
+
+    fn jar_names(paths: &[PathBuf]) -> Vec<String> {
+        paths
+            .iter()
+            .filter_map(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn parses_coordinates() {
+        let dependency = Dependency::parse("com.example:app:1.2.3").expect("parses");
+        assert_eq!(dependency.group, "com.example");
+        assert_eq!(dependency.artifact, "app");
+        assert_eq!(dependency.version, "1.2.3");
+        assert!(Dependency::parse("com.example:app").is_err());
+        assert!(Dependency::parse("com.example:app:1:extra").is_err());
+        assert!(Dependency::parse("::").is_err());
+    }
+
+    #[test]
+    fn parses_a_deps_block() {
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "implementation".to_owned(),
+            Value::Str("com.example:app:1.0".to_owned()),
+        );
+        entries.insert(
+            "ksp".to_owned(),
+            Value::List(vec![
+                Value::Coordinate("com.example:proc:2.0".to_owned()),
+                Value::Coordinate("com.example:proc2:2.0".to_owned()),
+            ]),
+        );
+        entries.insert(
+            "runtimeOnly".to_owned(),
+            Value::Str("com.example:run:1.0".to_owned()),
+        );
+        let deps = parse_deps_block(&Value::Block(entries)).expect("parses");
+        assert_eq!(deps.len(), 4);
+        assert_eq!(deps[0].scope, MavenScope::Implementation);
+        assert_eq!(deps[0].dependency.artifact, "app");
+        assert_eq!(deps[2].scope, MavenScope::Ksp);
+        assert_eq!(deps[3].scope, MavenScope::RuntimeOnly);
+        assert_eq!(deps[3].dependency.artifact, "run");
+    }
+
+    #[test]
+    fn rejects_unknown_scope_and_bad_values() {
+        let mut entries = BTreeMap::new();
+        entries.insert("notAScope".to_owned(), Value::Str("a:b:1".to_owned()));
+        assert!(parse_deps_block(&Value::Block(entries)).is_err());
+
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "implementation".to_owned(),
+            Value::Number(ulb_lang::token::Number::Int(1)),
+        );
+        assert!(parse_deps_block(&Value::Block(entries)).is_err());
+
+        let mut entries = BTreeMap::new();
+        entries.insert("implementation".to_owned(), Value::Str("a:b".to_owned()));
+        assert!(parse_deps_block(&Value::Block(entries)).is_err());
+    }
+
+    #[test]
+    fn maven_version_ordering() {
+        assert_eq!(compare_maven_versions("1.0", "1.0.0"), Ordering::Equal);
+        assert_eq!(compare_maven_versions("1.0.1", "1.0"), Ordering::Greater);
+        assert_eq!(compare_maven_versions("2.10.0", "2.1.0"), Ordering::Greater);
+        assert_eq!(
+            compare_maven_versions("1.0.0-rc1", "1.0.0-beta1"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_maven_versions("1.0.0-rc2", "1.0.0-rc1"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_maven_versions("1.0.0-snapshot", "1.0.0-rc1"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_maven_versions("1.0.0", "1.0.0-snapshot"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_maven_versions("1.0.0-sp1", "1.0.0"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_maven_versions("1.0.0-alpha1", "1.0.0"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_maven_versions("2.0.0", "2.0.0-alpha"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_maven_versions("1.0.0-1", "1.0.0"),
+            Ordering::Greater
+        );
+        assert_eq!(compare_maven_versions("1.0.0", "1.0.0-1"), Ordering::Less);
+    }
+
+    #[test]
+    fn parses_pom_compile_and_runtime_deps() {
+        let pom = r#"<?xml version="1.0"?>
+        <project>
+          <modelVersion>4.0.0</modelVersion>
+          <groupId>com.example</groupId><artifactId>root</artifactId><version>1.0</version>
+          <dependencies>
+            <dependency>
+              <groupId>com.example</groupId><artifactId>a</artifactId><version>1.0</version>
+            </dependency>
+            <dependency>
+              <groupId>com.example</groupId><artifactId>b</artifactId><version>1.0</version>
+              <scope>runtime</scope>
+            </dependency>
+            <dependency>
+              <groupId>com.example</groupId><artifactId>c</artifactId><version>1.0</version>
+              <scope>test</scope>
+            </dependency>
+            <dependency>
+              <groupId>com.example</groupId><artifactId>d</artifactId><version>1.0</version>
+              <optional>true</optional>
+            </dependency>
+          </dependencies>
+        </project>"#;
+        let parsed = parse_pom(pom.as_bytes()).expect("parses");
+        assert_eq!(parsed.packaging, "jar");
+        assert_eq!(parsed.deps.len(), 2);
+        assert_eq!(parsed.deps[0].scope, PomScope::Compile);
+        assert_eq!(parsed.deps[1].scope, PomScope::Runtime);
+    }
+
+    #[test]
+    fn parses_pom_ignoring_dependency_management() {
+        let pom = r#"<project>
+          <groupId>com.example</groupId><artifactId>root</artifactId><version>1.0</version>
+          <dependencyManagement>
+            <dependencies>
+              <dependency>
+                <groupId>com.example</groupId><artifactId>managed</artifactId><version>1.0</version>
+              </dependency>
+            </dependencies>
+          </dependencyManagement>
+          <dependencies>
+            <dependency>
+              <groupId>com.example</groupId><artifactId>real</artifactId><version>1.0</version>
+            </dependency>
+          </dependencies>
+        </project>"#;
+        let parsed = parse_pom(pom.as_bytes()).expect("parses");
+        assert_eq!(parsed.deps.len(), 1);
+        assert_eq!(parsed.deps[0].artifact, "real");
+    }
+
+    #[test]
+    fn parses_pom_packaging() {
+        let pom = "<project><packaging>aar</packaging></project>";
+        assert_eq!(parse_pom(pom.as_bytes()).unwrap().packaging, "aar");
+        assert_eq!(parse_pom(b"<project></project>").unwrap().packaging, "jar");
+    }
+
+    #[test]
+    fn resolves_transitive_compile_classpath() {
+        let repo = LocalRepo::new();
+        repo.add(
+            "com.example",
+            "one",
+            "1.0",
+            &[("com.example:two", "1.0", "")],
+        );
+        repo.add("com.example", "two", "1.0", &[]);
+        let resolution = repo
+            .resolver()
+            .resolve(&[declared(MavenScope::Implementation, "com.example:one:1.0")])
+            .expect("resolves");
+        assert_eq!(
+            jar_names(&resolution.classpath.compile),
+            vec!["one-1.0.jar", "two-1.0.jar"]
+        );
+        assert_eq!(
+            jar_names(&resolution.classpath.runtime),
+            vec!["one-1.0.jar", "two-1.0.jar"]
+        );
+    }
+
+    #[test]
+    fn runtime_only_and_compile_only_scopes() {
+        let repo = LocalRepo::new();
+        repo.add("com.example", "a", "1.0", &[]);
+        repo.add("com.example", "b", "1.0", &[]);
+        let resolution = repo
+            .resolver()
+            .resolve(&[
+                declared(MavenScope::RuntimeOnly, "com.example:a:1.0"),
+                declared(MavenScope::CompileOnly, "com.example:b:1.0"),
+            ])
+            .expect("resolves");
+        assert_eq!(jar_names(&resolution.classpath.compile), vec!["b-1.0.jar"]);
+        assert_eq!(jar_names(&resolution.classpath.runtime), vec!["a-1.0.jar"]);
+    }
+
+    #[test]
+    fn compile_only_dep_does_not_leak_children() {
+        let repo = LocalRepo::new();
+        repo.add(
+            "com.example",
+            "tool",
+            "1.0",
+            &[("com.example:helper", "1.0", "")],
+        );
+        repo.add("com.example", "helper", "1.0", &[]);
+        let resolution = repo
+            .resolver()
+            .resolve(&[declared(MavenScope::CompileOnly, "com.example:tool:1.0")])
+            .expect("resolves");
+        assert_eq!(
+            jar_names(&resolution.classpath.compile),
+            vec!["tool-1.0.jar"]
+        );
+    }
+
+    #[test]
+    fn runtime_closure_includes_runtime_scope_edges() {
+        let repo = LocalRepo::new();
+        repo.add(
+            "com.example",
+            "app",
+            "1.0",
+            &[("com.example:rt", "1.0", "runtime")],
+        );
+        repo.add("com.example", "rt", "1.0", &[]);
+        let resolution = repo
+            .resolver()
+            .resolve(&[declared(MavenScope::Implementation, "com.example:app:1.0")])
+            .expect("resolves");
+        assert_eq!(
+            jar_names(&resolution.classpath.compile),
+            vec!["app-1.0.jar"]
+        );
+        assert_eq!(
+            jar_names(&resolution.classpath.runtime),
+            vec!["app-1.0.jar", "rt-1.0.jar"]
+        );
+    }
+
+    #[test]
+    fn conflict_resolves_to_highest_version() {
+        let repo = LocalRepo::new();
+        repo.add(
+            "com.example",
+            "app",
+            "1.0",
+            &[("com.example:lib", "1.0", "")],
+        );
+        repo.add("com.example", "lib", "1.0", &[]);
+        repo.add("com.example", "lib", "2.0", &[]);
+        let resolution = repo
+            .resolver()
+            .resolve(&[
+                declared(MavenScope::Implementation, "com.example:app:1.0"),
+                declared(MavenScope::Implementation, "com.example:lib:2.0"),
+            ])
+            .expect("resolves");
+        assert_eq!(
+            jar_names(&resolution.classpath.runtime),
+            vec!["app-1.0.jar", "lib-2.0.jar"]
+        );
+        let superseded = resolution
+            .notes
+            .iter()
+            .find(|note| note.contains("superseded"));
+        assert!(superseded.is_some(), "notes: {:?}", resolution.notes);
+        assert!(superseded.unwrap().contains("lib:1.0"));
+    }
+
+    #[test]
+    fn test_scope_layers_on_main_classpath() {
+        let repo = LocalRepo::new();
+        repo.add("com.example", "main", "1.0", &[]);
+        repo.add("com.example", "t", "1.0", &[]);
+        let resolution = repo
+            .resolver()
+            .resolve(&[
+                declared(MavenScope::Implementation, "com.example:main:1.0"),
+                declared(MavenScope::TestImplementation, "com.example:t:1.0"),
+            ])
+            .expect("resolves");
+        assert_eq!(
+            jar_names(&resolution.classpath.test_compile),
+            vec!["main-1.0.jar", "t-1.0.jar"]
+        );
+        assert_eq!(
+            jar_names(&resolution.classpath.test_runtime),
+            vec!["main-1.0.jar", "t-1.0.jar"]
+        );
+    }
+
+    #[test]
+    fn processor_scope_collects_ksp_deps() {
+        let repo = LocalRepo::new();
+        repo.add("com.example", "proc", "1.0", &[]);
+        let resolution = repo
+            .resolver()
+            .resolve(&[declared(MavenScope::Ksp, "com.example:proc:1.0")])
+            .expect("resolves");
+        assert_eq!(
+            jar_names(&resolution.classpath.processor),
+            vec!["proc-1.0.jar"]
+        );
+        assert!(resolution.classpath.compile.is_empty());
+    }
+
+    #[test]
+    fn pom_packaging_contributes_no_jar() {
+        let repo = LocalRepo::new();
+        repo.add(
+            "com.example",
+            "bom",
+            "1.0",
+            &[("com.example:real", "1.0", "")],
+        );
+        repo.add("com.example", "real", "1.0", &[]);
+        let bom_pom = repo_pom(
+            "com.example",
+            "bom",
+            "1.0",
+            &[("com.example:real", "1.0", "")],
+        )
+        .replace("<project>", "<project><packaging>pom</packaging>");
+        write_artifact(&repo.root, "com.example", "bom", "1.0", &bom_pom);
+        let resolution = repo
+            .resolver()
+            .resolve(&[declared(MavenScope::Implementation, "com.example:bom:1.0")])
+            .expect("resolves");
+        assert_eq!(
+            jar_names(&resolution.classpath.compile),
+            vec!["real-1.0.jar"]
+        );
+    }
+
+    #[test]
+    fn skips_property_versions_with_a_note() {
+        let repo = LocalRepo::new();
+        repo.add(
+            "com.example",
+            "app",
+            "1.0",
+            &[("com.example:lib", "${lib.version}", "")],
+        );
+        repo.add("com.example", "lib", "1.0", &[]);
+        let resolution = repo
+            .resolver()
+            .resolve(&[declared(MavenScope::Implementation, "com.example:app:1.0")])
+            .expect("resolves");
+        assert_eq!(
+            jar_names(&resolution.classpath.runtime),
+            vec!["app-1.0.jar"]
+        );
+        assert!(
+            resolution
+                .notes
+                .iter()
+                .any(|note| note.contains("property version")),
+            "notes: {:?}",
+            resolution.notes
+        );
+    }
+
+    #[test]
+    fn cache_serves_a_second_resolution() {
+        let repo = LocalRepo::new();
+        repo.add("com.example", "one", "1.0", &[]);
+        let resolver = repo.resolver();
+        let first = resolver
+            .resolve(&[declared(MavenScope::Implementation, "com.example:one:1.0")])
+            .expect("resolves");
+        let jar_path = &first.classpath.compile[0];
+        let pom_path = jar_path.with_extension("pom");
+        assert!(pom_path.exists());
+        assert!(sha_path(jar_path).exists());
+        assert!(sha_path(&pom_path).exists());
+        assert_ne!(sha_path(jar_path), sha_path(&pom_path));
+
+        std::fs::remove_dir_all(repo.root.join("com")).unwrap();
+        let cached = resolver
+            .resolve(&[declared(MavenScope::Implementation, "com.example:one:1.0")])
+            .expect("served from cache without the repository");
+        assert_eq!(first.classpath.compile, cached.classpath.compile);
+    }
+
+    #[test]
+    fn a_corrupted_cache_entry_is_refetched() {
+        let repo = LocalRepo::new();
+        repo.add("com.example", "one", "1.0", &[]);
+        let resolver = repo.resolver();
+        resolver
+            .resolve(&[declared(MavenScope::Implementation, "com.example:one:1.0")])
+            .expect("resolves");
+        let jar_path = &resolver
+            .resolve(&[declared(MavenScope::Implementation, "com.example:one:1.0")])
+            .expect("resolves")
+            .classpath
+            .compile[0];
+        std::fs::write(jar_path, b"corrupted").unwrap();
+        resolver
+            .resolve(&[declared(MavenScope::Implementation, "com.example:one:1.0")])
+            .expect("refetches and recovers");
+        assert_eq!(std::fs::read(jar_path).unwrap(), b"one-1.0");
+    }
+
+    #[test]
+    fn missing_artifact_errors() {
+        let repo = LocalRepo::new();
+        let error = repo
+            .resolver()
+            .resolve(&[declared(
+                MavenScope::Implementation,
+                "com.example:absent:1.0",
+            )])
+            .expect_err("not found");
+        assert!(matches!(error, ResolveError::NotFound { .. }), "{error}");
+    }
+}

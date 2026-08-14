@@ -11,6 +11,7 @@
 
 pub mod driver;
 pub mod host;
+pub mod maven;
 pub mod project;
 pub mod registry;
 pub mod task;
