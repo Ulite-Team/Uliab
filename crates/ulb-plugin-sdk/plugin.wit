@@ -1,5 +1,68 @@
 package ulite:ulb;
 
+/// The host capability a plugin uses to register build tasks during
+/// `configure`. The host implements this interface; a plugin calls it
+/// through the handle `configure` passes it (ARCHITECTURE.md §3.2).
+interface task-registrar {
+    /// A tool the core allowlists for `run_tool` actions
+    /// (ARCHITECTURE.md §3.5). The set is closed and core-owned; the host
+    /// refuses a task whose action names anything outside it.
+    enum allowlisted-tool {
+        cp,
+        cat,
+        mkdir,
+        echo,
+    }
+
+    /// Arguments for an action that copies one file to another.
+    record copy-args {
+        source: string,
+        destination: string,
+    }
+
+    /// Arguments for an action that runs an allowlisted tool.
+    record run-tool-args {
+        /// The allowlisted tool to run.
+        tool: allowlisted-tool,
+        /// Tool arguments, in order.
+        args: list<string>,
+        /// Working directory the tool runs in.
+        cwd: string,
+    }
+
+    /// The closed set of actions a task may perform (§4.1). A task
+    /// carries exactly one action; there is no way to chain several.
+    variant action {
+        /// Copy one file to another, creating the destination directory.
+        copy-file(copy-args),
+        /// Run an allowlisted tool with arguments in a working directory.
+        run-tool(run-tool-args),
+    }
+
+    /// A unit of work a plugin registers during configuration (§4.1).
+    record task {
+        /// Task name, e.g. "compileReleaseKotlin".
+        name: string,
+        /// Declared input files; their contents feed the task's input
+        /// fingerprint (§10). A declared input may not exist yet when the
+        /// task is scheduled.
+        inputs: list<string>,
+        /// Declared output files (informational).
+        outputs: list<string>,
+        /// Names of tasks in the same module this one depends on. An
+        /// undefined name is a resolution error at schedule time.
+        depends-on: list<string>,
+        /// The single action this task performs.
+        action: action,
+    }
+
+    /// Registers `task` into the module's task graph.
+    ///
+    /// Returns an error when the module already has a task of the same
+    /// name, or when the action names a tool that is not allowlisted.
+    register-task: func(task: task) -> result<_, string>;
+}
+
 /// The interface every plugin component exports.
 interface ulb-plugin {
     /// Identity and ABI compatibility a plugin declares about itself. The
@@ -18,13 +81,25 @@ interface ulb-plugin {
     /// Declares the plugin's identity and ABI compatibility.
     manifest: func() -> plugin-manifest;
 
-    /// Runs the plugin against `input` and returns the result. This is the
-    /// single entry point for the initial ABI; later ABI versions replace
-    /// it with a `configure(module-config, task-registrar)` shape.
+    /// Called by the host during configuration (ARCHITECTURE.md §9 step
+    /// 7). `module-config` is the JSON serialization of the module's
+    /// resolved configuration block; the plugin validates the keys it
+    /// owns and registers its tasks through the `task-registrar` import.
+    /// This is the plugin's only way to affect the build.
+    ///
+    /// Returns an error when the plugin rejects the configuration or when
+    /// it could not register the tasks it needs.
+    configure: func(module-config: string) -> result<_, string>;
+
+    /// Runs the plugin against `input` and returns the result. This is
+    /// the trivial entry point of the initial ABI, kept for debugging and
+    /// for plugins that have no build tasks; the build-relevant entry
+    /// point is `configure`.
     run: func(input: string) -> string;
 }
 
 /// A plugin component: exactly one world exporting `ulb-plugin`.
 world plugin {
     export ulb-plugin;
+    import task-registrar;
 }
