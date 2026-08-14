@@ -520,7 +520,11 @@ impl Executor {
     ) -> Result<BuildResult, GraphError> {
         let waves = graph.waves()?;
         let mut result = BuildResult::default();
-        let mut known_success: BTreeSet<String> = BTreeSet::new();
+        // Tasks classified UP-TO-DATE this run. A task is skipped only when
+        // every dependency was also UP-TO-DATE (§4.2 step 3), so a task that
+        // re-ran this build forces its dependents to re-run too even when
+        // their own fingerprints still match.
+        let mut up_to_date_keys: BTreeSet<String> = BTreeSet::new();
 
         for wave in &waves {
             if result.failure.is_some() {
@@ -528,28 +532,29 @@ impl Executor {
                 continue;
             }
 
-            let mut to_run: Vec<&Task> = Vec::new();
+            let mut to_run: Vec<(&Task, String)> = Vec::new();
             let mut up_to_date: Vec<String> = Vec::new();
             for task in wave {
                 let key = format!("{}::{}", task.module, task.name);
-                let deps_ok = task
+                let deps_up_to_date = task
                     .depends_on
                     .iter()
-                    .all(|dep| known_success.contains(&format!("{}::{dep}", task.module)));
-                if deps_ok && store.is_up_to_date(&key, &fingerprint(task, ctx)) {
+                    .all(|dep| up_to_date_keys.contains(&format!("{}::{dep}", task.module)));
+                let fingerprint = fingerprint(task, ctx);
+                if deps_up_to_date && store.is_up_to_date(&key, &fingerprint) {
+                    up_to_date_keys.insert(key.clone());
                     up_to_date.push(key);
                 } else {
-                    to_run.push(task);
+                    to_run.push((task, fingerprint));
                 }
             }
 
             let outcomes = self.run_in_parallel(&to_run);
-            for (task, outcome) in to_run.iter().zip(outcomes) {
+            for ((task, fingerprint), outcome) in to_run.iter().zip(outcomes) {
                 let key = format!("{}::{}", task.module, task.name);
                 match outcome {
                     Ok(()) => {
-                        store.record(&key, &fingerprint(task, ctx));
-                        known_success.insert(key);
+                        store.record(&key, fingerprint);
                         result.ran += 1;
                     }
                     Err(error) => {
@@ -559,10 +564,7 @@ impl Executor {
                     }
                 }
             }
-            for key in up_to_date {
-                known_success.insert(key);
-                result.up_to_date += 1;
-            }
+            result.up_to_date += up_to_date.len();
         }
         Ok(result)
     }
@@ -581,9 +583,9 @@ impl Executor {
 
     /// Runs tasks on a fixed worker pool, returning one outcome per task
     /// in input order.
-    fn run_in_parallel(&self, tasks: &[&Task]) -> Vec<Result<(), String>> {
+    fn run_in_parallel(&self, tasks: &[(&Task, String)]) -> Vec<Result<(), String>> {
         if tasks.len() == 1 {
-            return vec![(self.runner)(tasks[0])];
+            return vec![self.run_caught(tasks[0].0)];
         }
         let workers = self.workers.min(tasks.len()).max(1);
         let queue = Mutex::new(VecDeque::from_iter(0..tasks.len()));
@@ -594,7 +596,7 @@ impl Executor {
                     loop {
                         let index = queue.lock().unwrap().pop_front();
                         let Some(index) = index else { break };
-                        let outcome = (self.runner)(tasks[index]);
+                        let outcome = self.run_caught(tasks[index].0);
                         results.lock().unwrap()[index] = Some(outcome);
                     }
                 });
@@ -604,8 +606,20 @@ impl Executor {
             .into_inner()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .into_iter()
-            .map(|outcome| outcome.unwrap_or(Ok(())))
+            .map(|outcome| outcome.unwrap_or_else(|| Err("task produced no result".to_owned())))
             .collect()
+    }
+
+    /// Runs one task, converting a panicking runner into an error so a
+    /// buggy action is a task failure rather than a build crash.
+    fn run_caught(&self, task: &Task) -> Result<(), String> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.runner)(task))) {
+            Ok(outcome) => outcome,
+            Err(payload) => Err(format!(
+                "task runner panicked: {}",
+                panic_message(payload.as_ref())
+            )),
+        }
     }
 
     /// Test-only constructor with an injected runner and worker count.
@@ -701,6 +715,18 @@ fn render_action(action: &TaskAction) -> String {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Recovers a readable message from a caught panic payload, for reporting
+/// in a [`TaskFailure`].
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_owned()
+    }
 }
 
 #[cfg(test)]
@@ -952,6 +978,77 @@ mod tests {
             .execute(&graph, &ctx("cfg"), &mut store)
             .unwrap();
         assert_eq!((result.ran, result.up_to_date), (2, 0));
+    }
+
+    #[test]
+    fn dependent_reruns_when_its_dependency_reran() {
+        let root = temp_dir("deprerun");
+        std::fs::write(root.join("in.txt"), "v1").unwrap();
+        let mut graph = TaskGraph::new();
+        // d reads in.txt and writes d.out; e depends on d and declares no
+        // inputs, so e's fingerprint never changes.
+        graph
+            .register(Task::leaf(
+                "d",
+                "app",
+                vec![root.join("in.txt")],
+                vec![root.join("d.out")],
+                TaskAction::Copy {
+                    from: root.join("in.txt"),
+                    to: root.join("d.out"),
+                },
+            ))
+            .unwrap();
+        graph
+            .register(Task {
+                depends_on: vec!["d".to_owned()],
+                ..Task::leaf(
+                    "e",
+                    "app",
+                    vec![],
+                    vec![root.join("e.out")],
+                    TaskAction::Copy {
+                        from: root.join("d.out"),
+                        to: root.join("e.out"),
+                    },
+                )
+            })
+            .unwrap();
+
+        let executor = Executor::new([]);
+        let ctx = ctx("cfg");
+        let mut store = FingerprintStore::load(root.join("state.json")).unwrap();
+        executor
+            .execute(&graph, &ctx, &mut store)
+            .expect("schedules");
+
+        // d's input changes: d reruns, and e must rerun too even though its
+        // own fingerprint is unchanged (§4.2 step 3).
+        std::fs::write(root.join("in.txt"), "v2").unwrap();
+        let result = executor
+            .execute(&graph, &ctx, &mut store)
+            .expect("schedules");
+        assert_eq!((result.ran, result.up_to_date), (2, 0));
+        assert_eq!(std::fs::read(root.join("e.out")).unwrap(), b"v2");
+    }
+
+    #[test]
+    fn a_panicking_runner_is_a_task_failure_not_a_crash() {
+        let runner: Runner = Arc::new(|_| panic!("runner exploded"));
+        let executor = Executor::with_runner(vec![], 2, runner);
+        let mut graph = TaskGraph::new();
+        for name in ["a", "b"] {
+            graph.register(copy_task(name, "x", "y")).unwrap();
+        }
+        let result = executor
+            .execute(
+                &graph,
+                &ctx("cfg"),
+                &mut FingerprintStore::load(temp_dir("panic").join("s.json")).unwrap(),
+            )
+            .expect("schedules");
+        let failure = result.failure.expect("task failed");
+        assert!(failure.error.contains("runner exploded"));
     }
 
     #[test]
