@@ -11,10 +11,16 @@
 //!   into the cache on a miss (ARCHITECTURE.md §9, steps 5–6), and prints
 //!   the resulting local artifact paths. `SOURCE` is a registry index URL
 //!   (`https://…`) or a local `index.json` path.
+//! - `uliab build [--project DIR] [--registry SOURCE] [--cache-dir DIR]`
+//!   — evaluates the project, configures each declared plugin with the
+//!   module model, and executes the registered task graphs incrementally
+//!   (ARCHITECTURE.md §9), printing how many tasks ran versus were skipped
+//!   as up-to-date.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use uliab::driver::{BuildOptions, DEFAULT_REGISTRY, build_project};
 use uliab::host::PluginHost;
 use uliab::project::{self, read_libs_plugins};
 use uliab::registry::{Registry, RegistrySource};
@@ -24,13 +30,15 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("run") => cmd_run(&args[1..]),
         Some("plugins") => cmd_plugins(&args[1..]),
+        Some("build") => cmd_build(&args[1..]),
         _ => {
-            eprintln!("usage: uliab <run|plugins> …");
+            eprintln!("usage: uliab <run|plugins|build> …");
             eprintln!("  uliab run <plugin.wasm> [input]");
             eprintln!("  uliab plugins list [--project DIR]");
             eprintln!(
                 "  uliab plugins resolve [--project DIR] [--registry SOURCE] [--cache-dir DIR]"
             );
+            eprintln!("  uliab build [--project DIR] [--registry SOURCE] [--cache-dir DIR]");
             ExitCode::from(2)
         }
     }
@@ -145,10 +153,49 @@ fn resolve_all(specs: &[uliab::registry::PluginSpec], options: &Options) -> Exit
     }
 }
 
-/// The default registry index the tool consults unless `--registry` or
-/// `ULIAB_REGISTRY` points elsewhere.
-const DEFAULT_REGISTRY: &str =
-    "https://raw.githubusercontent.com/Ulite-Team/ulb-plugins/main/registry/index.json";
+/// Runs a full build of a project: evaluate, configure each plugin, and
+/// execute the merged task graphs.
+fn cmd_build(args: &[String]) -> ExitCode {
+    let options = parse_options(args);
+    let Some(project_dir) = options.project_dir.as_ref() else {
+        eprintln!("error: --project DIR is required");
+        return ExitCode::FAILURE;
+    };
+    if !project_dir.is_dir() {
+        eprintln!(
+            "error: project directory '{}' does not exist",
+            project_dir.display()
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let build_options = BuildOptions {
+        registry: options.registry.as_deref().map(parse_registry_source),
+        cache_dir: options.cache_dir.clone(),
+    };
+    match build_project(project_dir, &build_options) {
+        Ok(result) => {
+            if let Some(failure) = &result.failure {
+                eprintln!("error: task '{}' failed: {}", failure.task, failure.error);
+                return ExitCode::FAILURE;
+            }
+            let skipped = if result.skipped > 0 {
+                format!(", {} skipped", result.skipped)
+            } else {
+                String::new()
+            };
+            println!(
+                "build finished: {} ran, {} up-to-date{skipped}",
+                result.ran, result.up_to_date
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
 fn parse_registry_source(source: &str) -> RegistrySource {
     if source.starts_with("http://") || source.starts_with("https://") {
