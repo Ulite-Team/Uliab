@@ -140,6 +140,67 @@ fn configure_reports_plugin_rejection() {
 }
 
 #[test]
+fn write_file_task_generates_and_reruns_on_content_change() {
+    let plugin = build_fixture("ulb-plugin-fixture");
+    let workdir = temp_workdir("write-file");
+    let generated = workdir.join("generated/Runner.java");
+    std::fs::write(workdir.join("in.txt"), "input").unwrap();
+    let config_json = format!(
+        r#"{{"source": {}, "output": {}, "writeProbe": {{"path": {}, "contents": "v1"}}}}"#,
+        serde_json::to_string(&workdir.join("in.txt").display().to_string()).unwrap(),
+        serde_json::to_string(&workdir.join("out.txt").display().to_string()).unwrap(),
+        serde_json::to_string(&generated.display().to_string()).unwrap(),
+    );
+
+    let host = PluginHost::new().expect("host engine");
+    let graph = host
+        .configure(&plugin, "app", &config_json)
+        .expect("plugin configures");
+    assert_eq!(
+        graph
+            .get("app", "write-probe")
+            .expect("write-probe task")
+            .action,
+        uliab::task::TaskAction::WriteFile {
+            to: generated.clone(),
+            contents: "v1".to_owned(),
+        }
+    );
+
+    let ctx = FingerprintContext {
+        plugin_version: "0.1.0".to_owned(),
+        config_hash: "cfg-write".to_owned(),
+    };
+    let mut store = FingerprintStore::load(workdir.join("state.json")).unwrap();
+    let executor = Executor::new([uliab::task::AllowlistedTool::Echo]);
+
+    let first = executor
+        .execute(&graph, &ctx, &mut store)
+        .expect("schedules");
+    assert_eq!(first.ran, 3);
+    assert_eq!(std::fs::read(&generated).unwrap(), b"v1");
+
+    let second = executor
+        .execute(&graph, &ctx, &mut store)
+        .expect("schedules");
+    assert_eq!((second.ran, second.up_to_date), (0, 3));
+
+    // A second configure with different write contents produces a different
+    // write action. Under the same config hash the write task's own
+    // fingerprint (the rendered action includes the contents) is what forces
+    // it to rerun, while the copy and echo tasks stay up-to-date.
+    let changed_config_json = config_json.replace("\"contents\": \"v1\"", "\"contents\": \"v2\"");
+    let changed_graph = host
+        .configure(&plugin, "app", &changed_config_json)
+        .expect("plugin reconfigures");
+    let third = executor
+        .execute(&changed_graph, &ctx, &mut store)
+        .expect("schedules");
+    assert_eq!((third.ran, third.up_to_date), (1, 2));
+    assert_eq!(std::fs::read(&generated).unwrap(), b"v2");
+}
+
+#[test]
 fn legacy_component_still_instantiates_and_runs() {
     let plugin = build_fixture("ulb-plugin-legacy-fixture");
     let host = PluginHost::new().expect("host engine");

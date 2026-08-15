@@ -3,8 +3,8 @@
 //! Tasks are the unit of work a plugin registers during configuration
 //! (§4.1): a name scoped to the module that registered it, declared input
 //! and output files, `dependsOn` edges to sibling tasks in the same
-//! module, and a closed action — either copying a file or running one of
-//! the core allowlisted tools (§3.5). The graph is a DAG; [`TaskGraph`]
+//! module, and a closed action — copying a file, writing a file with
+//! fixed contents, or running one of the core allowlisted tools (§3.5). The graph is a DAG; [`TaskGraph`]
 //! partitions it into waves of tasks that can run concurrently (§4.2) and
 //! detects dependency cycles.
 //!
@@ -90,6 +90,15 @@ pub enum TaskAction {
         from: PathBuf,
         /// Destination file.
         to: PathBuf,
+    },
+    /// Write a file with fixed contents, creating the destination directory
+    /// if it does not exist. The contents are part of the task's fingerprint,
+    /// so changing them re-runs the task.
+    WriteFile {
+        /// Destination file.
+        to: PathBuf,
+        /// Exact contents to write.
+        contents: String,
     },
     /// Run an allowlisted tool with arguments in a working directory.
     RunTool {
@@ -664,6 +673,15 @@ fn run_action(allowlist: &HashSet<AllowlistedTool>, task: &Task) -> Result<(), S
                 .map_err(|error| format!("copy {} -> {}: {error}", from.display(), to.display()))?;
             Ok(())
         }
+        TaskAction::WriteFile { to, contents } => {
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| format!("creating {}: {error}", parent.display()))?;
+            }
+            std::fs::write(to, contents)
+                .map_err(|error| format!("writing {}: {error}", to.display()))?;
+            Ok(())
+        }
         TaskAction::RunTool { tool, args, cwd } => {
             if !allowlist.contains(tool) {
                 return Err(format!("tool '{}' is not on the allowlist", tool.as_str()));
@@ -717,6 +735,9 @@ fn render_action(action: &TaskAction) -> String {
     match action {
         TaskAction::Copy { from, to } => {
             format!("copy {} -> {}", from.display(), to.display())
+        }
+        TaskAction::WriteFile { to, contents } => {
+            format!("write {} with <<{contents}>>", to.display())
         }
         TaskAction::RunTool { tool, args, cwd } => {
             format!(
@@ -1184,6 +1205,48 @@ mod tests {
             std::fs::read(root.join("nested/deep/out.txt")).unwrap(),
             b"data"
         );
+    }
+
+    #[test]
+    fn write_file_creates_the_destination_directory_and_contents() {
+        let root = temp_dir("writefile");
+        let task = Task::leaf(
+            "gen",
+            "app",
+            vec![],
+            vec![root.join("generated/Runner.java")],
+            TaskAction::WriteFile {
+                to: root.join("generated/Runner.java"),
+                contents: "public final class Runner {}".to_owned(),
+            },
+        );
+        Executor::new([]).run_task(&task).expect("write ok");
+        assert_eq!(
+            std::fs::read(root.join("generated/Runner.java")).unwrap(),
+            b"public final class Runner {}"
+        );
+    }
+
+    #[test]
+    fn write_file_reruns_when_contents_change() {
+        let root = temp_dir("write-rerun");
+        let to = root.join("gen/Runner.java");
+        let task = |contents: &str| {
+            Task::leaf(
+                "gen",
+                "app",
+                vec![],
+                vec![to.clone()],
+                TaskAction::WriteFile {
+                    to: to.clone(),
+                    contents: contents.to_owned(),
+                },
+            )
+        };
+        let first = fingerprint(&task("v1"), &ctx("cfg"));
+        assert_eq!(first, fingerprint(&task("v1"), &ctx("cfg")));
+        assert_ne!(first, fingerprint(&task("v2"), &ctx("cfg")));
+        assert_ne!(first, fingerprint(&task("v1"), &ctx("other")));
     }
 
     #[test]

@@ -34,6 +34,14 @@ interface task-registrar {
         cwd: string,
     }
 
+    /// Arguments for an action that writes a file with fixed contents.
+    record write-file-args {
+        /// Path of the file to write, relative to the project directory.
+        path: string,
+        /// The exact contents to write.
+        contents: string,
+    }
+
     /// The closed set of actions a task may perform (§4.1). A task
     /// carries exactly one action; there is no way to chain several.
     variant action {
@@ -41,6 +49,9 @@ interface task-registrar {
         copy-file(copy-args),
         /// Run an allowlisted tool with arguments in a working directory.
         run-tool(run-tool-args),
+        /// Write a file with fixed contents, creating the destination
+        /// directory.
+        write-file(write-file-args),
     }
 
     /// A unit of work a plugin registers during configuration (§4.1).

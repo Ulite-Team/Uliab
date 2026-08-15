@@ -151,6 +151,10 @@ impl From<bindings::ulite::ulb::task_registrar::Action> for TaskAction {
                 args: args.args,
                 cwd: PathBuf::from(args.cwd),
             },
+            W::WriteFile(args) => TaskAction::WriteFile {
+                to: PathBuf::from(args.path),
+                contents: args.contents,
+            },
         }
     }
 }

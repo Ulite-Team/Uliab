@@ -22,7 +22,9 @@ wit_bindgen::generate!({
     world: "plugin",
 });
 
-use ulite::ulb::task_registrar::{self, Action, AllowlistedTool, CopyArgs, RunToolArgs, Task};
+use ulite::ulb::task_registrar::{
+    self, Action, AllowlistedTool, CopyArgs, RunToolArgs, Task, WriteFileArgs,
+};
 
 /// The fixture plugin: a copy task plus an echo task per configuration.
 struct Fixture;
@@ -150,6 +152,31 @@ impl exports::ulite::ulb::ulb_plugin::Guest for Fixture {
                     tool: AllowlistedTool::Mkdir,
                     args: vec!["-p".to_owned(), format!("{project_dir}/{name}")],
                     cwd: ".".to_owned(),
+                }),
+            })?;
+        }
+
+        // A `writeProbe` config key (`{"path": <file>, "contents": <text>}`)
+        // registers a write-file task producing that file, proving a plugin
+        // can generate a file with fixed contents (the jvm plugin's
+        // generated test runner does exactly this).
+        if let Some(write) = config.get("writeProbe") {
+            let path = write
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "writeProbe is missing a 'path' string".to_owned())?;
+            let contents = write
+                .get("contents")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "writeProbe is missing a 'contents' string".to_owned())?;
+            task_registrar::register_task(&Task {
+                name: "write-probe".to_owned(),
+                inputs: Vec::new(),
+                outputs: vec![path.to_owned()],
+                depends_on: Vec::new(),
+                action: Action::WriteFile(WriteFileArgs {
+                    path: path.to_owned(),
+                    contents: contents.to_owned(),
                 }),
             })?;
         }

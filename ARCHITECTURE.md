@@ -322,8 +322,11 @@ cases the engine knows about.
 
 - **Task** = name, module, inputs (file set + content-hash fingerprints),
   outputs (file set), dependencies (edges), a run action from the closed
-  set the engine understands: `copy`, `run_tool` (§3.5) with an
-  allowlisted tool + args.
+  set the engine understands: `copy`, `write` (§4.1 action list),
+  `run_tool` (§3.5) with an allowlisted tool + args. The `write` action
+  emits a file with fixed contents (creating parent directories) and is
+  how a plugin synthesizes generated sources, such as the jvm plugin's
+  test runner.
 - The **task graph** is the transitive closure of `dependsOn` edges
   across all modules and all plugins active on those modules. Edges are
   directed, acyclic (cycle = resolution error with the cycle path in the
