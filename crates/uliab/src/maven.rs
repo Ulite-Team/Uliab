@@ -487,6 +487,11 @@ fn fetch_one(repo: &MavenRepo, rel: &str) -> Result<Vec<u8>, FetchError> {
     match ureq::get(&url).call() {
         Ok(response) => response
             .into_body()
+            .with_config()
+            // ureq caps `read_to_vec` at 10 MB by default; the KSP toolchain
+            // jar (`symbol-processing-aa`) is tens of megabytes, so artifacts
+            // in that class must not be silently refused.
+            .limit(256 * 1024 * 1024)
             .read_to_vec()
             .map_err(|error| FetchError::Fail(format!("reading response body: {error}"))),
         Err(ureq::Error::StatusCode(404)) => Err(FetchError::Miss),

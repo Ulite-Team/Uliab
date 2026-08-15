@@ -11,14 +11,17 @@
 //!   into the cache on a miss (ARCHITECTURE.md §9, steps 5–6), and prints
 //!   the resulting local artifact paths. `SOURCE` is a registry index URL
 //!   (`https://…`) or a local `index.json` path.
-//! - `uliab build [--project DIR] [--registry SOURCE] [--cache-dir DIR]`
+//! - `uliab build [--project DIR] [--registry SOURCE] [--cache-dir DIR] [--repo REPO]`
 //!   — evaluates the project, configures each declared plugin with the
 //!   module model, and executes the registered task graphs incrementally
 //!   (ARCHITECTURE.md §9), printing how many tasks ran versus were skipped
 //!   as up-to-date.
-//! - `uliab deps resolve [--project DIR] [--cache-dir DIR]` — resolves the
-//!   project's `deps {}` block into a classpath (ARCHITECTURE.md §6, §7)
-//!   against the default repositories, and prints the jars per bucket.
+//! - `uliab deps resolve [--project DIR] [--cache-dir DIR] [--repo REPO]`
+//!   — resolves the project's `deps {}` block into a classpath
+//!   (ARCHITECTURE.md §6, §7) against the default repositories, and prints
+//!   the jars per bucket. A repeatable `--repo REPO` adds a repository
+//!   (`https://`, `file://`, or a plain path) in front of the defaults, so
+//!   a project can resolve against a local repository and stay offline.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -43,8 +46,10 @@ fn main() -> ExitCode {
             eprintln!(
                 "  uliab plugins resolve [--project DIR] [--registry SOURCE] [--cache-dir DIR]"
             );
-            eprintln!("  uliab build [--project DIR] [--registry SOURCE] [--cache-dir DIR]");
-            eprintln!("  uliab deps resolve [--project DIR] [--cache-dir DIR]");
+            eprintln!(
+                "  uliab build [--project DIR] [--registry SOURCE] [--cache-dir DIR] [--repo REPO]"
+            );
+            eprintln!("  uliab deps resolve [--project DIR] [--cache-dir DIR] [--repo REPO]");
             ExitCode::from(2)
         }
     }
@@ -175,10 +180,11 @@ fn cmd_build(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    let repos = repos_for(&options);
     let build_options = BuildOptions {
         registry: options.registry.as_deref().map(parse_registry_source),
         cache_dir: options.cache_dir.clone(),
-        repos: None,
+        repos: (!options.repos.is_empty()).then_some(repos),
     };
     match build_project(project_dir, &build_options) {
         Ok(result) => {
@@ -228,7 +234,7 @@ fn cmd_deps(args: &[String]) -> ExitCode {
     }
     debug_assert_eq!(sub, "resolve");
 
-    let repos = vec![MavenRepo::Google, MavenRepo::Central];
+    let repos = repos_for(&options);
     match resolve_project_deps(project_dir, &repos, options.cache_dir.clone()) {
         Ok(resolution) => {
             for note in &resolution.notes {
@@ -279,6 +285,7 @@ struct Options {
     project_dir: Option<PathBuf>,
     registry: Option<String>,
     cache_dir: Option<PathBuf>,
+    repos: Vec<MavenRepo>,
 }
 
 fn parse_options(args: &[String]) -> Options {
@@ -286,6 +293,7 @@ fn parse_options(args: &[String]) -> Options {
         project_dir: None,
         registry: std::env::var("ULIAB_REGISTRY").ok(),
         cache_dir: None,
+        repos: Vec::new(),
     };
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
@@ -305,8 +313,23 @@ fn parse_options(args: &[String]) -> Options {
                     options.cache_dir = Some(PathBuf::from(value));
                 }
             }
+            "--repo" => {
+                if let Some(value) = iter.next() {
+                    options.repos.push(MavenRepo::Custom(value.clone()));
+                }
+            }
             other => eprintln!("warning: ignoring unknown option '{other}'"),
         }
     }
     options
+}
+
+/// The repository list a build or `deps resolve` should use: any `--repo`
+/// repositories first, then the defaults. A local repository placed first
+/// keeps resolution offline against it.
+fn repos_for(options: &Options) -> Vec<MavenRepo> {
+    let mut repos = options.repos.clone();
+    repos.push(MavenRepo::Google);
+    repos.push(MavenRepo::Central);
+    repos
 }
