@@ -128,7 +128,7 @@ pub struct BuildOptions {
 ///         "ulite/fixture": {
 ///             "versions": {
 ///                 "0.1.0": {
-///                     "abi": { "min": "0.2", "max": "0.2" },
+///                     "abi": { "min": "0.3", "max": "0.3" },
 ///                     "artifact_url": fixture.display().to_string(),
 ///                 }
 ///             }
@@ -263,7 +263,9 @@ pub fn build_project(dir: &Path, options: &BuildOptions) -> Result<BuildResult, 
         AllowlistedTool::Mkdir,
         AllowlistedTool::Echo,
         AllowlistedTool::Javac,
+        AllowlistedTool::Kotlinc,
         AllowlistedTool::Jar,
+        AllowlistedTool::Java,
     ]);
     let result = executor
         .execute(&graph, &ctx, &mut store)

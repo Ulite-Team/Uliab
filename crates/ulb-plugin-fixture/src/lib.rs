@@ -38,6 +38,7 @@ fn parse_tool(name: &str) -> Result<AllowlistedTool, String> {
         "javac" => AllowlistedTool::Javac,
         "kotlinc" => AllowlistedTool::Kotlinc,
         "jar" => AllowlistedTool::Jar,
+        "java" => AllowlistedTool::Java,
         other => return Err(format!("unknown tool '{other}'")),
     })
 }

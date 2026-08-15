@@ -48,11 +48,11 @@ impl AbiRange {
     ///
     /// let range = AbiRange {
     ///     min: "0.1".to_owned(),
-    ///     max: "0.2".to_owned(),
+    ///     max: "0.3".to_owned(),
     /// };
     /// assert!(range.contains("0.1.0"));
-    /// assert!(range.contains("0.2"));
-    /// assert!(!range.contains("0.3"));
+    /// assert!(range.contains("0.3"));
+    /// assert!(!range.contains("0.4"));
     /// assert!(!range.contains("0.0.9"));
     /// ```
     #[must_use]
@@ -95,7 +95,7 @@ pub struct PluginIndexEntry {
 ///     "ulite/hello": {
 ///       "versions": {
 ///         "0.1.0": {
-///           "abi": { "min": "0.2", "max": "0.2" },
+///           "abi": { "min": "0.3", "max": "0.3" },
 ///           "artifact_url": "file:///tmp/hello_plugin.wasm"
 ///         }
 ///       }
@@ -104,7 +104,7 @@ pub struct PluginIndexEntry {
 /// }"#;
 /// let index: RegistryIndex = serde_json::from_str(json).expect("valid index");
 /// assert_eq!(index.schema_version, 1);
-/// assert_eq!(index.plugins["ulite/hello"].versions["0.1.0"].abi.min, "0.2");
+/// assert_eq!(index.plugins["ulite/hello"].versions["0.1.0"].abi.min, "0.3");
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistryIndex {
@@ -668,11 +668,11 @@ mod tests {
             "ulite/hello": {
               "versions": {
                 "0.1.0": {
-                  "abi": { "min": "0.2", "max": "0.2" },
+                  "abi": { "min": "0.3", "max": "0.3" },
                   "artifact_url": "artifacts/hello_plugin.wasm"
                 },
                 "0.2.0": {
-                  "abi": { "min": "0.2", "max": "0.2" },
+                  "abi": { "min": "0.3", "max": "0.3" },
                   "artifact_url": "artifacts/hello_plugin.wasm"
                 }
               }
@@ -687,7 +687,7 @@ mod tests {
         assert_eq!(index.schema_version, 1);
         let hello = &index.plugins["ulite/hello"];
         assert_eq!(hello.versions.len(), 2);
-        assert_eq!(hello.versions["0.1.0"].abi.min, "0.2");
+        assert_eq!(hello.versions["0.1.0"].abi.min, "0.3");
     }
 
     #[test]
@@ -742,7 +742,7 @@ mod tests {
         let (version, abi, warning) =
             select_version(entry, &spec, ulb_plugin_sdk::ABI_VERSION).expect("resolvable");
         assert_eq!(version, "0.2.0");
-        assert_eq!(abi.min, "0.2");
+        assert_eq!(abi.min, "0.3");
         assert!(warning.is_none());
     }
 
@@ -845,8 +845,8 @@ mod tests {
             name: "ulite/hello".to_owned(),
             version: "0.2.0".to_owned(),
             abi: AbiRange {
-                min: "0.2".to_owned(),
-                max: "0.2".to_owned(),
+                min: "0.3".to_owned(),
+                max: "0.3".to_owned(),
             },
         };
         std::fs::write(
@@ -891,7 +891,7 @@ mod tests {
                   "artifact_url": "artifacts/hello_plugin.wasm"
                 },
                 "0.2.0": {
-                  "abi": { "min": "0.1", "max": "0.2" },
+                  "abi": { "min": "0.3", "max": "0.3" },
                   "artifact_url": "artifacts/hello_plugin.wasm"
                 }
               }
@@ -911,8 +911,8 @@ mod tests {
             name: "ulite/hello".to_owned(),
             version: "0.2.0".to_owned(),
             abi: AbiRange {
-                min: "0.1".to_owned(),
-                max: "0.1".to_owned(),
+                min: "0.2".to_owned(),
+                max: "0.2".to_owned(),
             },
         };
         std::fs::write(
@@ -924,7 +924,7 @@ mod tests {
         let registry = Registry {
             source: fixture_source(&dir),
             cache_dir: cache.clone(),
-            host_abi: "0.2".to_owned(),
+            host_abi: ulb_plugin_sdk::ABI_VERSION.to_owned(),
             verifier: fake_verifier_named("0.2.0"),
         };
         let spec = PluginSpec {

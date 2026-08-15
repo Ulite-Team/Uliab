@@ -41,6 +41,8 @@ pub enum AllowlistedTool {
     Kotlinc,
     /// `jar` — archive class files.
     Jar,
+    /// `java` — run a compiled JVM program.
+    Java,
 }
 
 impl AllowlistedTool {
@@ -55,6 +57,7 @@ impl AllowlistedTool {
             Self::Javac => "javac",
             Self::Kotlinc => "kotlinc",
             Self::Jar => "jar",
+            Self::Java => "java",
         }
     }
 
@@ -70,6 +73,7 @@ impl AllowlistedTool {
             "javac" => Some(Self::Javac),
             "kotlinc" => Some(Self::Kotlinc),
             "jar" => Some(Self::Jar),
+            "java" => Some(Self::Java),
             _ => None,
         }
     }

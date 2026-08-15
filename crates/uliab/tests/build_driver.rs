@@ -70,7 +70,7 @@ impl TestProject {
                 "ulite/fixture": {
                     "versions": {
                         "0.1.0": {
-                            "abi": { "min": "0.2", "max": "0.2" },
+                            "abi": { "min": "0.3", "max": "0.3" },
                             "artifact_url": fixture.display().to_string(),
                         }
                     }

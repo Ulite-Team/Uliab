@@ -166,6 +166,7 @@ impl From<bindings::ulite::ulb::task_registrar::AllowlistedTool> for crate::task
             W::Javac => Self::Javac,
             W::Kotlinc => Self::Kotlinc,
             W::Jar => Self::Jar,
+            W::Java => Self::Java,
         }
     }
 }
