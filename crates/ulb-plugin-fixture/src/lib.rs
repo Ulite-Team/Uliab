@@ -9,9 +9,12 @@
 //! host-resolved `classpath` object and a `classpathOutput` path, it
 //! registers a `copy-classpath` task that copies the first compile jar
 //! there, proving a plugin can consume the jars the host resolved for its
-//! `deps {}` block. The `uliab` integration tests build this crate for
-//! `wasm32-wasip2` and drive it through [`uliab::host::PluginHost`] to
-//! prove configure -> task graph -> execute end to end.
+//! `deps {}` block. A `probeTool` config key additionally registers a
+//! no-op `run-tool` task with the named tool, so the host tests can drive
+//! the manifest-declared-tools gate (ARCHITECTURE.md §3.5). The `uliab`
+//! integration tests build this crate for `wasm32-wasip2` and drive it
+//! through [`uliab::host::PluginHost`] to prove configure -> task graph ->
+//! execute end to end.
 #![allow(unsafe_code)]
 
 wit_bindgen::generate!({
@@ -24,12 +27,28 @@ use ulite::ulb::task_registrar::{self, Action, AllowlistedTool, CopyArgs, RunToo
 /// The fixture plugin: a copy task plus an echo task per configuration.
 struct Fixture;
 
+/// Maps a tool name from the module configuration onto the WIT
+/// allowlisted-tool enum.
+fn parse_tool(name: &str) -> Result<AllowlistedTool, String> {
+    Ok(match name {
+        "echo" => AllowlistedTool::Echo,
+        "cp" => AllowlistedTool::Cp,
+        "cat" => AllowlistedTool::Cat,
+        "mkdir" => AllowlistedTool::Mkdir,
+        "javac" => AllowlistedTool::Javac,
+        "kotlinc" => AllowlistedTool::Kotlinc,
+        "jar" => AllowlistedTool::Jar,
+        other => return Err(format!("unknown tool '{other}'")),
+    })
+}
+
 impl exports::ulite::ulb::ulb_plugin::Guest for Fixture {
     fn manifest() -> exports::ulite::ulb::ulb_plugin::PluginManifest {
         exports::ulite::ulb::ulb_plugin::PluginManifest {
             name: "ulite/fixture".to_owned(),
             version: "0.1.0".to_owned(),
-            abi_version: "0.1".to_owned(),
+            abi_version: ulb_plugin_sdk::ABI_VERSION.to_owned(),
+            tools: vec!["echo".to_owned()],
         }
     }
 
@@ -90,6 +109,24 @@ impl exports::ulite::ulb::ulb_plugin::Guest for Fixture {
                 action: Action::CopyFile(CopyArgs {
                     source: compile_jar,
                     destination: classpath_output,
+                }),
+            })?;
+        }
+
+        // A `probeTool` config key registers a no-op run-tool task with that
+        // tool, letting the host tests exercise the manifest-declared-tools
+        // gate (§3.5): a tool the manifest does not declare is refused.
+        if let Some(tool_name) = config.get("probeTool").and_then(serde_json::Value::as_str) {
+            let tool = parse_tool(tool_name)?;
+            task_registrar::register_task(&Task {
+                name: "probe".to_owned(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                depends_on: Vec::new(),
+                action: Action::RunTool(RunToolArgs {
+                    tool,
+                    args: Vec::new(),
+                    cwd: ".".to_owned(),
                 }),
             })?;
         }

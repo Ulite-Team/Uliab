@@ -8,11 +8,17 @@ package ulite:ulb;
 /// `plugin.wit` requires the `configure` export, which an older component
 /// does not have). New components export the extra entry point, which a
 /// legacy-world instantiation simply ignores.
+///
+/// The `plugin-manifest` record below tracks the current shape in
+/// `plugin.wit` (including the `tools` field): the host reads a new
+/// component's `manifest` through this world, so the record layouts must
+/// agree even though the world stops at `manifest`/`run`.
 interface ulb-plugin {
     record plugin-manifest {
         name: string,
         version: string,
         abi-version: string,
+        tools: list<string>,
     }
     manifest: func() -> plugin-manifest;
     run: func(input: string) -> string;

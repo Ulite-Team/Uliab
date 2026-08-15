@@ -76,7 +76,11 @@ fn configure_registers_tasks_that_execute_incrementally() {
         .manifest_of_bytes(&std::fs::read(&plugin).unwrap())
         .unwrap();
     assert_eq!(manifest.name, "ulite/fixture");
-    assert_eq!(manifest.abi_version, "0.1");
+    assert_eq!(
+        manifest.abi_version,
+        ulb_plugin_sdk::ABI_VERSION,
+        "fixture reports the host ABI"
+    );
 
     let graph = host
         .configure(&plugin, "app", &config_json)

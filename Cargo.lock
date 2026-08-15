@@ -1652,6 +1652,7 @@ dependencies = [
 name = "ulb-plugin-legacy-fixture"
 version = "0.1.0"
 dependencies = [
+ "ulb-plugin-sdk",
  "wit-bindgen",
 ]
 

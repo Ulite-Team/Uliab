@@ -21,7 +21,10 @@ impl exports::ulite::ulb::ulb_plugin::Guest for Legacy {
         exports::ulite::ulb::ulb_plugin::PluginManifest {
             name: "ulite/legacy".to_owned(),
             version: "0.1.0".to_owned(),
-            abi_version: "0.1".to_owned(),
+            // Rebuilt from current source on every test run, so it reports
+            // the host's current ABI even though it predates `configure`.
+            abi_version: ulb_plugin_sdk::ABI_VERSION.to_owned(),
+            tools: Vec::new(),
         }
     }
 

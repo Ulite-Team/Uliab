@@ -6,6 +6,7 @@ publish = false
 description = "Test plugin built against the pre-configure ABI; proves additive ABI growth keeps old components instantiable"
 
 [dependencies]
+ulb-plugin-sdk = { path = "../ulb-plugin-sdk" }
 wit-bindgen = "0.51.0"
 
 [lib]

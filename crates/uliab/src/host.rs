@@ -14,13 +14,14 @@ literal://! and a plugin cannot drift apart.
 //! older ABI that never imports `task-registrar` still instantiates; the
 //! registrar itself is only reachable inside a `configure` call.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView, p2};
 
-use crate::task::{Task as BuildTask, TaskAction, TaskGraph};
+use crate::task::{AllowlistedTool, Task as BuildTask, TaskAction, TaskGraph};
 
 /// Generated host bindings for the `ulb-plugin` world.
 ///
@@ -83,16 +84,32 @@ struct HostCtx {
     registrar: Option<RegistrarState>,
 }
 
-/// The host side of a `configure` session: the graph being built and the
-/// module it belongs to.
+/// The host side of a `configure` session: the graph being built, the
+/// module it belongs to, and the tools the plugin's manifest declared for
+/// its `run-tool` actions (§3.5).
 struct RegistrarState {
     graph: TaskGraph,
     module: String,
+    declared_tools: HashSet<AllowlistedTool>,
 }
 
 impl RegistrarState {
     /// Registers a task a plugin reported through the WIT `task` record.
+    ///
+    /// A `run-tool` action whose tool the plugin's manifest did not
+    /// declare is refused here, in-band, so the plugin can surface it in
+    /// its own `configure` result (§3.5: a plugin cannot silently start
+    /// invoking something new after being installed).
     fn register(&mut self, task: bindings::ulite::ulb::task_registrar::Task) -> Result<(), String> {
+        if let bindings::ulite::ulb::task_registrar::Action::RunTool(args) = &task.action {
+            let tool = AllowlistedTool::from(args.tool);
+            if !self.declared_tools.contains(&tool) {
+                return Err(format!(
+                    "tool '{}' is not declared in the plugin manifest",
+                    tool.as_str()
+                ));
+            }
+        }
         let task = BuildTask {
             name: task.name,
             module: self.module.clone(),
@@ -146,6 +163,9 @@ impl From<bindings::ulite::ulb::task_registrar::AllowlistedTool> for crate::task
             W::Cat => Self::Cat,
             W::Mkdir => Self::Mkdir,
             W::Echo => Self::Echo,
+            W::Javac => Self::Javac,
+            W::Kotlinc => Self::Kotlinc,
+            W::Jar => Self::Jar,
         }
     }
 }
@@ -194,6 +214,10 @@ pub struct PluginManifest {
     pub version: String,
     /// Plugin-ABI version the plugin was built against.
     pub abi_version: String,
+    /// The allowlisted tools the plugin's task actions invoke
+    /// (ARCHITECTURE.md §3.5); the registrar refuses a `run-tool` action
+    /// whose tool is not declared here.
+    pub tools: Vec<String>,
 }
 
 impl PluginHost {
@@ -238,8 +262,9 @@ impl PluginHost {
     /// `abi-version` is rejected without executing plugin code
     /// (ARCHITECTURE.md §3.7). Each task the plugin registers through
     /// `register-task` is validated as it arrives (duplicate name, tool
-    /// outside the allowlist), and the assembled graph is validated once
-    /// more for undefined dependencies and cycles before it is returned.
+    /// outside the allowlist, tool not declared in the plugin's manifest
+    /// per §3.5), and the assembled graph is validated once more for
+    /// undefined dependencies and cycles before it is returned.
     ///
     /// # Errors
     ///
@@ -310,9 +335,11 @@ impl PluginHost {
             .manifest()
             .map_err(|error| HostError::Call(error.to_string()))?;
         self.check_abi(&manifest)?;
+        let declared_tools = parse_declared_tools(&manifest)?;
         plugin.store.data_mut().registrar = Some(RegistrarState {
             graph: TaskGraph::new(),
             module: module.to_owned(),
+            declared_tools,
         });
         let outcome = plugin
             .plugin
@@ -441,6 +468,23 @@ impl PluginHost {
     }
 }
 
+/// Parses the tools a plugin's manifest declares for its `run-tool`
+/// actions into the closed [`AllowlistedTool`] set, refusing a name the
+/// host does not allowlist (§3.5).
+fn parse_declared_tools(manifest: &PluginManifest) -> Result<HashSet<AllowlistedTool>, HostError> {
+    let mut tools = HashSet::new();
+    for name in &manifest.tools {
+        let tool = AllowlistedTool::parse(name).ok_or_else(|| {
+            HostError::Call(format!(
+                "plugin '{}' declares tool '{name}', which is not on the host allowlist",
+                manifest.name
+            ))
+        })?;
+        tools.insert(tool);
+    }
+    Ok(tools)
+}
+
 impl LoadedPlugin {
     /// Calls the plugin's `manifest` entry point.
     fn manifest(&mut self) -> Result<PluginManifest, HostError> {
@@ -453,6 +497,7 @@ impl LoadedPlugin {
             name: manifest.name,
             version: manifest.version,
             abi_version: manifest.abi_version,
+            tools: manifest.tools,
         })
     }
 }
@@ -469,6 +514,7 @@ impl LoadedLegacyPlugin {
             name: manifest.name,
             version: manifest.version,
             abi_version: manifest.abi_version,
+            tools: manifest.tools,
         })
     }
 

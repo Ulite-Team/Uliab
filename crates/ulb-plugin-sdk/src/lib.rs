@@ -23,4 +23,4 @@ pub const WIT: &str = include_str!("../plugin.wit");
 /// A plugin reports this in its [`manifest`](crate::WIT)'s `abi-version`
 /// field; the host compares it against its own [`ABI_VERSION`] before
 /// calling anything else.
-pub const ABI_VERSION: &str = "0.1";
+pub const ABI_VERSION: &str = "0.2";

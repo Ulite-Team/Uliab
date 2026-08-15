@@ -35,6 +35,12 @@ pub enum AllowlistedTool {
     Mkdir,
     /// `echo` — write a line to standard output.
     Echo,
+    /// `javac` — compile Java sources.
+    Javac,
+    /// `kotlinc` — compile Kotlin sources.
+    Kotlinc,
+    /// `jar` — archive class files.
+    Jar,
 }
 
 impl AllowlistedTool {
@@ -46,6 +52,9 @@ impl AllowlistedTool {
             Self::Cat => "cat",
             Self::Mkdir => "mkdir",
             Self::Echo => "echo",
+            Self::Javac => "javac",
+            Self::Kotlinc => "kotlinc",
+            Self::Jar => "jar",
         }
     }
 
@@ -58,6 +67,9 @@ impl AllowlistedTool {
             "cat" => Some(Self::Cat),
             "mkdir" => Some(Self::Mkdir),
             "echo" => Some(Self::Echo),
+            "javac" => Some(Self::Javac),
+            "kotlinc" => Some(Self::Kotlinc),
+            "jar" => Some(Self::Jar),
             _ => None,
         }
     }
