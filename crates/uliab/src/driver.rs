@@ -262,6 +262,8 @@ pub fn build_project(dir: &Path, options: &BuildOptions) -> Result<BuildResult, 
         AllowlistedTool::Cat,
         AllowlistedTool::Mkdir,
         AllowlistedTool::Echo,
+        AllowlistedTool::Javac,
+        AllowlistedTool::Jar,
     ]);
     let result = executor
         .execute(&graph, &ctx, &mut store)
