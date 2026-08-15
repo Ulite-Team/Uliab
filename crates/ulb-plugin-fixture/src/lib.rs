@@ -48,7 +48,7 @@ impl exports::ulite::ulb::ulb_plugin::Guest for Fixture {
             name: "ulite/fixture".to_owned(),
             version: "0.1.0".to_owned(),
             abi_version: ulb_plugin_sdk::ABI_VERSION.to_owned(),
-            tools: vec!["echo".to_owned()],
+            tools: vec!["echo".to_owned(), "mkdir".to_owned()],
         }
     }
 
@@ -126,6 +126,28 @@ impl exports::ulite::ulb::ulb_plugin::Guest for Fixture {
                 action: Action::RunTool(RunToolArgs {
                     tool,
                     args: Vec::new(),
+                    cwd: ".".to_owned(),
+                }),
+            })?;
+        }
+
+        // A `mkdirProbe` config key (a directory name) registers a run-tool
+        // task creating `<projectDir>/<name>`. The host injects `projectDir`
+        // into every plugin configuration, so the created directory proves
+        // the key reached the plugin with the real project path.
+        if let Some(name) = config.get("mkdirProbe").and_then(serde_json::Value::as_str) {
+            let project_dir = config
+                .get("projectDir")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "module config is missing 'projectDir'".to_owned())?;
+            task_registrar::register_task(&Task {
+                name: "mkdir-probe".to_owned(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                depends_on: Vec::new(),
+                action: Action::RunTool(RunToolArgs {
+                    tool: AllowlistedTool::Mkdir,
+                    args: vec!["-p".to_owned(), format!("{project_dir}/{name}")],
                     cwd: ".".to_owned(),
                 }),
             })?;

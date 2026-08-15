@@ -216,3 +216,31 @@ fn deps_are_resolved_and_reach_the_plugin() {
     let second = build_project(&project.dir, &options).expect("second build");
     assert_eq!((second.ran, second.up_to_date), (0, 3));
 }
+
+#[test]
+fn project_dir_is_handed_to_plugins() {
+    let fixture = build_fixture("ulb-plugin-fixture");
+    let project = TestProject::new("project-dir", &fixture);
+    let source = project.dir.join("in.txt");
+    let output = project.dir.join("out.txt");
+    project.write("in.txt", "hello");
+    project.write(
+        "build.ulb",
+        &format!(
+            "source = {:?}\noutput = {:?}\nmkdirProbe = \"from-plugin\"\n",
+            source.display().to_string(),
+            output.display().to_string(),
+        ),
+    );
+    project.write(
+        "libs.ulb",
+        "plugins {\n  fixture = \"ulite/fixture\" @ \"0.1.0\"\n}\n",
+    );
+
+    let result = build_project(&project.dir, &project.options()).expect("build");
+    assert_eq!((result.ran, result.up_to_date), (3, 0));
+    assert!(
+        project.dir.join("from-plugin").is_dir(),
+        "the plugin created <projectDir>/from-plugin, so projectDir reached it"
+    );
+}

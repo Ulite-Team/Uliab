@@ -198,10 +198,23 @@ pub fn build_project(dir: &Path, options: &BuildOptions) -> Result<BuildResult, 
     // too, so a jar that changes without its version changing (a SNAPSHOT,
     // say) still reruns affected tasks.
     let mut plugin_config = model_json;
-    plugin_config
+    let plugin_config_object = plugin_config
         .as_object_mut()
-        .expect("the module model serialized to an object")
-        .insert("classpath".to_owned(), classpath.to_json());
+        .expect("the module model serialized to an object");
+    // The classpath is resolved host-side and handed to every plugin as a
+    // `classpath` key of its configuration, so a compiler or runner plugin
+    // can embed the jar paths into its task actions without resolving them
+    // itself. The hash that fingerprints the build covers the classpath
+    // too, so a jar that changes without its version changing (a SNAPSHOT,
+    // say) still reruns affected tasks.
+    plugin_config_object.insert("classpath".to_owned(), classpath.to_json());
+    // The project directory is handed over the same channel, so a plugin
+    // can resolve its block's relative paths against it regardless of the
+    // directory the build tool was invoked from.
+    plugin_config_object.insert(
+        "projectDir".to_owned(),
+        serde_json::json!(dir.display().to_string()),
+    );
     let config_text = plugin_config.to_string();
     let config_hash = hex(&Sha256::digest(config_text.as_bytes()));
 
