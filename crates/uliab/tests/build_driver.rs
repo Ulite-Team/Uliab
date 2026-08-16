@@ -96,6 +96,7 @@ impl TestProject {
             registry: Some(RegistrySource::File(self.dir.join("index.json"))),
             cache_dir: Some(self.dir.join(".cache")),
             repos: None,
+            android_sdk: None,
         }
     }
 }

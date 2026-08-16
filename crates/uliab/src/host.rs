@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView, p2};
+use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView, p2};
 
 use crate::task::{AllowlistedTool, Task as BuildTask, TaskAction, TaskGraph};
 
@@ -209,6 +209,12 @@ impl std::error::Error for HostError {}
 /// The embedded wasmtime engine that plugin components run in.
 pub struct PluginHost {
     engine: Engine,
+    /// An Android SDK root preopened read-only into every plugin's WASI
+    /// filesystem at its real path, so a plugin can discover SDK components
+    /// (platform jars, build-tools binaries) itself during `configure`
+    /// instead of trusting the host to do Android-specific probing. `None`
+    /// leaves the guest filesystem empty.
+    android_sdk: Option<PathBuf>,
 }
 
 /// The identity a plugin reports in its `manifest` entry.
@@ -231,7 +237,24 @@ impl PluginHost {
         let mut config = Config::new();
         config.wasm_component_model(true);
         let engine = Engine::new(&config).map_err(|error| HostError::Load(error.to_string()))?;
-        Ok(Self { engine })
+        Ok(Self {
+            engine,
+            android_sdk: None,
+        })
+    }
+
+    /// Grants plugins read access to the Android SDK root `dir` during
+    /// configuration.
+    ///
+    /// The directory is preopened into each plugin's WASI filesystem at
+    /// its real absolute path — the same path the driver injects as the
+    /// `androidSdkDir` configuration key — so a plugin can inspect it
+    /// directly (ARCHITECTURE.md §3.3). Access is read-only: a plugin can
+    /// read the SDK but never modify it. The default (`new`) grants no
+    /// filesystem access at all.
+    pub fn with_android_sdk(mut self, dir: PathBuf) -> Self {
+        self.android_sdk = Some(dir);
+        self
     }
 
     /// Loads the component in `path` and runs its `run` entry point with
@@ -409,15 +432,27 @@ impl PluginHost {
         let store = Store::new(
             &self.engine,
             HostCtx {
-                wasi: WasiCtxBuilder::new()
-                    .inherit_stdout()
-                    .inherit_stderr()
-                    .build(),
+                wasi: self.wasi_context().map_err(HostError::Load)?,
                 table: ResourceTable::new(),
                 registrar: None,
             },
         );
         Ok((linker, store))
+    }
+
+    /// The WASI context for a store: stdio wired to the host plus, when
+    /// one is configured, the Android SDK root preopened read-only at its
+    /// real path (see [`PluginHost::with_android_sdk`]).
+    fn wasi_context(&self) -> Result<WasiCtx, String> {
+        let mut builder = WasiCtxBuilder::new();
+        builder.inherit_stdout().inherit_stderr();
+        if let Some(sdk) = &self.android_sdk {
+            let guest_path = sdk.to_string_lossy();
+            builder
+                .preopened_dir(sdk, guest_path.as_ref(), DirPerms::READ, FilePerms::READ)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(builder.build())
     }
 
     /// Instantiates an already-loaded component into a store with a WASI
