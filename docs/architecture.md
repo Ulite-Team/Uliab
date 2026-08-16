@@ -178,6 +178,15 @@ This mirrors the DSL's own "closed action set" philosophy (grammar.md
 §7) at the plugin layer: a plugin can be *wrong*, but it can't be
 *unsafe* in ways the host didn't explicitly allow.
 
+The one ambient capability beyond compute is what the host preopens. Its
+WASI context wires stdout/stderr to the build's and, when a build runs
+against an Android SDK, preopens that SDK directory **read-only at its
+real path** (§3.3 injection: `androidSdkDir`) so a plugin can discover
+SDK components itself — platform jars, `build-tools` binaries — instead
+of asking the host to embed Android-specific probing logic. Everything
+else outside the plugin's own wasm memory stays unreachable: the guest
+filesystem is empty unless the SDK is configured.
+
 ### 3.3 How a plugin gets applied
 
 `libs.ulb`'s existing `plugins {}` syntax (grammar.md §6.4 — this needed
@@ -425,8 +434,15 @@ host's `java` tool, and a `jar` packaging step. The host's `write` action
   registered compile tasks rather than re-implementing compilation.
 
 Cross-plugin composition is designed on paper only: no plugin-to-plugin
-dependency mechanism exists in the ABI today, and this plugin is not
-started.
+dependency mechanism exists in the ABI today. What exists so far is the
+compile slice (`ulb-plugins/android-plugin`, `docs/android-plugin.md`):
+an `android {}` block with `compileSdk`, `sources`, `classesDir`, and an
+optional `sdkDir`, toolchain discovery of the platform jar and the
+highest `build-tools` release carrying `aapt2`/`d8` (both preopened to
+the plugin read-only via the `androidSdkDir` capability, §3.2), and a
+`compile` task that runs javac against the platform jar. The variant
+matrix, manifest merging, and `aapt2`/`d8` packaging remain future
+slices of the same plugin.
 
 ### 5.3 `ulite/kmp` — depends on `ulite/jvm`, optionally `ulite/android`
 

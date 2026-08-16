@@ -69,7 +69,10 @@ Every plugin's `configure` JSON contains at minimum:
 - `androidSdkDir` — the resolved Android SDK root, when one exists (the
   `--android-sdk` flag or an environment convention resolves to a real
   directory); a plugin that drives Android toolchain tools reads it, and a
-  project with no android plugin ignores it;
+  project with no android plugin ignores it. The same directory is
+  preopened **read-only** into each plugin's WASI filesystem at its real
+  path, so a plugin can discover SDK components (platform jars,
+  build-tools binaries) itself;
 - the module model: the `jvm {}`/`android {}`-style blocks, `deps {}`,
   properties, and every other evaluated value;
 - `classpath.*` buckets for the jvm family, when the module declares deps.

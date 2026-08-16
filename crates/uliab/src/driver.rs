@@ -223,15 +223,19 @@ pub fn build_project(dir: &Path, options: &BuildOptions) -> Result<BuildResult, 
         "projectDir".to_owned(),
         serde_json::json!(dir.display().to_string()),
     );
-    // The Android SDK root, when one can be found, is handed over the same
-    // channel so a plugin that drives Android toolchain tools can locate
-    // the SDK without any environment access of its own (the wasm guest
-    // has none). An explicit `--android-sdk` wins; otherwise the usual
-    // environment conventions are probed. The root is injected whether or
-    // not the module declares an `android {}` block — the plugin decides
-    // what a key means, and a project that never resolves an android
-    // plugin simply ignores it.
-    if let Some(sdk_root) = android_sdk_root(options.android_sdk.as_deref()) {
+    // The Android SDK root, when one can be found, is handed over two
+    // channels. The `androidSdkDir` configuration key tells a plugin where
+    // the SDK is; the host also preopens the same directory read-only into
+    // the plugin's WASI filesystem at its real path (see
+    // `PluginHost::with_android_sdk`), so a plugin that discovers SDK
+    // components — platform jars, build-tools binaries — can inspect it
+    // itself. An explicit `--android-sdk` wins; otherwise the usual
+    // environment conventions are probed. Both are applied whether or not
+    // the module declares an `android {}` block — the plugin decides what
+    // a key means, and a project that never resolves an android plugin
+    // simply ignores it.
+    let sdk_root = android_sdk_root(options.android_sdk.as_deref());
+    if let Some(sdk_root) = &sdk_root {
         plugin_config_object.insert(
             "androidSdkDir".to_owned(),
             serde_json::json!(sdk_root.display().to_string()),
@@ -251,6 +255,10 @@ pub fn build_project(dir: &Path, options: &BuildOptions) -> Result<BuildResult, 
         .unwrap_or(RegistrySource::Url(DEFAULT_REGISTRY.to_owned()));
     let registry = Registry::new(source, options.cache_dir.clone());
     let host = PluginHost::new().map_err(|error| error.to_string())?;
+    let host = match sdk_root {
+        Some(sdk_root) => host.with_android_sdk(sdk_root),
+        None => host,
+    };
 
     let mut graph = TaskGraph::new();
     let mut plugin_versions = Vec::new();
