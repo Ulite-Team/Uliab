@@ -183,9 +183,13 @@ WASI context wires stdout/stderr to the build's and, when a build runs
 against an Android SDK, preopens that SDK directory **read-only at its
 real path** (§3.3 injection: `androidSdkDir`) so a plugin can discover
 SDK components itself — platform jars, `build-tools` binaries — instead
-of asking the host to embed Android-specific probing logic. Everything
-else outside the plugin's own wasm memory stays unreachable: the guest
-filesystem is empty unless the SDK is configured.
+of asking the host to embed Android-specific probing logic. A module
+that declares its own `android.sdkDir` gets the same capability for that
+path (resolved against the project directory when relative): the host
+stays Android-agnostic and merely preopens the directories the module
+names. Everything else outside the plugin's own wasm memory stays
+unreachable: the guest filesystem is empty unless an SDK root is
+configured.
 
 ### 3.3 How a plugin gets applied
 
@@ -438,9 +442,9 @@ dependency mechanism exists in the ABI today. What exists so far is the
 compile slice (`ulb-plugins/android-plugin`, `docs/android-plugin.md`):
 an `android {}` block with `compileSdk`, `sources`, `classesDir`, and an
 optional `sdkDir`, toolchain discovery of the platform jar and the
-highest `build-tools` release carrying `aapt2`/`d8` (both preopened to
-the plugin read-only via the `androidSdkDir` capability, §3.2), and a
-`compile` task that runs javac against the platform jar. The variant
+highest `build-tools` release carrying `aapt2`/`d8` (both the resolved
+root and a module-declared `sdkDir` are preopened read-only, §3.2), and
+a `compile` task that runs javac against the platform jar. The variant
 matrix, manifest merging, and `aapt2`/`d8` packaging remain future
 slices of the same plugin.
 

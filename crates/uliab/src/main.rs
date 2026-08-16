@@ -16,8 +16,10 @@
 //!   module model, and executes the registered task graphs incrementally
 //!   (ARCHITECTURE.md §9), printing how many tasks ran versus were skipped
 //!   as up-to-date. `--android-sdk DIR` names the Android SDK root to hand
-//!   plugins (see `androidSdkDir` in `driver.rs`); without it the usual
-//!   environment conventions are probed.
+//!   plugins (see `androidSdkDir` in `driver.rs`) and must name an existing
+//!   directory — an explicit path that does not exist fails the build rather
+//!   than falling back to the environment conventions. Without it, `ulite`
+//!   probes `ANDROID_HOME`, then `ANDROID_SDK_ROOT`, then `~/Android/Sdk`.
 //! - `uliab deps resolve [--project DIR] [--cache-dir DIR] [--repo REPO]`
 //!   — resolves the project's `deps {}` block into a classpath
 //!   (ARCHITECTURE.md §6, §7) against the default repositories, and prints

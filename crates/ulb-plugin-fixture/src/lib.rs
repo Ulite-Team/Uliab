@@ -11,7 +11,10 @@
 //! there, proving a plugin can consume the jars the host resolved for its
 //! `deps {}` block. A `probeTool` config key additionally registers a
 //! no-op `run-tool` task with the named tool, so the host tests can drive
-//! the manifest-declared-tools gate (ARCHITECTURE.md §3.5). The `uliab`
+//! the manifest-declared-tools gate (ARCHITECTURE.md §3.5). A
+//! `probeAndroidSdk` config key makes configure assert that the module's
+//! `android.sdkDir` (or the injected `androidSdkDir`) is readable from the
+//! guest, proving the host preopened it. The `uliab`
 //! integration tests build this crate for `wasm32-wasip2` and drive it
 //! through [`uliab::host::PluginHost`] to prove configure -> task graph ->
 //! execute end to end.
@@ -178,6 +181,50 @@ impl exports::ulite::ulb::ulb_plugin::Guest for Fixture {
                     path: path.to_owned(),
                     contents: contents.to_owned(),
                 }),
+            })?;
+        }
+
+        // A `probeAndroidSdk` config key (true) makes configure assert that
+        // an Android SDK root is readable from the guest: the module's own
+        // `android.sdkDir` when the block declares one, else the injected
+        // `androidSdkDir`. The host preopens those paths read-only into the
+        // guest filesystem, so a plugin that discovers SDK components can
+        // inspect them; this probe fails configure when the path is not
+        // actually reachable — exactly what the android plugin does, minus
+        // the platform-jar and build-tools logic. It lets the driver tests
+        // prove the preopen without shipping the real plugin.
+        if config
+            .get("probeAndroidSdk")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            let sdk_dir = config
+                .get("android")
+                .and_then(|block| block.get("sdkDir"))
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    config
+                        .get("androidSdkDir")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .ok_or_else(|| {
+                    "probeAndroidSdk needs 'android.sdkDir' or the injected 'androidSdkDir'"
+                        .to_owned()
+                })?;
+            // Resolve a relative block path against the injected
+            // `projectDir`, exactly as the android plugin resolves its
+            // `sdkDir` — the preopened guest path is the absolute one.
+            let sdk_dir = if std::path::Path::new(sdk_dir).is_absolute() {
+                sdk_dir.to_owned()
+            } else {
+                let project_dir = config
+                    .get("projectDir")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "module config is missing 'projectDir'".to_owned())?;
+                format!("{project_dir}/{sdk_dir}")
+            };
+            std::fs::metadata(&sdk_dir).map_err(|error| {
+                format!("android SDK root '{sdk_dir}' is not readable from the plugin: {error}")
             })?;
         }
 

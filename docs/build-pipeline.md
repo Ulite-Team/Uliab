@@ -20,6 +20,9 @@ resolve plugins against, where plugin artifacts cache, which Maven
 repositories to use (from the `--repo` flag), and which Android SDK root
 to hand plugins (from `--android-sdk`; absent that flag the environment
 conventions `ANDROID_HOME`/`ANDROID_SDK_ROOT`/`~/Android/Sdk` are probed).
+An explicit `--android-sdk` must name an existing directory — a path that
+does not exist fails the build rather than falling back to the
+environment conventions and silently compiling against a different SDK.
 
 ## Two phases
 
@@ -72,7 +75,10 @@ Every plugin's `configure` JSON contains at minimum:
   project with no android plugin ignores it. The same directory is
   preopened **read-only** into each plugin's WASI filesystem at its real
   path, so a plugin can discover SDK components (platform jars,
-  build-tools binaries) itself;
+  build-tools binaries) itself. A module that declares its own
+  `android.sdkDir` gets the same capability: that path is preopened
+  read-only too (resolved against the project directory when relative), so
+  a per-module SDK a plugin discovers is actually readable from the guest;
 - the module model: the `jvm {}`/`android {}`-style blocks, `deps {}`,
   properties, and every other evaluated value;
 - `classpath.*` buckets for the jvm family, when the module declares deps.

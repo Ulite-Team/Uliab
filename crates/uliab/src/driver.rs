@@ -209,12 +209,6 @@ pub fn build_project(dir: &Path, options: &BuildOptions) -> Result<BuildResult, 
     let plugin_config_object = plugin_config
         .as_object_mut()
         .expect("the module model serialized to an object");
-    // The classpath is resolved host-side and handed to every plugin as a
-    // `classpath` key of its configuration, so a compiler or runner plugin
-    // can embed the jar paths into its task actions without resolving them
-    // itself. The hash that fingerprints the build covers the classpath
-    // too, so a jar that changes without its version changing (a SNAPSHOT,
-    // say) still reruns affected tasks.
     plugin_config_object.insert("classpath".to_owned(), classpath.to_json());
     // The project directory is handed over the same channel, so a plugin
     // can resolve its block's relative paths against it regardless of the
@@ -229,18 +223,23 @@ pub fn build_project(dir: &Path, options: &BuildOptions) -> Result<BuildResult, 
     // the plugin's WASI filesystem at its real path (see
     // `PluginHost::with_android_sdk`), so a plugin that discovers SDK
     // components — platform jars, build-tools binaries — can inspect it
-    // itself. An explicit `--android-sdk` wins; otherwise the usual
-    // environment conventions are probed. Both are applied whether or not
-    // the module declares an `android {}` block — the plugin decides what
-    // a key means, and a project that never resolves an android plugin
-    // simply ignores it.
-    let sdk_root = android_sdk_root(options.android_sdk.as_deref());
+    // itself. An explicit `--android-sdk` wins and must name an existing
+    // directory — an override that resolves to nothing is an error rather
+    // than a silent fallback to whatever the environment happens to have.
+    // A module that declares its own `android.sdkDir` for the plugin gets
+    // the same capability: that path is preopened read-only too, resolved
+    // against the project directory when relative. Both are applied whether
+    // or not the module declares an `android {}` block — the plugin decides
+    // what a key means, and a project that never resolves an android plugin
+    // simply ignores them.
+    let sdk_root = checked_sdk_root(options.android_sdk.as_deref())?;
     if let Some(sdk_root) = &sdk_root {
         plugin_config_object.insert(
             "androidSdkDir".to_owned(),
             serde_json::json!(sdk_root.display().to_string()),
         );
     }
+    let module_sdk_root = module_android_sdk_dir(&plugin_config, dir);
     let config_text = plugin_config.to_string();
     let config_hash = hex(&Sha256::digest(config_text.as_bytes()));
 
@@ -255,10 +254,18 @@ pub fn build_project(dir: &Path, options: &BuildOptions) -> Result<BuildResult, 
         .unwrap_or(RegistrySource::Url(DEFAULT_REGISTRY.to_owned()));
     let registry = Registry::new(source, options.cache_dir.clone());
     let host = PluginHost::new().map_err(|error| error.to_string())?;
-    let host = match sdk_root {
-        Some(sdk_root) => host.with_android_sdk(sdk_root),
-        None => host,
-    };
+    let mut sdk_roots = Vec::new();
+    if let Some(root) = &sdk_root {
+        sdk_roots.push(root.clone());
+    }
+    if let Some(module_root) = module_sdk_root
+        && !sdk_roots.contains(&module_root)
+    {
+        sdk_roots.push(module_root);
+    }
+    let host = sdk_roots
+        .into_iter()
+        .fold(host, |host, root| host.with_android_sdk(root));
 
     let mut graph = TaskGraph::new();
     let mut plugin_versions = Vec::new();
@@ -304,15 +311,63 @@ pub fn build_project(dir: &Path, options: &BuildOptions) -> Result<BuildResult, 
     Ok(result)
 }
 
-/// Resolves the Android SDK root a build should use: an explicit
-/// `--android-sdk` path wins, then `ANDROID_HOME`, then `ANDROID_SDK_ROOT`,
-/// then the conventional `~/Android/Sdk`. The first candidate that is an
-/// existing directory wins; `None` when no candidate exists. The resolved
-/// root is injected into every plugin's configuration as `androidSdkDir`
-/// (see [`build_project`]).
+/// Resolves the Android SDK root a build should use, applying the
+/// explicit-override rule [`build_project`] depends on: an override that
+/// does not name an existing directory is an error — the build must not
+/// silently probe the environment and compile against a different SDK than
+/// the user asked for. With no override, `ANDROID_HOME`, then
+/// `ANDROID_SDK_ROOT`, then the conventional `~/Android/Sdk` are probed
+/// silently; the first existing directory wins, and `None` when none
+/// exists (the plugins then report their own missing-SDK errors). The
+/// resolved root is injected into every plugin's configuration as
+/// `androidSdkDir` (see [`build_project`]).
+///
+/// # Errors
+///
+/// Returns a message naming the override when an explicit path does not
+/// exist.
+pub fn checked_sdk_root(override_path: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    match override_path {
+        Some(path) if !path.is_dir() => Err(format!(
+            "the Android SDK root '{}' does not exist (--android-sdk must name an existing directory)",
+            path.display()
+        )),
+        Some(path) => Ok(Some(path.to_path_buf())),
+        None => Ok(android_sdk_root(None)),
+    }
+}
+
+/// Resolves the Android SDK root by probing the environment conventions:
+/// an explicit `--android-sdk` path wins, then `ANDROID_HOME`, then
+/// `ANDROID_SDK_ROOT`, then the conventional `~/Android/Sdk`. The first
+/// candidate that is an existing directory wins; `None` when no candidate
+/// exists. The environment variables are read at call time, which is why
+/// the ordering itself is tested through [`sdk_candidates`] rather than by
+/// mutating the process environment in a test. [`build_project`]
+/// hard-fails on an explicit override that does not exist via
+/// [`checked_sdk_root`]; the resolved root is injected into every plugin's
+/// configuration as `androidSdkDir`.
 pub fn android_sdk_root(override_path: Option<&Path>) -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     first_existing_sdk_dir(&sdk_candidates(override_path, home.as_deref()))
+}
+
+/// The module's own `android.sdkDir` — a block path the plugin is asked to
+/// use instead of the host-resolved root — resolved against the project
+/// directory when relative. `None` when the module declares none, or
+/// declares something the host cannot turn into a path (the plugin reports
+/// such a block as its own error). The host preopens this directory
+/// read-only too (see [`PluginHost::with_android_sdk`]), so a per-module
+/// SDK a plugin discovers is actually readable from the guest filesystem
+/// rather than being visible only as a JSON string.
+fn module_android_sdk_dir(plugin_config: &serde_json::Value, dir: &Path) -> Option<PathBuf> {
+    let sdk_dir = plugin_config.get("android")?.get("sdkDir")?.as_str()?;
+    let path = Path::new(sdk_dir);
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        Some(dir.join(path))
+    }
 }
 
 /// The Android SDK roots a build probes, in priority order. A pure
@@ -601,6 +656,74 @@ mod tests {
         assert_eq!(
             android_sdk_root(Some(&base.join("sdk"))),
             Some(base.join("sdk"))
+        );
+    }
+
+    #[test]
+    fn an_explicit_override_that_does_not_exist_is_an_error() {
+        let base = std::env::temp_dir().join(format!("uliab-sdk-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("create temp dir");
+        let missing = base.join("does-not-exist");
+        let error = checked_sdk_root(Some(&missing)).expect_err("missing override");
+        assert!(error.contains(&missing.display().to_string()), "{error}");
+        assert!(error.contains("must name an existing directory"), "{error}");
+    }
+
+    #[test]
+    fn an_existing_override_wins_without_probing_the_environment() {
+        // The override is returned as-is even though this machine's real
+        // `~/Android/Sdk` would otherwise resolve; the explicit path must
+        // not be silently replaced by an environment convention.
+        let base = std::env::temp_dir().join(format!("uliab-sdk-override-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("custom")).expect("create temp dir");
+        assert_eq!(
+            checked_sdk_root(Some(&base.join("custom"))).expect("existing override"),
+            Some(base.join("custom"))
+        );
+    }
+
+    #[test]
+    fn a_module_sdk_dir_is_resolved_against_the_project_dir_when_relative() {
+        let project = Path::new("/tmp/project");
+        let config = serde_json::json!({
+            "source": "in.txt",
+            "android": { "sdkDir": "local/sdk" },
+        });
+        assert_eq!(
+            module_android_sdk_dir(&config, project),
+            Some(PathBuf::from("/tmp/project/local/sdk"))
+        );
+    }
+
+    #[test]
+    fn an_absolute_module_sdk_dir_is_left_untouched() {
+        let config = serde_json::json!({
+            "android": { "sdkDir": "/opt/android-sdk" },
+        });
+        assert_eq!(
+            module_android_sdk_dir(&config, Path::new("/tmp/project")),
+            Some(PathBuf::from("/opt/android-sdk"))
+        );
+    }
+
+    #[test]
+    fn a_module_without_a_string_sdk_dir_declares_none() {
+        assert_eq!(
+            module_android_sdk_dir(&serde_json::json!({ "android": {} }), Path::new("/p")),
+            None
+        );
+        assert_eq!(
+            module_android_sdk_dir(
+                &serde_json::json!({ "android": { "compileSdk": 36 } }),
+                Path::new("/p")
+            ),
+            None
+        );
+        assert_eq!(
+            module_android_sdk_dir(&serde_json::json!({}), Path::new("/p")),
+            None
         );
     }
 }
