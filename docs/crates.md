@@ -12,7 +12,7 @@ modules, which use `unsafe` internally and carry a scoped
 |---|---|---|
 | `crates/ulb-lang` | library | Lexer, parser, span-annotated AST, and evaluator for the ulb DSL. No wasm, no dependencies on the rest of the workspace. Reused by the `uliab` CLI, `ulb-lsp`, and the worked-example tests. |
 | `crates/ulb-plugin-sdk` | library | The plugin ABI as a single source of truth: the `plugin.wit`/`legacy-plugin.wit` texts, the `ABI_VERSION` constant, and the manifest record. MIT-licensed; the rest of the workspace is GPL-3.0. |
-| `crates/ulb-plugin-fixture` | cdylib | Test plugin (`ulite/fixture`, ABI 0.4) exercising the `configure` path: parses a module config, registers `stage`/`announce`/`copy-classpath` tasks. Built for `wasm32-wasip2` by the integration tests. |
+| `crates/ulb-plugin-fixture` | cdylib | Test plugin (`ulite/fixture`, ABI 0.5) exercising the `configure` path: parses a module config, registers `stage`/`announce`/`copy-classpath` tasks. Built for `wasm32-wasip2` by the integration tests. |
 | `crates/ulb-plugin-legacy-fixture` | cdylib | Test plugin (`ulite/legacy-fixture`) built against the frozen pre-`configure` world (`legacy-plugin.wit`). Proves additive ABI growth keeps old components loadable. |
 | `crates/uliab` | binary + library | The build tool itself: CLI, embedded wasmtime host, registry client, Maven resolver, task engine, and the `build_project` driver. |
 

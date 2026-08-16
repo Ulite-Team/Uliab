@@ -135,7 +135,7 @@ pub struct BuildOptions {
 ///         "ulite/fixture": {
 ///             "versions": {
 ///                 "0.1.0": {
-///                     "abi": { "min": "0.4", "max": "0.4" },
+///                     "abi": { "min": "0.4", "max": "0.5" },
 ///                     "artifact_url": fixture.display().to_string(),
 ///                 }
 ///             }
@@ -158,9 +158,13 @@ pub struct BuildOptions {
 /// assert_eq!((second.ran, second.up_to_date), (0, 2));
 /// ```
 pub fn build_project(dir: &Path, options: &BuildOptions) -> Result<BuildResult, String> {
-    let conventions = read_source(dir, "conventions.ulb", false)?;
-    let libs = read_source(dir, "libs.ulb", true)?;
-    let build = read_source(dir, "build.ulb", true)?;
+    // An absolute project directory keeps the plugin-config injection and a
+    // module's derived build paths (which a plugin resolves against
+    // `projectDir`) independent of the directory the tool was invoked from.
+    let dir = canonical_project_dir(dir)?;
+    let conventions = read_source(&dir, "conventions.ulb", false)?;
+    let libs = read_source(&dir, "libs.ulb", true)?;
+    let build = read_source(&dir, "build.ulb", true)?;
 
     let outcome = ulb_lang::eval::evaluate_project(&conventions, &libs, &build);
     if !outcome.diagnostics.is_empty() {
@@ -243,7 +247,7 @@ pub fn build_project(dir: &Path, options: &BuildOptions) -> Result<BuildResult, 
     let config_text = plugin_config.to_string();
     let config_hash = hex(&Sha256::digest(config_text.as_bytes()));
 
-    let libs = read_libs_plugins(dir)?;
+    let libs = read_libs_plugins(&dir)?;
     if libs.plugins.is_empty() {
         return Err(format!("{} declares no plugins", libs.libs_path.display()));
     }
@@ -303,6 +307,7 @@ pub fn build_project(dir: &Path, options: &BuildOptions) -> Result<BuildResult, 
         AllowlistedTool::Kotlinc,
         AllowlistedTool::Jar,
         AllowlistedTool::Java,
+        AllowlistedTool::Aapt2,
     ]);
     let result = executor
         .execute(&graph, &ctx, &mut store)
@@ -396,6 +401,19 @@ fn first_existing_sdk_dir(candidates: &[PathBuf]) -> Option<PathBuf> {
         .iter()
         .find(|candidate| candidate.is_dir())
         .cloned()
+}
+
+/// Resolves the project directory to an absolute path, so the `projectDir`
+/// a plugin receives and the build paths derived from it are correct no
+/// matter which directory the tool was invoked from. A project path that
+/// does not exist is a configure-time error, not a mid-build surprise.
+fn canonical_project_dir(dir: &Path) -> Result<PathBuf, String> {
+    dir.canonicalize().map_err(|error| {
+        format!(
+            "cannot resolve project directory '{}': {error}",
+            dir.display()
+        )
+    })
 }
 
 /// Reads one project source file. `conventions.ulb` is optional; the other
@@ -575,6 +593,22 @@ fn value_kind(value: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_dir_is_canonicalized_to_an_absolute_path() {
+        let base = std::env::temp_dir().join(format!("uliab-canonical-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("proj")).expect("temp project");
+        let resolved = canonical_project_dir(&base.join("proj")).expect("resolves");
+        assert!(resolved.is_absolute());
+        assert_eq!(resolved, base.join("proj"));
+        let error = canonical_project_dir(&base.join("missing")).expect_err("missing project");
+        assert!(
+            error.contains("cannot resolve project directory"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn block_serializes_to_an_object_with_scalar_entries() {

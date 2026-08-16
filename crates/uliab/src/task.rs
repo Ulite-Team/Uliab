@@ -15,7 +15,7 @@
 //! module model, so the same executor drives every toolchain plugin.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -43,6 +43,11 @@ pub enum AllowlistedTool {
     Jar,
     /// `java` — run a compiled JVM program.
     Java,
+    /// `aapt2` — Android asset packaging tool. The binary is not on the
+    /// `PATH`; it lives under an Android SDK `build-tools` directory, so
+    /// the action names that directory as its first argument and the host
+    /// resolves `<dir>/aapt2` for it.
+    Aapt2,
 }
 
 impl AllowlistedTool {
@@ -58,6 +63,7 @@ impl AllowlistedTool {
             Self::Kotlinc => "kotlinc",
             Self::Jar => "jar",
             Self::Java => "java",
+            Self::Aapt2 => "aapt2",
         }
     }
 
@@ -74,6 +80,7 @@ impl AllowlistedTool {
             "kotlinc" => Some(Self::Kotlinc),
             "jar" => Some(Self::Jar),
             "java" => Some(Self::Java),
+            "aapt2" => Some(Self::Aapt2),
             _ => None,
         }
     }
@@ -686,9 +693,9 @@ fn run_action(allowlist: &HashSet<AllowlistedTool>, task: &Task) -> Result<(), S
             if !allowlist.contains(tool) {
                 return Err(format!("tool '{}' is not on the allowlist", tool.as_str()));
             }
-            let binary = tool.as_str();
-            let output = std::process::Command::new(binary)
-                .args(args)
+            let (binary, tool_args) = resolve_tool(*tool, args)?;
+            let output = std::process::Command::new(&binary)
+                .args(tool_args)
                 .current_dir(cwd)
                 .output()
                 .map_err(|error| format!("running '{binary}': {error}"))?;
@@ -705,10 +712,39 @@ fn run_action(allowlist: &HashSet<AllowlistedTool>, task: &Task) -> Result<(), S
     }
 }
 
+/// Resolves the binary a `run-tool` action invokes, paired with the
+/// arguments that belong to it.
+///
+/// Most tools run by their bare name on the `PATH`. `aapt2` is different:
+/// it ships inside an Android SDK `build-tools` directory rather than on
+/// the `PATH`, so the action carries that directory as its first argument
+/// and the host resolves `<dir>/aapt2`, stripping the directory from the
+/// arguments the tool actually receives.
+fn resolve_tool(tool: AllowlistedTool, args: &[String]) -> Result<(String, &[String]), String> {
+    match tool {
+        AllowlistedTool::Aapt2 => {
+            let dir = args.first().ok_or_else(|| {
+                "tool 'aapt2' requires the build-tools directory as its first argument".to_owned()
+            })?;
+            let binary = std::path::PathBuf::from(dir)
+                .join(format!("aapt2{}", std::env::consts::EXE_SUFFIX));
+            if !binary.exists() {
+                return Err(format!(
+                    "aapt2 binary '{}' does not exist",
+                    binary.display()
+                ));
+            }
+            Ok((binary.display().to_string(), &args[1..]))
+        }
+        _ => Ok((tool.as_str().to_owned(), args)),
+    }
+}
+
 /// Content-addressed fingerprint of a task's inputs (ARCHITECTURE §10):
 /// the plugin version, the configuration hash, the contents of each
-/// declared input file (missing inputs hash as absent), and a rendering of
-/// the action itself so a changed action forces a rerun.
+/// declared input file (missing inputs hash as absent), a directory input
+/// hashed as its tree of relative paths and file contents, and a rendering
+/// of the action itself so a changed action forces a rerun.
 fn fingerprint(task: &Task, ctx: &FingerprintContext) -> String {
     let mut hasher = Sha256::new();
     hasher.update(ctx.plugin_version.as_bytes());
@@ -716,17 +752,61 @@ fn fingerprint(task: &Task, ctx: &FingerprintContext) -> String {
     hasher.update(ctx.config_hash.as_bytes());
     hasher.update([0u8]);
     for input in &task.inputs {
-        match std::fs::read(input) {
-            Ok(bytes) => {
-                hasher.update([1u8]);
-                hasher.update(Sha256::digest(&bytes));
-            }
-            Err(_) => hasher.update([0u8]),
+        match std::fs::metadata(input) {
+            Ok(metadata) if metadata.is_dir() => hash_directory(&mut hasher, input),
+            _ => match std::fs::read(input) {
+                Ok(bytes) => {
+                    hasher.update([1u8]);
+                    hasher.update(Sha256::digest(&bytes));
+                }
+                Err(_) => hasher.update([0u8]),
+            },
         }
     }
     hasher.update([0u8]);
     hasher.update(render_action(&task.action).as_bytes());
     hex(&hasher.finalize())
+}
+
+/// Hashes the tree under `dir` into `hasher`: each file's path relative
+/// to `dir` (sorted for determinism) followed by its content digest.
+/// Adding, removing, or editing a file under the tree therefore changes
+/// the fingerprint. An unreadable tree hashes as absent, matching how a
+/// missing input file is treated.
+fn hash_directory(hasher: &mut Sha256, dir: &Path) {
+    let mut files = Vec::new();
+    if collect_dir_files(dir, &mut files).is_err() {
+        hasher.update([0u8]);
+        return;
+    }
+    files.sort();
+    hasher.update([2u8]);
+    for file in files {
+        let relative = file.strip_prefix(dir).unwrap_or(&file);
+        match std::fs::read(&file) {
+            Ok(bytes) => {
+                hasher.update([1u8]);
+                hasher.update(relative.as_os_str().as_encoded_bytes());
+                hasher.update([0u8]);
+                hasher.update(Sha256::digest(&bytes));
+            }
+            Err(_) => hasher.update([0u8]),
+        }
+    }
+}
+
+/// Collects every file (not directory) under `dir`, recursively.
+fn collect_dir_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_dir_files(&path, out)?;
+        } else {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 /// A canonical rendering of an action, stable across runs so equal actions
@@ -919,6 +999,126 @@ mod tests {
 
         std::fs::write(&input, "v2").unwrap();
         assert_ne!(first, fingerprint(&task, &ctx("cfg")));
+    }
+
+    #[test]
+    fn directory_input_fingerprint_tracks_the_tree() {
+        let root = temp_dir("fingerprint-dir");
+        let dir = root.join("res");
+        std::fs::create_dir_all(dir.join("layout")).unwrap();
+        std::fs::create_dir_all(dir.join("values")).unwrap();
+        std::fs::write(dir.join("layout/activity.xml"), "<a/>").unwrap();
+        std::fs::write(dir.join("values/strings.xml"), "<r/>").unwrap();
+        let task = Task::leaf(
+            "res",
+            "app",
+            vec![dir.clone()],
+            vec![],
+            TaskAction::RunTool {
+                tool: AllowlistedTool::Echo,
+                args: vec!["x".to_owned()],
+                cwd: root.clone(),
+            },
+        );
+
+        let baseline = fingerprint(&task, &ctx("cfg"));
+        assert_eq!(baseline, fingerprint(&task, &ctx("cfg")));
+
+        std::fs::write(dir.join("layout/activity.xml"), "<b/>").unwrap();
+        assert_ne!(baseline, fingerprint(&task, &ctx("cfg")));
+
+        std::fs::write(dir.join("layout/activity.xml"), "<a/>").unwrap();
+        let restored = fingerprint(&task, &ctx("cfg"));
+        assert_eq!(baseline, restored);
+
+        std::fs::write(dir.join("values/extra.xml"), "<e/>").unwrap();
+        assert_ne!(baseline, fingerprint(&task, &ctx("cfg")));
+
+        std::fs::remove_file(dir.join("values/extra.xml")).unwrap();
+        assert_eq!(baseline, fingerprint(&task, &ctx("cfg")));
+    }
+
+    #[test]
+    fn aapt2_runs_the_build_tools_binary_without_the_dir_argument() {
+        let root = temp_dir("aapt2");
+        let build_tools = root.join("build-tools/36.0.0");
+        std::fs::create_dir_all(&build_tools).unwrap();
+        let script = "#!/bin/sh\necho \"$*\" > \"$PWD/aapt2-args.txt\"\n";
+        std::fs::write(build_tools.join("aapt2"), script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                build_tools.join("aapt2"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let task = Task::leaf(
+            "res",
+            "app",
+            vec![],
+            vec![],
+            TaskAction::RunTool {
+                tool: AllowlistedTool::Aapt2,
+                args: vec![
+                    build_tools.display().to_string(),
+                    "compile".to_owned(),
+                    "--dir".to_owned(),
+                    "res".to_owned(),
+                ],
+                cwd: work.clone(),
+            },
+        );
+        Executor::new([AllowlistedTool::Aapt2])
+            .run_task(&task)
+            .expect("aapt2 runs");
+        assert_eq!(
+            std::fs::read_to_string(work.join("aapt2-args.txt")).unwrap(),
+            "compile --dir res\n"
+        );
+    }
+
+    #[test]
+    fn aapt2_requires_the_build_tools_dir_as_first_argument() {
+        let task = Task::leaf(
+            "res",
+            "app",
+            vec![],
+            vec![],
+            TaskAction::RunTool {
+                tool: AllowlistedTool::Aapt2,
+                args: vec![],
+                cwd: PathBuf::from("."),
+            },
+        );
+        let error = Executor::new([AllowlistedTool::Aapt2])
+            .run_task(&task)
+            .expect_err("no dir argument");
+        assert!(error.contains("build-tools directory"));
+    }
+
+    #[test]
+    fn aapt2_refuses_a_missing_build_tools_dir() {
+        let root = temp_dir("aapt2-missing");
+        let task = Task::leaf(
+            "res",
+            "app",
+            vec![],
+            vec![],
+            TaskAction::RunTool {
+                tool: AllowlistedTool::Aapt2,
+                args: vec![root.join("nowhere").display().to_string()],
+                cwd: root.clone(),
+            },
+        );
+        let error = Executor::new([AllowlistedTool::Aapt2])
+            .run_task(&task)
+            .expect_err("missing dir");
+        assert!(error.contains("does not exist"));
     }
 
     #[test]

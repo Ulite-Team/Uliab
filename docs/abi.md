@@ -6,7 +6,7 @@ one file — the host with `wasmtime::component::bindgen!`, plugins with
 `wit_bindgen::generate!` pointing at the same path — so there is no second
 copy of the interface to keep in sync.
 
-The current ABI version is `ulb_plugin_sdk::ABI_VERSION == "0.4"`.
+The current ABI version is `ulb_plugin_sdk::ABI_VERSION == "0.5"`.
 A plugin reports this value verbatim in its manifest; the host reads it
 back and refuses to run anything that disagrees, before executing any
 plugin code.
@@ -47,7 +47,7 @@ The host reads this on every load and cross-checks it:
 ### `task-registrar`
 
 ```
-enum allowlisted-tool { cp, cat, mkdir, echo, javac, kotlinc, jar, java }
+enum allowlisted-tool { cp, cat, mkdir, echo, javac, kotlinc, jar, java, aapt2 }
 
 record copy-args     { source: string, destination: string }
 record run-tool-args { tool: allowlisted-tool, args: list<string>, cwd: string }
@@ -74,8 +74,11 @@ register-task: func(task) -> result<_, string>;
 only register tasks, and only inside its `configure` call. The action set
 is closed on purpose — plugins get no ambient filesystem, network, or
 process access; every external tool (`javac`, `kotlinc`, `jar`, `java`,
-and the unix coreutils) is spawned by the host through the allowlisted
-`run-tool` capability.
+`aapt2`, and the unix coreutils) is spawned by the host through the
+allowlisted `run-tool` capability. `aapt2` is resolved under the
+`build-tools` directory the action names as its first argument, because it
+ships inside the Android SDK rather than on the `PATH`; the host strips
+that directory before passing the remaining arguments to the tool.
 
 `register-task` errors on:
 
