@@ -19,8 +19,10 @@ Task { name, module, inputs, outputs, depends_on, action }
   - `Copy { from, to }`
   - `WriteFile { to, contents }` — `contents` participates in the fingerprint
   - `RunTool { tool, args, cwd }` — `tool` must be a parsed
-    `AllowlistedTool` (`cp cat mkdir echo javac kotlinc jar java`) that the
-    plugin declared in its manifest.
+    `AllowlistedTool` (`cp cat mkdir echo javac kotlinc jar java aapt2`) that the
+    plugin declared in its manifest. `aapt2` is the only tool not resolved
+    from the `PATH`: the action names the Android SDK `build-tools`
+    directory as `args[0]` and the engine runs `<dir>/aapt2` with the rest.
 
 ## Graph construction
 

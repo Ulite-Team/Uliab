@@ -31,7 +31,7 @@ Before any plugin code runs, `check_abi` compares the manifest's
 match**:
 
 ```
-plugin abi-version '0.3' does not match host abi-version '0.4'
+plugin abi-version '0.3' does not match host abi-version '0.5'
 ```
 
 A later ABI major widens this to the compatible-range rule described in

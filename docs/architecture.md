@@ -272,12 +272,14 @@ fn run_tool(&mut self, tool: AllowlistedTool, args: Vec<String>, cwd: &Path)
 ```
 
 `AllowlistedTool` is a closed enum the *core* defines — currently `cp`,
-`cat`, `mkdir`, `echo` for filesystem plumbing plus `javac`, `kotlinc`,
-`jar`, `java` for the JVM toolchain (see `docs/abi.md` for the exact
-set) — and a plugin manifest must declare which tools it needs (checked
-at load time, so a plugin can't silently start invoking something new
-after being installed). The plugin computes *what* to run (e.g. every
-`kotlinc` flag for a given module + variant); the host actually spawns
+`cat`, `mkdir`, `echo` for filesystem plumbing, `javac`, `kotlinc`,
+`jar`, `java` for the JVM toolchain, and `aapt2` (resolved under the
+Android SDK `build-tools` directory a task names as its first argument)
+for asset packaging (see `docs/abi.md` for the exact set) — and a plugin
+manifest must declare which tools it needs (checked at load time, so a
+plugin can't silently start invoking something new after being
+installed). The plugin computes *what* to run (e.g. every `kotlinc` flag
+for a given module + variant); the host actually spawns
 the process. This is the same "plugin decides, host executes" split as
 `TaskRegistrar` (§3.2) and mirrors the DSL's own `copy`/`exec` design
 (grammar.md Appendix C) one layer up.

@@ -16,6 +16,7 @@ interface task-registrar {
         kotlinc,
         jar,
         java,
+        aapt2,
     }
 
     /// Arguments for an action that copies one file to another.
