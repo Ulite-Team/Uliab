@@ -44,6 +44,13 @@ pub struct BuildOptions {
     /// Repositories for resolving the project's `deps {}` block. `None`
     /// uses Google Maven then Maven Central (ARCHITECTURE.md §7.1).
     pub repos: Option<Vec<MavenRepo>>,
+    /// An explicit Android SDK root, injected into each plugin's
+    /// configuration as `androidSdkDir`. `None` probes the environment
+    /// (`ANDROID_HOME`, then `ANDROID_SDK_ROOT`, then `~/Android/Sdk`);
+    /// when none of those resolves to an existing directory the key is
+    /// omitted and a plugin that needs it must be given the root another
+    /// way (e.g. its own module block).
+    pub android_sdk: Option<PathBuf>,
 }
 
 /// Evaluates `dir` as a ulb project and runs the task graphs its plugins
@@ -141,6 +148,7 @@ pub struct BuildOptions {
 ///     registry: Some(RegistrySource::File(index)),
 ///     cache_dir: Some(project.join(".cache")),
 ///     repos: None,
+///     android_sdk: None,
 /// };
 /// let first = build_project(&project, &options).expect("first build");
 /// assert_eq!((first.ran, first.up_to_date), (2, 0));
@@ -215,6 +223,20 @@ pub fn build_project(dir: &Path, options: &BuildOptions) -> Result<BuildResult, 
         "projectDir".to_owned(),
         serde_json::json!(dir.display().to_string()),
     );
+    // The Android SDK root, when one can be found, is handed over the same
+    // channel so a plugin that drives Android toolchain tools can locate
+    // the SDK without any environment access of its own (the wasm guest
+    // has none). An explicit `--android-sdk` wins; otherwise the usual
+    // environment conventions are probed. The root is injected whether or
+    // not the module declares an `android {}` block — the plugin decides
+    // what a key means, and a project that never resolves an android
+    // plugin simply ignores it.
+    if let Some(sdk_root) = android_sdk_root(options.android_sdk.as_deref()) {
+        plugin_config_object.insert(
+            "androidSdkDir".to_owned(),
+            serde_json::json!(sdk_root.display().to_string()),
+        );
+    }
     let config_text = plugin_config.to_string();
     let config_hash = hex(&Sha256::digest(config_text.as_bytes()));
 
@@ -272,6 +294,45 @@ pub fn build_project(dir: &Path, options: &BuildOptions) -> Result<BuildResult, 
         .map_err(|error| format!("scheduling the build: {error}"))?;
     store.save()?;
     Ok(result)
+}
+
+/// Resolves the Android SDK root a build should use: an explicit
+/// `--android-sdk` path wins, then `ANDROID_HOME`, then `ANDROID_SDK_ROOT`,
+/// then the conventional `~/Android/Sdk`. The first candidate that is an
+/// existing directory wins; `None` when no candidate exists. The resolved
+/// root is injected into every plugin's configuration as `androidSdkDir`
+/// (see [`build_project`]).
+pub fn android_sdk_root(override_path: Option<&Path>) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    first_existing_sdk_dir(&sdk_candidates(override_path, home.as_deref()))
+}
+
+/// The Android SDK roots a build probes, in priority order. A pure
+/// function of the override and the home directory (the environment
+/// variables are read separately) so the ordering is testable without
+/// touching the process environment.
+fn sdk_candidates(override_path: Option<&Path>, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = override_path {
+        candidates.push(path.to_path_buf());
+    }
+    for variable in ["ANDROID_HOME", "ANDROID_SDK_ROOT"] {
+        if let Some(path) = std::env::var_os(variable) {
+            candidates.push(PathBuf::from(path));
+        }
+    }
+    if let Some(home) = home {
+        candidates.push(home.join("Android").join("Sdk"));
+    }
+    candidates
+}
+
+/// The first candidate that is an existing directory, or `None`.
+fn first_existing_sdk_dir(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .find(|candidate| candidate.is_dir())
+        .cloned()
 }
 
 /// Reads one project source file. `conventions.ulb` is optional; the other
@@ -487,5 +548,51 @@ mod tests {
         let error = module_model_to_json(&Value::Invalid("unknown reference".to_owned()))
             .expect_err("invalid");
         assert!(error.contains("unresolved value"));
+    }
+
+    #[test]
+    fn sdk_candidates_lead_with_the_override_and_end_with_the_home_fallback() {
+        let candidates = sdk_candidates(
+            Some(Path::new("/opt/sdk")),
+            Some(Path::new("/home/example")),
+        );
+        assert_eq!(candidates.first().unwrap(), &PathBuf::from("/opt/sdk"));
+        assert_eq!(
+            candidates.last().unwrap(),
+            &PathBuf::from("/home/example/Android/Sdk")
+        );
+        // The override always leads, so it wins over any environment or
+        // home candidate no matter what the machine has set.
+        let no_override = sdk_candidates(None, Some(Path::new("/home/example")));
+        assert_eq!(
+            no_override.last().unwrap(),
+            &PathBuf::from("/home/example/Android/Sdk")
+        );
+    }
+
+    #[test]
+    fn first_existing_sdk_dir_skips_missing_candidates() {
+        let base =
+            std::env::temp_dir().join(format!("uliab-sdk-candidates-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("real")).expect("create temp dir");
+        let candidates = vec![
+            base.join("missing"),
+            base.join("real"),
+            base.join("also-missing"),
+        ];
+        assert_eq!(first_existing_sdk_dir(&candidates), Some(base.join("real")));
+        assert_eq!(first_existing_sdk_dir(&[base.join("missing")]), None);
+    }
+
+    #[test]
+    fn android_sdk_root_accepts_an_existing_override() {
+        let base = std::env::temp_dir().join(format!("uliab-sdk-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("sdk")).expect("create temp dir");
+        assert_eq!(
+            android_sdk_root(Some(&base.join("sdk"))),
+            Some(base.join("sdk"))
+        );
     }
 }

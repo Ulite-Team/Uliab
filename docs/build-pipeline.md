@@ -1,22 +1,25 @@
 # Build pipeline (`crates/uliab/src/driver.rs`)
 
 `build_project(dir, options)` is the whole build in one call. The
-11-step shape is specified in `architecture.md` §9; this is how the
+10-step shape is specified in `architecture.md` §9; this is how the
 implementation maps onto it.
 
 ## Options
 
 ```
 BuildOptions {
-    registry: Option<RegistrySource>,
-    cache_dir: Option<PathBuf>,
-    repos:    Option<Vec<MavenRepo>>,
+    registry:    Option<RegistrySource>,
+    cache_dir:   Option<PathBuf>,
+    repos:       Option<Vec<MavenRepo>>,
+    android_sdk: Option<PathBuf>,
 }
 ```
 
-The three optional knobs override, respectively: which registry index to
-resolve plugins against, where plugin artifacts cache, and which Maven
-repositories to use (from the `--repo` flag).
+The four optional knobs override, respectively: which registry index to
+resolve plugins against, where plugin artifacts cache, which Maven
+repositories to use (from the `--repo` flag), and which Android SDK root
+to hand plugins (from `--android-sdk`; absent that flag the environment
+conventions `ANDROID_HOME`/`ANDROID_SDK_ROOT`/`~/Android/Sdk` are probed).
 
 ## Two phases
 
@@ -31,8 +34,8 @@ configured.
 1. Read the project's `libs.ulb` via `read_libs_plugins`
    (`crates/uliab/src/project.rs`), lifting each `plugins {}` entry into a
    `PluginSpec { name, version }`.
-2. Evaluate the module model (`settings` / `libs` / `conventions` / each
-   `build.ulb`) through `ulb-lang`'s evaluator.
+2. Evaluate the module model (`libs` / `conventions` / `build.ulb`)
+   through `ulb-lang`'s evaluator.
 3. Resolve every `PluginSpec` through the registry
    ([plugin-registry.md](plugin-registry.md)) into a downloaded, verified
    wasm artifact.
@@ -63,6 +66,10 @@ Every plugin's `configure` JSON contains at minimum:
 - `projectDir` — the project directory the build was started for, so
   plugins resolve their relative paths against the project, not the
   invocation directory;
+- `androidSdkDir` — the resolved Android SDK root, when one exists (the
+  `--android-sdk` flag or an environment convention resolves to a real
+  directory); a plugin that drives Android toolchain tools reads it, and a
+  project with no android plugin ignores it;
 - the module model: the `jvm {}`/`android {}`-style blocks, `deps {}`,
   properties, and every other evaluated value;
 - `classpath.*` buckets for the jvm family, when the module declares deps.

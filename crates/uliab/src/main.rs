@@ -11,11 +11,13 @@
 //!   into the cache on a miss (ARCHITECTURE.md §9, steps 5–6), and prints
 //!   the resulting local artifact paths. `SOURCE` is a registry index URL
 //!   (`https://…`) or a local `index.json` path.
-//! - `uliab build [--project DIR] [--registry SOURCE] [--cache-dir DIR] [--repo REPO]`
+//! - `uliab build [--project DIR] [--registry SOURCE] [--cache-dir DIR] [--repo REPO] [--android-sdk DIR]`
 //!   — evaluates the project, configures each declared plugin with the
 //!   module model, and executes the registered task graphs incrementally
 //!   (ARCHITECTURE.md §9), printing how many tasks ran versus were skipped
-//!   as up-to-date.
+//!   as up-to-date. `--android-sdk DIR` names the Android SDK root to hand
+//!   plugins (see `androidSdkDir` in `driver.rs`); without it the usual
+//!   environment conventions are probed.
 //! - `uliab deps resolve [--project DIR] [--cache-dir DIR] [--repo REPO]`
 //!   — resolves the project's `deps {}` block into a classpath
 //!   (ARCHITECTURE.md §6, §7) against the default repositories, and prints
@@ -47,7 +49,7 @@ fn main() -> ExitCode {
                 "  uliab plugins resolve [--project DIR] [--registry SOURCE] [--cache-dir DIR]"
             );
             eprintln!(
-                "  uliab build [--project DIR] [--registry SOURCE] [--cache-dir DIR] [--repo REPO]"
+                "  uliab build [--project DIR] [--registry SOURCE] [--cache-dir DIR] [--repo REPO] [--android-sdk DIR]"
             );
             eprintln!("  uliab deps resolve [--project DIR] [--cache-dir DIR] [--repo REPO]");
             ExitCode::from(2)
@@ -185,6 +187,7 @@ fn cmd_build(args: &[String]) -> ExitCode {
         registry: options.registry.as_deref().map(parse_registry_source),
         cache_dir: options.cache_dir.clone(),
         repos: (!options.repos.is_empty()).then_some(repos),
+        android_sdk: options.android_sdk.clone(),
     };
     match build_project(project_dir, &build_options) {
         Ok(result) => {
@@ -286,6 +289,7 @@ struct Options {
     registry: Option<String>,
     cache_dir: Option<PathBuf>,
     repos: Vec<MavenRepo>,
+    android_sdk: Option<PathBuf>,
 }
 
 fn parse_options(args: &[String]) -> Options {
@@ -294,6 +298,7 @@ fn parse_options(args: &[String]) -> Options {
         registry: std::env::var("ULIAB_REGISTRY").ok(),
         cache_dir: None,
         repos: Vec::new(),
+        android_sdk: None,
     };
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
@@ -316,6 +321,11 @@ fn parse_options(args: &[String]) -> Options {
             "--repo" => {
                 if let Some(value) = iter.next() {
                     options.repos.push(MavenRepo::Custom(value.clone()));
+                }
+            }
+            "--android-sdk" => {
+                if let Some(value) = iter.next() {
+                    options.android_sdk = Some(PathBuf::from(value));
                 }
             }
             other => eprintln!("warning: ignoring unknown option '{other}'"),
