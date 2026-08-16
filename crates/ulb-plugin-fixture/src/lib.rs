@@ -9,7 +9,10 @@
 //! host-resolved `classpath` object and a `classpathOutput` path, it
 //! registers a `copy-classpath` task that copies the first compile jar
 //! there, proving a plugin can consume the jars the host resolved for its
-//! `deps {}` block. A `probeTool` config key additionally registers a
+//! `deps {}` block. A `sourceSetClasspath` config key (an object naming a
+//! source set and an output path) registers a task copying the first
+//! compile jar of that source set's resolved `classpathSourceSets` entry.
+//! A `probeTool` config key additionally registers a
 //! no-op `run-tool` task with the named tool, so the host tests can drive
 //! the manifest-declared-tools gate (ARCHITECTURE.md §3.5). A
 //! `probeAndroidSdk` config key makes configure assert that the module's
@@ -115,6 +118,41 @@ impl exports::ulite::ulb::ulb_plugin::Guest for Fixture {
                 action: Action::CopyFile(CopyArgs {
                     source: compile_jar,
                     destination: classpath_output,
+                }),
+            })?;
+        }
+
+        // A `sourceSetClasspath` config key (an object with `name` and
+        // `output`) registers a task that copies the first compile jar of
+        // that source set's classpath, proving the host-resolved
+        // `classpathSourceSets` map reaches the plugin.
+        if let Some(spec) = config.get("sourceSetClasspath") {
+            let name = spec
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "sourceSetClasspath is missing 'name'".to_owned())?;
+            let output = spec
+                .get("output")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "sourceSetClasspath is missing 'output'".to_owned())?
+                .to_owned();
+            let compile_jar = config
+                .get("classpathSourceSets")
+                .and_then(|sets| sets.get(name))
+                .and_then(|classpath| classpath.get("compile"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|jars| jars.first())
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("no compile jar for source set '{name}'"))?
+                .to_owned();
+            task_registrar::register_task(&Task {
+                name: "copy-source-set-classpath".to_owned(),
+                inputs: Vec::new(),
+                outputs: vec![output.clone()],
+                depends_on: Vec::new(),
+                action: Action::CopyFile(CopyArgs {
+                    source: compile_jar,
+                    destination: output,
                 }),
             })?;
         }

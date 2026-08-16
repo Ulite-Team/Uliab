@@ -457,7 +457,10 @@ slices of the same plugin.
   Kotlin's published defaults or an explicit one declared in `build.ulb`.
 - Owns per-source-set `deps {}` scoping (`commonMain.deps { }` — DSL
   syntax already exists per grammar.md §6.4; resolving which deps are
-  visible to which platform source set is `ulite/kmp` behavior).
+  visible to which platform source set is `ulite/kmp` behavior). The host
+  already resolves every nested `deps {}` block into per-source-set
+  classpaths and injects them as `classpathSourceSets` (§9 step 7), so the
+  plugin's job is the *hierarchy*: which source sets feed which target.
 - For a KMP module's Android target specifically, delegates to
   `ulite/android`; for other native targets (iOS, desktop), delegates to
   whatever future plugins own those toolchains (not designed yet —
@@ -577,7 +580,12 @@ one repo produces a `PROGRESS.md` entry in the others; the
 6. Each plugin's configure() validates its owned keys in the module model
    and registers tasks into the core task engine (§3.2, §4)
 7. Resolve external Maven deps against repos → cache (§7) — core, shared
-   by every plugin active on the module
+   by every plugin active on the module. The module's top-level `deps {}`
+   block resolves to the `classpath` configuration key; every nested
+   `deps {}` block — `commonMain.deps`, `androidMain.deps`, or deeper such
+   as `kmp.commonMain.deps` — resolves independently and is injected as
+   `classpathSourceSets`, mapping each source-set path to its own classpath
+   (§5.3). Both are part of the configuration hash (§10)
 8. Derive the full task DAG (§4); fingerprint inputs; schedule waves
 9. Execute: each task's action runs via `run_tool`/`copy`/`write` (§3.5)
    inside a sandboxed working directory

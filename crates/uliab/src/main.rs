@@ -30,9 +30,12 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use uliab::driver::{BuildOptions, DEFAULT_REGISTRY, build_project, resolve_project_deps};
+use uliab::driver::{
+    BuildOptions, DEFAULT_REGISTRY, build_project, resolve_project_deps,
+    resolve_project_source_sets,
+};
 use uliab::host::PluginHost;
-use uliab::maven::MavenRepo;
+use uliab::maven::{self, MavenRepo};
 use uliab::project::{self, read_libs_plugins};
 use uliab::registry::{Registry, RegistrySource};
 
@@ -245,35 +248,52 @@ fn cmd_deps(args: &[String]) -> ExitCode {
             for note in &resolution.notes {
                 eprintln!("note: {note}");
             }
-            let buckets = [
-                ("compile", &resolution.classpath.compile),
-                ("runtime", &resolution.classpath.runtime),
-                ("processor", &resolution.classpath.processor),
-                ("testCompile", &resolution.classpath.test_compile),
-                ("testRuntime", &resolution.classpath.test_runtime),
-                (
-                    "androidTestCompile",
-                    &resolution.classpath.android_test_compile,
-                ),
-                (
-                    "androidTestRuntime",
-                    &resolution.classpath.android_test_runtime,
-                ),
-            ];
-            for (name, jars) in buckets {
-                if jars.is_empty() {
-                    continue;
-                }
-                println!("{name}:");
-                for jar in jars {
-                    println!("  {}", jar.display());
-                }
+            print_classpath(&resolution.classpath, "");
+        }
+        Err(error) if error.contains("does not declare a deps") => {}
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    // Source-set deps resolve independently of the module's top-level deps,
+    // so a project that only declares `commonMain.deps { }` and friends
+    // still gets a useful report (and a module without any deps is not an
+    // error here the way it is for the module-level resolution).
+    match resolve_project_source_sets(project_dir, &repos, options.cache_dir.clone()) {
+        Ok(source_sets) => {
+            for (path, classpath) in source_sets {
+                println!("{path}:");
+                print_classpath(&classpath, "  ");
             }
             ExitCode::SUCCESS
         }
         Err(error) => {
             eprintln!("error: {error}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Prints the non-empty buckets of a classpath, each bucket on its own line
+/// followed by one line per jar, indented relative to the enclosing section.
+fn print_classpath(classpath: &maven::Classpath, indent: &str) {
+    let buckets = [
+        ("compile", &classpath.compile),
+        ("runtime", &classpath.runtime),
+        ("processor", &classpath.processor),
+        ("testCompile", &classpath.test_compile),
+        ("testRuntime", &classpath.test_runtime),
+        ("androidTestCompile", &classpath.android_test_compile),
+        ("androidTestRuntime", &classpath.android_test_runtime),
+    ];
+    for (name, jars) in buckets {
+        if jars.is_empty() {
+            continue;
+        }
+        println!("{indent}{name}:");
+        for jar in jars {
+            println!("{indent}  {}", jar.display());
         }
     }
 }
