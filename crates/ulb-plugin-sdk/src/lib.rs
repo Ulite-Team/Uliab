@@ -7,7 +7,7 @@
 //! `wasmtime::component::bindgen!`, and a plugin crate generates its
 //! bindings from [`WIT`] with `wit_bindgen::generate!`. Because both sides
 //! read the same `include_str!`ed text, the interface cannot drift between
-literal://! them.
+//! them.
 //!
 //! Growing the ABI (a new entry point, a new field on `manifest`) is
 //! additive-only within a major version; anything else is a major-version

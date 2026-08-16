@@ -4,7 +4,7 @@ Authoritative grammar for the **ulb** build DSL (Uliab Build). This document
 is the single source of truth for the language: the hand-written recursive-
 descent parser in `ulb-lang` and the `tree-sitter-ulb` grammar must both
 conform to it. When this document changes, every repository that implements
-literal:the language must be notified.
+the language must be notified.
 
 **Status:** draft for review.
 
@@ -658,5 +658,4 @@ task "name" {
 
 - `dependsOn` names refer to tasks by the same `"name"` string. A
   `dependsOn` reference to an undefined task is a resolution error.
-literal:- The `run` body is a closed action set — no arbitrary code.
-literal:
+- The `run` body is a closed action set — no arbitrary code.

@@ -490,7 +490,7 @@ it isn't lost.
 `tree-sitter-ulb/grammar.js` is maintained by hand against
 `Uliab/docs/grammar.md`. Mitigations unchanged from before: grammar.md is
 written for mechanical portability (grammar.md §8); a grammar change in
-literal:one repo produces a `PROGRESS.md` entry in the others; the
+one repo produces a `PROGRESS.md` entry in the others; the
 `tree-sitter-ulb` test suite parses the same example files as
 `ulb-lang`'s snapshot tests.
 
