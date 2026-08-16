@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use uliab::driver::resolve_project_deps;
+use uliab::driver::{resolve_project_deps, resolve_project_source_sets};
 use uliab::maven::MavenRepo;
 
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -226,4 +226,53 @@ fn missing_artifact_is_an_error() {
     let repos = vec![MavenRepo::Custom(repo.root.display().to_string())];
     let error = resolve_project_deps(&project.dir, &repos, None).expect_err("missing artifact");
     assert!(error.contains("could not find"), "{error}");
+}
+
+#[test]
+fn source_set_deps_resolve_independently() {
+    let repo = LocalRepo::new();
+    repo.add("com.example", "common", "1.0", &[]);
+    repo.add("com.example", "android", "1.0", &[]);
+    let project = Project::new(
+        "commonMain.deps {\n  implementation \"com.example:common:1.0\"\n}\n\
+         androidMain.deps {\n  implementation \"com.example:android:1.0\"\n}\n",
+    );
+
+    let repos = vec![MavenRepo::Custom(repo.root.display().to_string())];
+    let resolved =
+        resolve_project_source_sets(&project.dir, &repos, Some(project.dir.join(".cache")))
+            .expect("resolves");
+    assert_eq!(resolved.len(), 2);
+    assert_eq!(resolved[0].0, "androidMain");
+    assert_eq!(jar_names(&resolved[0].1.compile), vec!["android-1.0.jar"]);
+    assert!(resolved[0].1.runtime.contains(&resolved[0].1.compile[0]));
+    assert_eq!(resolved[1].0, "commonMain");
+    assert_eq!(jar_names(&resolved[1].1.compile), vec!["common-1.0.jar"]);
+    assert!(resolved[1].1.runtime.contains(&resolved[1].1.compile[0]));
+}
+
+#[test]
+fn nested_source_set_deps_resolve_by_full_path() {
+    let repo = LocalRepo::new();
+    repo.add("com.example", "shared", "1.0", &[]);
+    let project = Project::new(
+        "kmp {\n  commonMain.deps {\n    implementation \"com.example:shared:1.0\"\n  }\n}\n",
+    );
+
+    let repos = vec![MavenRepo::Custom(repo.root.display().to_string())];
+    let resolved =
+        resolve_project_source_sets(&project.dir, &repos, Some(project.dir.join(".cache")))
+            .expect("resolves");
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].0, "kmp.commonMain");
+    assert_eq!(jar_names(&resolved[0].1.compile), vec!["shared-1.0.jar"]);
+}
+
+#[test]
+fn a_model_without_source_set_deps_resolves_to_nothing() {
+    let repo = LocalRepo::new();
+    let project = Project::new("commonMain { sources [\"src/commonMain\"] }\n");
+    let repos = vec![MavenRepo::Custom(repo.root.display().to_string())];
+    let resolved = resolve_project_source_sets(&project.dir, &repos, None).expect("no deps");
+    assert!(resolved.is_empty());
 }

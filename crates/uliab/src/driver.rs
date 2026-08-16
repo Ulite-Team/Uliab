@@ -214,6 +214,28 @@ pub fn build_project(dir: &Path, options: &BuildOptions) -> Result<BuildResult, 
         .as_object_mut()
         .expect("the module model serialized to an object");
     plugin_config_object.insert("classpath".to_owned(), classpath.to_json());
+    // Source-set dependencies (`commonMain.deps { }`, `jvmMain.deps { }`,
+    // ...) resolve the same way, but each into its own classpath, handed to
+    // plugins as a `classpathSourceSets` object mapping a source-set path
+    // to that source set's classpath. A plugin that compiles per-target —
+    // a KMP-style module compiling shared sources against each target's
+    // classpath — scopes its compile classpaths from this instead of
+    // resolving anything itself. Resolution runs for every nested deps block
+    // whether or not the module also declares the top-level `deps {}` block
+    // above, and the injected map is part of the configuration hash below,
+    // so a source-set jar that changes still reruns affected tasks.
+    let source_sets =
+        resolve_source_set_classpaths(&outcome.model, &repos, options.cache_dir.clone())?;
+    if !source_sets.is_empty() {
+        let mut source_set_map = serde_json::Map::new();
+        for (path, source_set_classpath) in source_sets {
+            source_set_map.insert(path, source_set_classpath.to_json());
+        }
+        plugin_config_object.insert(
+            "classpathSourceSets".to_owned(),
+            serde_json::Value::Object(source_set_map),
+        );
+    }
     // The project directory is handed over the same channel, so a plugin
     // can resolve its block's relative paths against it regardless of the
     // directory the build tool was invoked from.
@@ -530,6 +552,80 @@ pub fn resolve_project_deps(
     repos: &[MavenRepo],
     cache_dir: Option<PathBuf>,
 ) -> Result<maven::Resolution, String> {
+    let outcome = evaluate_project_dir(dir)?;
+    resolve_model_deps(&outcome.model, repos, cache_dir)
+}
+
+/// Resolves every source-set `deps {}` block declared in the project at
+/// `dir` into its own classpath, consulting `repos` in order and caching
+/// artifacts under `cache_dir` (or the default cache location when `None`).
+///
+/// A source set is any block below the module level that carries a `deps`
+/// key — `commonMain`, `jvmMain`, `androidMain`, or deeper nesting such as
+/// `kmp.commonMain` — and each resolves independently, so a module can keep
+/// one set of dependencies visible to its shared sources and another to a
+/// single target. The module's own top-level `deps {}` block is *not*
+/// included; use [`resolve_project_deps`] for that. The result is ordered by
+/// source-set path.
+///
+/// # Errors
+///
+/// Returns a description when a project file cannot be read or fails to
+/// parse or evaluate, when a source-set deps block is malformed (including a
+/// `deps` that is not a block), or when resolution fails (see
+/// [`maven::ResolveError`]).
+///
+/// # Examples
+///
+/// A local repository carries `example:one:1.0`. The module declares it for
+/// `commonMain` and for `androidMain`, and each source set resolves
+/// independently:
+///
+/// ```rust
+/// use std::fs;
+/// use uliab::driver::resolve_project_source_sets;
+/// use uliab::maven::MavenRepo;
+///
+/// let dir = std::env::temp_dir().join(format!(
+///     "uliab-source-sets-doc-{}", std::process::id()
+/// ));
+/// let _ = fs::remove_dir_all(&dir);
+/// let repo = dir.join("repo");
+/// fs::create_dir_all(repo.join("com/example/one/1.0")).unwrap();
+/// fs::write(repo.join("com/example/one/1.0/one-1.0.pom"), r#"<?xml version="1.0"?>
+/// <project><modelVersion>4.0.0</modelVersion>
+/// <groupId>com.example</groupId><artifactId>one</artifactId><version>1.0</version>
+/// </project>"#).unwrap();
+/// fs::write(repo.join("com/example/one/1.0/one-1.0.jar"), b"one").unwrap();
+/// fs::write(dir.join("build.ulb"), r#"commonMain.deps {
+///   implementation "com.example:one:1.0"
+/// }
+/// androidMain.deps {
+///   implementation "com.example:one:1.0"
+/// }"#).unwrap();
+/// fs::write(dir.join("libs.ulb"), "").unwrap();
+///
+/// let repos = vec![MavenRepo::Custom(repo.display().to_string())];
+/// let resolved =
+///     resolve_project_source_sets(&dir, &repos, Some(dir.join("cache"))).expect("resolves");
+/// let paths: Vec<&str> = resolved.iter().map(|(path, _)| path.as_str()).collect();
+/// assert_eq!(paths, ["androidMain", "commonMain"]);
+/// for (_, classpath) in &resolved {
+///     assert_eq!(classpath.compile.len(), 1);
+/// }
+/// ```
+pub fn resolve_project_source_sets(
+    dir: &Path,
+    repos: &[MavenRepo],
+    cache_dir: Option<PathBuf>,
+) -> Result<Vec<(String, maven::Classpath)>, String> {
+    let outcome = evaluate_project_dir(dir)?;
+    resolve_source_set_classpaths(&outcome.model, repos, cache_dir)
+}
+
+/// Evaluates the project sources at `dir` (`conventions.ulb`, `libs.ulb`,
+/// `build.ulb`) into a module model, erroring on the first diagnostic.
+fn evaluate_project_dir(dir: &Path) -> Result<ulb_lang::eval::EvalOutcome, String> {
     let conventions = read_source(dir, "conventions.ulb", false)?;
     let libs = read_source(dir, "libs.ulb", true)?;
     let build = read_source(dir, "build.ulb", true)?;
@@ -547,8 +643,7 @@ pub fn resolve_project_deps(
             dir.join("build.ulb").display()
         ));
     }
-
-    resolve_model_deps(&outcome.model, repos, cache_dir)
+    Ok(outcome)
 }
 
 /// Resolves the `deps {}` block of an evaluated module model, erroring when
@@ -574,6 +669,78 @@ fn resolve_model_deps(
     resolver
         .resolve(&declared)
         .map_err(|error| error.to_string())
+}
+
+/// Resolves every source-set `deps {}` block in the module model into its
+/// own classpath (see [`resolve_project_source_sets`]). The result is
+/// ordered by source-set path, matching the deterministic block iteration
+/// the evaluator produces.
+fn resolve_source_set_classpaths(
+    model: &Value,
+    repos: &[MavenRepo],
+    cache_dir: Option<PathBuf>,
+) -> Result<Vec<(String, maven::Classpath)>, String> {
+    let top = match model {
+        Value::Block(entries) => entries,
+        other => {
+            return Err(format!(
+                "the module model is not a block (found {})",
+                value_kind(other)
+            ));
+        }
+    };
+    let mut blocks = Vec::new();
+    for (key, value) in top {
+        let mut path = vec![key.clone()];
+        collect_source_set_deps(&mut blocks, &mut path, value)?;
+    }
+    let mut resolved = Vec::new();
+    for (path, deps) in blocks {
+        let declared = maven::parse_deps_block(deps)?;
+        let resolver = maven::Resolver::new(repos.to_vec(), cache_dir.clone());
+        let classpath = resolver
+            .resolve(&declared)
+            .map_err(|error| format!("{path}: {error}"))?
+            .classpath;
+        resolved.push((path, classpath));
+    }
+    Ok(resolved)
+}
+
+/// Collects every `deps` block nested at or below `value`, recording each
+/// under its key path joined with `.` (`commonMain`, `kmp.commonMain`). A
+/// block's own `deps` key is recorded but never descended into, so nested
+/// declarations cannot shadow each other, and non-block values are reported
+/// with their path so the error points at the offending source set.
+fn collect_source_set_deps<'a>(
+    out: &mut Vec<(String, &'a Value)>,
+    path: &mut Vec<String>,
+    value: &'a Value,
+) -> Result<(), String> {
+    let Value::Block(entries) = value else {
+        return Ok(());
+    };
+    if let Some(deps) = entries.get("deps") {
+        match deps {
+            Value::Block(_) => out.push((path.join("."), deps)),
+            other => {
+                return Err(format!(
+                    "deps at '{}' must be a block (found {})",
+                    path.join("."),
+                    value_kind(other)
+                ));
+            }
+        }
+    }
+    for (key, child) in entries {
+        if key == "deps" || !matches!(child, Value::Block(_)) {
+            continue;
+        }
+        path.push(key.clone());
+        collect_source_set_deps(out, path, child)?;
+        path.pop();
+    }
+    Ok(())
 }
 
 fn value_kind(value: &Value) -> &'static str {
@@ -759,5 +926,61 @@ mod tests {
             module_android_sdk_dir(&serde_json::json!({}), Path::new("/p")),
             None
         );
+    }
+
+    #[test]
+    fn source_set_deps_are_collected_by_key_path() {
+        let block = |entries: &[(&str, Value)]| -> Value {
+            Value::Block(
+                entries
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), value.clone()))
+                    .collect(),
+            )
+        };
+        let deps_block = block(&[(
+            "implementation",
+            Value::List(vec![Value::Str("com.example:one:1.0".to_owned())]),
+        )]);
+        let model = block(&[
+            ("deps", deps_block.clone()),
+            ("commonMain", block(&[("deps", deps_block.clone())])),
+            (
+                "android",
+                block(&[("compileSdk", Value::Number(Number::Int(35)))]),
+            ),
+            (
+                "kmp",
+                block(&[("commonMain", block(&[("deps", deps_block)]))]),
+            ),
+        ]);
+
+        let mut found = Vec::new();
+        let Value::Block(top) = &model else {
+            panic!("model is a block");
+        };
+        for (key, value) in top {
+            collect_source_set_deps(&mut found, &mut vec![key.clone()], value).expect("collects");
+        }
+        let paths: Vec<&str> = found.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(paths, ["commonMain", "kmp.commonMain"]);
+    }
+
+    #[test]
+    fn a_non_block_source_set_deps_names_its_path() {
+        let model = Value::Block(
+            [(
+                "commonMain".to_owned(),
+                Value::Block(
+                    [("deps".to_owned(), Value::Str("x".to_owned()))]
+                        .into_iter()
+                        .collect(),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let error = resolve_source_set_classpaths(&model, &[], None).expect_err("malformed deps");
+        assert!(error.contains("deps at 'commonMain'"), "{error}");
     }
 }
