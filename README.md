@@ -1,5 +1,11 @@
 # uliab
 
+> [!WARNING]
+> **Experimental — alpha, not stable.** uliab is not yet usable for real
+> builds. The CLI, the DSL, the plugin ABI, and the registry format are all
+> subject to breaking changes at any time. Do not depend on any of it for
+> production work, and do not vendor the ABI.
+
 A declarative, plugin-driven build tool for the `ulb` DSL.
 
 `uliab` reads a project's `settings.ulb` / `build.ulb` / `conventions.ulb`
