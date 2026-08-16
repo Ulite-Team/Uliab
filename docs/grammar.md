@@ -1,4 +1,4 @@
-# ulb Language Grammar (GRAMMAR.md)
+# ulb Language Grammar (grammar.md)
 
 Authoritative grammar for the **ulb** build DSL (Uliab Build). This document
 is the single source of truth for the language: the hand-written recursive-
@@ -392,7 +392,7 @@ Version catalog — the equivalent of `libs.versions.toml`'s `[versions]`,
 | `alias = "group:artifact:version"` | full coordinate |
 | `alias = "group:artifact" @ refOrString` | coordinate with version reference |
 | `bundle { NAME = [ alias1, alias2 ] }` | named group of library aliases |
-| `plugins { NAME = "vendor/name" @ refOrString }` | versioned plugin references (Ulite Team plugin registry — ARCHITECTURE.md §3.3/§3.6) |
+| `plugins { NAME = "vendor/name" @ refOrString }` | versioned plugin references (Ulite Team plugin registry — architecture.md §3.3/§3.6) |
 
 Example:
 
@@ -420,10 +420,10 @@ plugins {
 An alias may only reference `@` a `versions {}` entry or an inline string.
 An alias whose value is a full coordinate may not also carry `@` (duplicate
 version — evaluator error). Plugin names resolve against the Ulite Team
-plugin registry, not a Maven repository (ARCHITECTURE.md §3.6); the
+plugin registry, not a Maven repository (architecture.md §3.6); the
 evaluator treats them as opaque values — the tool layer resolves them
 (`uliab plugins resolve` reads the `plugins {}` table and downloads each
-referenced build into the local plugin cache, ARCHITECTURE.md §9,
+referenced build into the local plugin cache, architecture.md §9,
 steps 5–6).
 
 ---
@@ -466,7 +466,7 @@ the grammar small enough for a day-one LSP:
    current token or a one-token lookahead, which is GLR-friendly.
 
 The `grammar.js` is maintained by hand against this document and the
-sync-by-hand risk is tracked in ARCHITECTURE.md §11.
+sync-by-hand risk is tracked in architecture.md §11.
 
 ---
 
@@ -498,7 +498,7 @@ errors):
 - `convention`/`fn` definitions only in `conventions.ulb` — enforced by
   the **core evaluator** (span-attached error).
 - `project`/`module`/`repositories`/`lspCompat` only in `settings.ulb` —
-  enforced by the tool layer (build pipeline, ARCHITECTURE.md §9).
+  enforced by the tool layer (build pipeline, architecture.md §9).
 - `versions`/`bundle`/`plugins`/alias assignments only in `libs.ulb` —
   enforced by the tool layer.
 - `task`/`plugin` statements only in `build.ulb` (or inside a `convention`
@@ -506,7 +506,7 @@ errors):
 - `android`/`buildTypes`/`productFlavors`/`signing` blocks are **not**
   core-validated: to the grammar and the evaluator they are ordinary
   blocks (§5), and their placement and keys are owned by whichever plugin
-  claims them — the `ulite/android` plugin (ARCHITECTURE.md §5.2, and the
+  claims them — the `ulite/android` plugin (architecture.md §5.2, and the
   ownership note at the top of Appendix A).
 - `apply "NAME"` with no matching `convention NAME` is an error — the
   evaluator reports it, and the LSP surfaces it as a semantic diagnostic.
@@ -551,7 +551,7 @@ Required diagnostic cases (each gets an assertion test in `ulb-lang`):
 > `android {}`, `buildTypes {}`, `productFlavors {}`, and `signing {}` are
 > ordinary block statements (§5) whose contents resolve to a generic
 > `Value` block — the same as any other block. The `ulite/android` plugin
-> (ARCHITECTURE.md §5.2) claims these keys, validates and interprets them,
+> (architecture.md §5.2) claims these keys, validates and interprets them,
 > and publishes its own reference docs mirroring these tables. The core
 > parser and evaluator never interpret the keys inside them (§10).
 
@@ -594,7 +594,7 @@ Named blocks (`debug`, `release`, or custom). Keys:
 
 The variant matrix is the cartesian product of build types × flavors; a
 variant is *valid* only if it contains exactly one flavor per dimension
-(see ARCHITECTURE.md §4).
+(see architecture.md §4).
 
 ### `signing { ... }`
 

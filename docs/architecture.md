@@ -1,6 +1,6 @@
-# ulb — Architecture (ARCHITECTURE.md)
+# ulb — Architecture (architecture.md)
 
-System design for the ulb build tool. GRAMMAR.md is the language spec;
+System design for the ulb build tool. grammar.md is the language spec;
 this document is how the pieces fit together.
 
 **Status:** revised design — the tool core is now target-agnostic. Java,
@@ -58,7 +58,7 @@ Four repositories under `Ulite-Team`:
 
 | Repo | Contains | Role |
 |---|---|---|
-| `Uliab` | `ulb-lang` crate, `uliab` CLI, plugin host + task engine, `GRAMMAR.md`, `ARCHITECTURE.md` | target-agnostic core |
+| `Uliab` | `ulb-lang` crate, `uliab` CLI, plugin host + task engine, `grammar.md`, `architecture.md` | target-agnostic core |
 | `tree-sitter-ulb` | `grammar.js`, `highlights.scm`, `folds.scm`, `indents.scm` | editor syntax presentation |
 | `ulb-lsp` | `ulb-lsp` binary | LSP server |
 | `ulb-plugins` | `jvm`, `android`, `kmp` plugin crates + the plugin registry index | official target plugins |
@@ -82,7 +82,7 @@ Four repositories under `Ulite-Team`:
 └─────────────────┘   │  published to the Ulite Team registry    │
                        └─────────────────────────────────────────┘
 ┌─────────────────────┐
-│  tree-sitter-ulb    │  (depends on GRAMMAR.md conceptually only)
+│  tree-sitter-ulb    │  (depends on grammar.md conceptually only)
 │  presentation only  │
 └─────────────────────┘
 ```
@@ -90,7 +90,7 @@ Four repositories under `Ulite-Team`:
 **Why this doesn't touch `ulb-lang` at all:** the evaluator already
 resolves `android { compileSdk 37 }` into a *generic* nested `Value::Block`
 — it never hardcoded a `compileSdk: u32` field anywhere. The DSL's
-"contextual identifiers" design (GRAMMAR.md §4: `android`, `buildTypes`,
+"contextual identifiers" design (grammar.md §4: `android`, `buildTypes`,
 `compileSdk`, … are plain identifiers, not reserved words) means the
 language was already plugin-friendly before this redesign existed; this
 document is about who gets to *assign meaning* to those keys downstream,
@@ -157,13 +157,13 @@ fingerprinting) and a *declared* action (§3.5: run an allowlisted
 external tool with an argument list the plugin computes, or a `copy`),
 and reading specific already-resolved values out of `ModuleConfig`
 (resolved classpaths, resolved deps, the generic config `Value` tree).
-This mirrors the DSL's own "closed action set" philosophy (GRAMMAR.md
+This mirrors the DSL's own "closed action set" philosophy (grammar.md
 §7) at the plugin layer: a plugin can be *wrong*, but it can't be
 *unsafe* in ways the host didn't explicitly allow.
 
 ### 3.3 How a plugin gets applied
 
-`libs.ulb`'s existing `plugins {}` syntax (GRAMMAR.md §6.4 — this needed
+`libs.ulb`'s existing `plugins {}` syntax (grammar.md §6.4 — this needed
 **no grammar change**, only a semantic reinterpretation) now names an
 Ulite Team plugin, not a Maven/AGP coordinate:
 
@@ -174,7 +174,7 @@ plugins {
 }
 ```
 
-`build.ulb`'s existing `plugin "alias"` pair statement (GRAMMAR.md
+`build.ulb`'s existing `plugin "alias"` pair statement (grammar.md
 Appendix C) applies one:
 
 ```
@@ -244,7 +244,7 @@ plugin can't silently start invoking something new after being
 installed). The plugin computes *what* to run (e.g. every `kotlinc` flag
 for a given module + variant); the host actually spawns the process. This
 is the same "plugin decides, host executes" split as `TaskRegistrar`
-(§3.2) and mirrors the DSL's own `copy`/`exec` design (GRAMMAR.md
+(§3.2) and mirrors the DSL's own `copy`/`exec` design (grammar.md
 Appendix C) one layer up.
 
 ### 3.6 Plugin registry & resolution
@@ -353,7 +353,7 @@ cases the engine knows about.
 This section replaces the old hardcoded §5/§7/§8/§9 — it now describes
 what `ulb-plugins/jvm`, `ulb-plugins/android`, and `ulb-plugins/kmp` are
 each *responsible for designing and shipping*, not core-tool behavior.
-Each plugin publishes its own reference doc (mirroring GRAMMAR.md
+Each plugin publishes its own reference doc (mirroring grammar.md
 Appendix A's tables, but plugin-owned) describing exactly which keys it
 understands inside the blocks it claims.
 
@@ -364,7 +364,7 @@ understands inside the blocks it claims.
   `assemble` tasks.
 - Owns the `api`/`implementation`/`runtimeOnly`/`compileOnly`/`ksp`/
   `testImplementation` dependency-scope *semantics* on top of the core
-  resolver's already-generic `deps {}` parsing (GRAMMAR.md Appendix B —
+  resolver's already-generic `deps {}` parsing (grammar.md Appendix B —
   the DSL syntax for these scopes is core/shared; what each scope *means*
   for a classpath is jvm-plugin behavior, reused by android/kmp below).
 - Owns KSP invocation (generate → compile → package ordering) — KSP is a
@@ -375,8 +375,8 @@ understands inside the blocks it claims.
 ### 5.2 `ulite/android` — depends on `ulite/jvm`
 
 - Owns everything under `android {}`, `buildTypes {}`, `productFlavors
-  {}`, `signing {}` (the old GRAMMAR.md Appendix A tables move to this
-  plugin's own docs — GRAMMAR.md itself no longer claims these keys as
+  {}`, `signing {}` (the old grammar.md Appendix A tables move to this
+  plugin's own docs — grammar.md itself no longer claims these keys as
   core language, see the note at the top of that document's Appendix A).
 - Owns the variant matrix (build type × flavor dimensions), per-variant
   source-set layering, and down-module variant propagation — the old §5
@@ -394,7 +394,7 @@ understands inside the blocks it claims.
   `androidMain`/`iosMain`/`desktopMain`/…, default hierarchy matching
   Kotlin's published defaults or an explicit one declared in `build.ulb`.
 - Owns per-source-set `deps {}` scoping (`commonMain.deps { }` — DSL
-  syntax already exists per GRAMMAR.md §6.4; resolving which deps are
+  syntax already exists per grammar.md §6.4; resolving which deps are
   visible to which platform source set is `ulite/kmp` behavior).
 - For a KMP module's Android target specifically, delegates to
   `ulite/android`; for other native targets (iOS, desktop), delegates to
@@ -488,8 +488,8 @@ it isn't lost.
 ### 8.1 Grammar sync-by-hand risk (unchanged)
 
 `tree-sitter-ulb/grammar.js` is maintained by hand against
-`Uliab/GRAMMAR.md`. Mitigations unchanged from before: GRAMMAR.md is
-written for mechanical portability (GRAMMAR.md §8); a grammar change in
+`Uliab/docs/grammar.md`. Mitigations unchanged from before: grammar.md is
+written for mechanical portability (grammar.md §8); a grammar change in
 literal:one repo produces a `PROGRESS.md` entry in the others; the
 `tree-sitter-ulb` test suite parses the same example files as
 `ulb-lang`'s snapshot tests.
@@ -542,11 +542,11 @@ responsibilities before (they were folded into hardcoded Android logic).
 
 | Phase | Scope | Deliverable |
 |---|---|---|
-| 1 (done) | GRAMMAR.md + ARCHITECTURE.md | design lock, review |
+| 1 (done) | grammar.md + architecture.md | design lock, review |
 | 2 (done) | `ulb-lang` workspace + lexer + AST | tokens, spans, one test per construct |
 | 3 (done) | `ulb-lang` parser + error recovery | partial AST + diagnostics, snapshot + malformed tests |
 | 4 (done) | `ulb-lang` evaluator + worked example | generic `Value` model, conventions/fn/env, end-to-end example |
-| 4.5 (new, not started) | This redesign's follow-up: update GRAMMAR.md's Appendix A framing + §10 role table to stop claiming android/buildTypes/etc. as core language | GRAMMAR.md edit, no code |
+| 4.5 (new, not started) | This redesign's follow-up: update grammar.md's Appendix A framing + §10 role table to stop claiming android/buildTypes/etc. as core language | grammar.md edit, no code |
 | 5 | `tree-sitter-ulb` | grammar.js + highlights/folds/indents |
 | 6 | `ulb-lsp` skeleton | didChange parse diagnostics + unknown-convention |
 | 7a (new) | `uliab` CLI: plugin host + WASM runtime embedding + registry client (§3) | can load and call a trivial "hello world" plugin |
