@@ -245,3 +245,80 @@ fn project_dir_is_handed_to_plugins() {
         "the plugin created <projectDir>/from-plugin, so projectDir reached it"
     );
 }
+
+#[test]
+fn a_module_sdk_dir_is_preopened_and_readable_from_the_plugin() {
+    let fixture = build_fixture("ulb-plugin-fixture");
+    let project = TestProject::new("module-sdk", &fixture);
+    // A fake SDK tree living next to the project. The module declares it
+    // with a relative `android.sdkDir`, which the host must resolve against
+    // the project directory before preopening; the plugin then discovers
+    // the SDK at that path during configure (probeAndroidSdk) and would see
+    // NOTCAPABLE if the host had skipped it.
+    project.write(
+        "build.ulb",
+        &format!(
+            "source = {:?}\noutput = {:?}\nandroid {{\n  sdkDir = \"fake-sdk\"\n}}\nprobeAndroidSdk = true\n",
+            project.dir.join("in.txt").display().to_string(),
+            project.dir.join("out.txt").display().to_string(),
+        ),
+    );
+    project.write(
+        "libs.ulb",
+        "plugins {\n  fixture = \"ulite/fixture\" @ \"0.1.0\"\n}\n",
+    );
+    std::fs::create_dir_all(project.dir.join("fake-sdk/platforms/android-36")).expect("fake sdk");
+
+    let result = build_project(&project.dir, &project.options()).expect("build");
+    assert_eq!((result.ran, result.up_to_date), (2, 0));
+}
+
+#[test]
+fn an_injected_sdk_root_is_preopened_and_readable_from_the_plugin() {
+    let fixture = build_fixture("ulb-plugin-fixture");
+    let project = TestProject::new("injected-sdk", &fixture);
+    let sdk = project.dir.join("fake-sdk");
+    std::fs::create_dir_all(sdk.join("platforms/android-36")).expect("fake sdk");
+    project.write(
+        "build.ulb",
+        &format!(
+            "source = {:?}\noutput = {:?}\nprobeAndroidSdk = true\n",
+            project.dir.join("in.txt").display().to_string(),
+            project.dir.join("out.txt").display().to_string(),
+        ),
+    );
+    project.write(
+        "libs.ulb",
+        "plugins {\n  fixture = \"ulite/fixture\" @ \"0.1.0\"\n}\n",
+    );
+
+    let mut options = project.options();
+    options.android_sdk = Some(sdk);
+    let result = build_project(&project.dir, &options).expect("build");
+    assert_eq!((result.ran, result.up_to_date), (2, 0));
+}
+
+#[test]
+fn an_explicit_sdk_override_that_does_not_exist_fails_the_build() {
+    let fixture = build_fixture("ulb-plugin-fixture");
+    let project = TestProject::new("missing-sdk", &fixture);
+    let missing = project.dir.join("no-such-sdk");
+    project.write(
+        "build.ulb",
+        &format!(
+            "source = {:?}\noutput = {:?}\n",
+            project.dir.join("in.txt").display().to_string(),
+            project.dir.join("out.txt").display().to_string(),
+        ),
+    );
+    project.write(
+        "libs.ulb",
+        "plugins {\n  fixture = \"ulite/fixture\" @ \"0.1.0\"\n}\n",
+    );
+
+    let mut options = project.options();
+    options.android_sdk = Some(missing.clone());
+    let error = build_project(&project.dir, &options).expect_err("missing SDK");
+    assert!(error.contains(&missing.display().to_string()), "{error}");
+    assert!(error.contains("must name an existing directory"), "{error}");
+}

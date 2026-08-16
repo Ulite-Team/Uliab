@@ -209,12 +209,12 @@ impl std::error::Error for HostError {}
 /// The embedded wasmtime engine that plugin components run in.
 pub struct PluginHost {
     engine: Engine,
-    /// An Android SDK root preopened read-only into every plugin's WASI
-    /// filesystem at its real path, so a plugin can discover SDK components
-    /// (platform jars, build-tools binaries) itself during `configure`
-    /// instead of trusting the host to do Android-specific probing. `None`
-    /// leaves the guest filesystem empty.
-    android_sdk: Option<PathBuf>,
+    /// Android SDK roots preopened read-only into every plugin's WASI
+    /// filesystem at their real paths, so a plugin can discover SDK
+    /// components (platform jars, build-tools binaries) itself during
+    /// `configure` instead of trusting the host to do Android-specific
+    /// probing. An empty `Vec` leaves the guest filesystem empty.
+    android_sdk: Vec<PathBuf>,
 }
 
 /// The identity a plugin reports in its `manifest` entry.
@@ -239,7 +239,7 @@ impl PluginHost {
         let engine = Engine::new(&config).map_err(|error| HostError::Load(error.to_string()))?;
         Ok(Self {
             engine,
-            android_sdk: None,
+            android_sdk: Vec::new(),
         })
     }
 
@@ -250,10 +250,14 @@ impl PluginHost {
     /// its real absolute path — the same path the driver injects as the
     /// `androidSdkDir` configuration key — so a plugin can inspect it
     /// directly (ARCHITECTURE.md §3.3). Access is read-only: a plugin can
-    /// read the SDK but never modify it. The default (`new`) grants no
-    /// filesystem access at all.
+    /// read the SDK but never modify it. Call once per root: the driver
+    /// preopens both the host-resolved root and any module-declared
+    /// `android.sdkDir`. A directory that does not exist when the store is
+    /// built is skipped, leaving the plugin to report the more specific
+    /// error for a bogus block path during `configure`. The default (`new`)
+    /// grants no filesystem access at all.
     pub fn with_android_sdk(mut self, dir: PathBuf) -> Self {
-        self.android_sdk = Some(dir);
+        self.android_sdk.push(dir);
         self
     }
 
@@ -440,13 +444,20 @@ impl PluginHost {
         Ok((linker, store))
     }
 
-    /// The WASI context for a store: stdio wired to the host plus, when
-    /// one is configured, the Android SDK root preopened read-only at its
-    /// real path (see [`PluginHost::with_android_sdk`]).
+    /// The WASI context for a store: stdio wired to the host plus every
+    /// configured Android SDK root preopened read-only at its real path
+    /// (see [`PluginHost::with_android_sdk`]).
     fn wasi_context(&self) -> Result<WasiCtx, String> {
         let mut builder = WasiCtxBuilder::new();
         builder.inherit_stdout().inherit_stderr();
-        if let Some(sdk) = &self.android_sdk {
+        for sdk in &self.android_sdk {
+            if !sdk.is_dir() {
+                // A module-declared `android.sdkDir` that does not exist is
+                // left for the plugin to report during `configure`; a
+                // preopen here would surface a less useful "not found"
+                // load error instead of the plugin's own message.
+                continue;
+            }
             let guest_path = sdk.to_string_lossy();
             builder
                 .preopened_dir(sdk, guest_path.as_ref(), DirPerms::READ, FilePerms::READ)
