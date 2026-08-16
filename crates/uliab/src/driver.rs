@@ -243,7 +243,7 @@ pub fn build_project(dir: &Path, options: &BuildOptions) -> Result<BuildResult, 
             serde_json::json!(sdk_root.display().to_string()),
         );
     }
-    let module_sdk_root = module_android_sdk_dir(&plugin_config, dir);
+    let module_sdk_root = module_android_sdk_dir(&plugin_config, &dir);
     let config_text = plugin_config.to_string();
     let config_hash = hex(&Sha256::digest(config_text.as_bytes()));
 
