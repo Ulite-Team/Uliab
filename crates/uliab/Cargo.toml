@@ -3,7 +3,7 @@ name = "uliab"
 description = "The ulb build tool CLI: loads and runs wasm32-wasip2 plugins in an embedded wasmtime host"
 edition.workspace = true
 version.workspace = true
-license = "MIT OR Apache-2.0"
+license = "GPL-3.0"
 
 [dependencies]
 ulb-lang = { path = "../ulb-lang" }

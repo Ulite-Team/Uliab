@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 description = "Test plugin built against the pre-configure ABI; proves additive ABI growth keeps old components instantiable"
+license = "GPL-3.0"
 
 [dependencies]
 ulb-plugin-sdk = { path = "../ulb-plugin-sdk" }

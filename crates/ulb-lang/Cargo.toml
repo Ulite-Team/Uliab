@@ -3,7 +3,7 @@ name = "ulb-lang"
 description = "Lexer, parser, AST and evaluator for the ulb build DSL; standalone library reused by the ulb CLI, ulb-lsp, and tests"
 edition.workspace = true
 version.workspace = true
-license = "MIT OR Apache-2.0"
+license = "GPL-3.0"
 keywords = ["build", "dsl", "parser"]
 categories = ["development-tools::build-utils"]
 
