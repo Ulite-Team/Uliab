@@ -304,7 +304,7 @@ pub fn build_project(dir: &Path, options: &BuildOptions) -> Result<BuildResult, 
             eprintln!("warning: {warning}");
         }
         let plugin_graph = host
-            .configure(&resolved.path, &resolved.name, &config_text)
+            .configure(&resolved.path, &resolved.name, &config_text, &dir)
             .map_err(|error| format!("configuring {label}: {error}"))?;
         for task in plugin_graph.tasks() {
             graph
