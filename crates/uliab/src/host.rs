@@ -85,12 +85,87 @@ struct HostCtx {
 }
 
 /// The host side of a `configure` session: the graph being built, the
-/// module it belongs to, and the tools the plugin's manifest declared for
-/// its `run-tool` actions (§3.5).
+/// module it belongs to, the project directory for path validation, and
+/// the tools the plugin's manifest declared for its `run-tool` actions
+/// (§3.5). Every write or execution path a plugin registers through
+/// `register-task` is validated against `project_dir` to prevent writes
+/// or executions outside the project boundary.
 struct RegistrarState {
     graph: TaskGraph,
     module: String,
+    project_dir: PathBuf,
     declared_tools: HashSet<AllowlistedTool>,
+}
+
+impl RegistrarState {
+    /// Resolves `path` (relative to the project dir when not absolute)
+    /// and confirms it falls within the project boundary. A symlink that
+    /// escapes is also rejected, and the resolved path does not need to
+    /// exist yet: [`canonicalize_best_effort`] canonicalizes the deepest
+    /// existing ancestor — following symlinks — and appends the remaining
+    /// components, so a traversal like `../etc/passwd` or a symlinked
+    /// directory pointing outside the project is caught even for a not
+    /// yet created task output.
+    fn check_path(&self, path: &str) -> Result<(), String> {
+        let candidate = Path::new(path);
+        let resolved = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            self.project_dir.join(candidate)
+        };
+        let canonical = canonicalize_best_effort(&resolved);
+        // Compare against the canonical project dir too, so a project
+        // opened through a symlink (e.g. `/tmp` on macOS) does not make
+        // the boundary check accept paths that would escape it.
+        let base = self
+            .project_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.project_dir.clone());
+        if canonical.starts_with(&base) {
+            Ok(())
+        } else {
+            Err(format!(
+                "path '{}' resolves outside the project directory",
+                path
+            ))
+        }
+    }
+}
+
+/// Canonicalizes as much of `path` as exists on disk, appending the
+/// remaining components verbatim.
+///
+/// [`Path::canonicalize`] fails whenever the final component does not
+/// exist — the normal case for a declared task output — so the deepest
+/// existing ancestor is canonicalized (resolving `..` and following
+/// symlinks) and the non-existent tail is appended lexically. A symlinked
+/// ancestor that points outside the project is therefore still caught;
+/// only a dangling symlink in the tail is not, and the eventual host
+/// write through it fails, which is the fail-closed direction.
+fn canonicalize_best_effort(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    let mut existing = path.to_path_buf();
+    let mut tail = Vec::new();
+    loop {
+        if let Ok(mut canonical) = existing.canonicalize() {
+            for component in tail.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+        match existing.file_name() {
+            Some(name) => {
+                tail.push(name.to_os_string());
+                existing = existing
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| path.to_path_buf());
+            }
+            None => return path.to_path_buf(),
+        }
+    }
 }
 
 impl RegistrarState {
@@ -99,7 +174,16 @@ impl RegistrarState {
     /// A `run-tool` action whose tool the plugin's manifest did not
     /// declare is refused here, in-band, so the plugin can surface it in
     /// its own `configure` result (§3.5: a plugin cannot silently start
-    /// invoking something new after being installed).
+    /// invoking something new after being installed). Write targets — the
+    /// destination of a `copy` and the path of a `write-file` — and the
+    /// working directory of a `run-tool` are validated against the
+    /// project directory so a plugin cannot write or execute outside the
+    /// project boundary; the read-only `copy` source is exempt because
+    /// the host hands plugins classpath jars resolved from the module
+    /// cache, which lives outside the project (ARCHITECTURE.md §7).
+    /// Relative paths are rebased onto the project directory before the
+    /// task is stored, so validation and execution agree no matter which
+    /// directory the build is invoked from.
     fn register(&mut self, task: bindings::ulite::ulb::task_registrar::Task) -> Result<(), String> {
         if let bindings::ulite::ulb::task_registrar::Action::RunTool(args) = &task.action {
             let tool = AllowlistedTool::from(args.tool);
@@ -110,15 +194,82 @@ impl RegistrarState {
                 ));
             }
         }
+        // Validate that the paths the task writes to or executes in stay
+        // within the project boundary. A relative path is resolved
+        // against the project dir; an absolute path must already be
+        // inside the project. This prevents a plugin from writing or
+        // executing anywhere on the host filesystem outside its project.
+        self.validate_action_paths(&task.action)?;
         let task = BuildTask {
             name: task.name,
             module: self.module.clone(),
-            inputs: task.inputs.into_iter().map(PathBuf::from).collect(),
-            outputs: task.outputs.into_iter().map(PathBuf::from).collect(),
+            inputs: task.inputs.into_iter().map(|p| self.rebase(p)).collect(),
+            outputs: task.outputs.into_iter().map(|p| self.rebase(p)).collect(),
             depends_on: task.depends_on,
-            action: task.action.into(),
+            action: self.action_from(task.action),
         };
         self.graph.register(task)
+    }
+
+    /// Rebases a path onto the project directory, unless it is already
+    /// absolute. The executor runs task actions against these stored
+    /// paths directly (ARCHITECTURE.md §10), so a relative path must not
+    /// be left to resolve against whatever directory the build process
+    /// happens to run in.
+    fn rebase(&self, path: String) -> PathBuf {
+        let candidate = PathBuf::from(path);
+        if candidate.is_absolute() {
+            candidate
+        } else {
+            self.project_dir.join(candidate)
+        }
+    }
+
+    /// Converts a WIT action into the executable task action, rebasing
+    /// every relative path onto the project directory.
+    fn action_from(&self, action: bindings::ulite::ulb::task_registrar::Action) -> TaskAction {
+        use bindings::ulite::ulb::task_registrar::Action as W;
+        match action {
+            W::CopyFile(args) => TaskAction::Copy {
+                from: self.rebase(args.source),
+                to: self.rebase(args.destination),
+            },
+            W::RunTool(args) => TaskAction::RunTool {
+                tool: args.tool.into(),
+                args: args.args,
+                cwd: self.rebase(args.cwd),
+            },
+            W::WriteFile(args) => TaskAction::WriteFile {
+                to: self.rebase(args.path),
+                contents: args.contents,
+            },
+        }
+    }
+
+    /// Validates that the paths a task action writes to or executes in
+    /// resolve inside the project directory. Returns `Err` with a
+    /// descriptive message when any path escapes the boundary. The
+    /// read-only `copy` source is not bounded: the host injects classpath
+    /// jars from the module cache into plugin configurations so plugins
+    /// can copy them into the project, and reading a host file was never
+    /// the boundary this check draws (run-tool arguments already reach
+    /// arbitrary host files).
+    fn validate_action_paths(
+        &self,
+        action: &bindings::ulite::ulb::task_registrar::Action,
+    ) -> Result<(), String> {
+        match action {
+            bindings::ulite::ulb::task_registrar::Action::CopyFile(args) => {
+                self.check_path(&args.destination)?;
+            }
+            bindings::ulite::ulb::task_registrar::Action::WriteFile(args) => {
+                self.check_path(&args.path)?;
+            }
+            bindings::ulite::ulb::task_registrar::Action::RunTool(args) => {
+                self.check_path(&args.cwd)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -135,27 +286,6 @@ impl bindings::ulite::ulb::task_registrar::Host for HostCtx {
             return Err("register-task called outside configure".to_owned());
         };
         registrar.register(task)
-    }
-}
-
-impl From<bindings::ulite::ulb::task_registrar::Action> for TaskAction {
-    fn from(action: bindings::ulite::ulb::task_registrar::Action) -> Self {
-        use bindings::ulite::ulb::task_registrar::Action as W;
-        match action {
-            W::CopyFile(args) => TaskAction::Copy {
-                from: PathBuf::from(args.source),
-                to: PathBuf::from(args.destination),
-            },
-            W::RunTool(args) => TaskAction::RunTool {
-                tool: args.tool.into(),
-                args: args.args,
-                cwd: PathBuf::from(args.cwd),
-            },
-            W::WriteFile(args) => TaskAction::WriteFile {
-                to: PathBuf::from(args.path),
-                contents: args.contents,
-            },
-        }
     }
 }
 
@@ -296,7 +426,8 @@ impl PluginHost {
     /// (ARCHITECTURE.md §3.7). Each task the plugin registers through
     /// `register-task` is validated as it arrives (duplicate name, tool
     /// outside the allowlist, tool not declared in the plugin's manifest
-    /// per §3.5), and the assembled graph is validated once more for
+    /// per §3.5, and every write or execution path must stay inside
+    /// `project_dir`), and the assembled graph is validated once more for
     /// undefined dependencies and cycles before it is returned.
     ///
     /// # Errors
@@ -304,7 +435,8 @@ impl PluginHost {
     /// Returns [`HostError::Load`] for any failure reading or
     /// instantiating the component, [`HostError::Call`] if a plugin entry
     /// point traps, the ABI check fails, the plugin rejects the
-    /// configuration, or the registered graph cannot be scheduled.
+    /// configuration, a registered path escapes the project directory, or
+    /// the registered graph cannot be scheduled.
     ///
     /// # Examples
     ///
@@ -344,7 +476,7 @@ impl PluginHost {
     ///
     /// let host = PluginHost::new().expect("engine");
     /// let graph = host
-    ///     .configure(&fixture, "app", &config)
+    ///     .configure(&fixture, "app", &config, &workdir)
     ///     .expect("plugin configures");
     /// let ctx = FingerprintContext {
     ///     plugin_version: "0.1.0".to_owned(),
@@ -362,6 +494,7 @@ impl PluginHost {
         path: &Path,
         module: &str,
         config_json: &str,
+        project_dir: &Path,
     ) -> Result<TaskGraph, HostError> {
         let mut plugin = self.load_full(path)?;
         let manifest = plugin
@@ -372,6 +505,7 @@ impl PluginHost {
         plugin.store.data_mut().registrar = Some(RegistrarState {
             graph: TaskGraph::new(),
             module: module.to_owned(),
+            project_dir: project_dir.to_path_buf(),
             declared_tools,
         });
         let outcome = plugin
@@ -576,5 +710,178 @@ impl LoadedLegacyPlugin {
             .ulite_ulb_ulb_plugin()
             .call_run(&mut self.store, input)
             .map_err(|error| HostError::Call(error.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("uliab-host-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn registrar_at(dir: &Path) -> RegistrarState {
+        RegistrarState {
+            graph: TaskGraph::new(),
+            module: "app".to_owned(),
+            project_dir: dir.to_path_buf(),
+            declared_tools: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn relative_path_inside_project_is_accepted() {
+        let root = temp_dir("path-ok");
+        std::fs::write(root.join("in.txt"), "x").unwrap();
+        let reg = registrar_at(&root);
+        // "in.txt" resolves to root/in.txt, which is inside root.
+        assert!(reg.check_path("in.txt").is_ok());
+    }
+
+    #[test]
+    fn dotdot_traversal_is_rejected() {
+        let root = temp_dir("path-dotdot");
+        let reg = registrar_at(&root);
+        let error = reg.check_path("../etc/passwd").expect_err("should escape");
+        assert!(
+            error.contains("resolves outside the project directory"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn absolute_path_inside_project_is_accepted() {
+        let root = temp_dir("path-abs-inside");
+        std::fs::write(root.join("out.txt"), "y").unwrap();
+        let reg = registrar_at(&root);
+        let inside = root.join("out.txt");
+        assert!(reg.check_path(&inside.display().to_string()).is_ok());
+    }
+
+    #[test]
+    fn absolute_path_outside_project_is_rejected() {
+        let root = temp_dir("path-abs-outside");
+        let reg = registrar_at(&root);
+        let error = reg
+            .check_path("/tmp/sneaky-file")
+            .expect_err("should escape");
+        assert!(
+            error.contains("resolves outside the project directory"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn copy_action_validates_destination() {
+        let root = temp_dir("path-copy");
+        let reg = registrar_at(&root);
+        let action = bindings::ulite::ulb::task_registrar::Action::CopyFile(
+            bindings::ulite::ulb::task_registrar::CopyArgs {
+                source: "in.txt".to_owned(),
+                destination: "../escape".to_owned(),
+            },
+        );
+        let error = reg.validate_action_paths(&action).expect_err("escape");
+        assert!(error.contains("resolves outside"));
+    }
+
+    #[test]
+    fn copy_source_outside_project_is_allowed() {
+        // The host hands plugins classpath jars resolved from the module
+        // cache, which lives outside the project (ARCHITECTURE.md §7), so
+        // the read-only copy source is deliberately not bounded.
+        let root = temp_dir("path-copy-source");
+        let reg = registrar_at(&root);
+        let action = bindings::ulite::ulb::task_registrar::Action::CopyFile(
+            bindings::ulite::ulb::task_registrar::CopyArgs {
+                source: "/etc/passwd".to_owned(),
+                destination: "out.txt".to_owned(),
+            },
+        );
+        assert!(reg.validate_action_paths(&action).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_ancestor_escaping_the_project_is_rejected() {
+        let root = temp_dir("path-symlink");
+        let outside =
+            std::env::temp_dir().join(format!("uliab-host-symlink-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let reg = registrar_at(&root);
+        // "link/out.txt" resolves to outside/out.txt through the symlink,
+        // even though the leaf does not exist yet.
+        let error = reg
+            .check_path("link/out.txt")
+            .expect_err("symlinked ancestor escapes");
+        assert!(
+            error.contains("resolves outside the project directory"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn relative_paths_are_rebazed_onto_the_project_dir() {
+        let root = temp_dir("path-rebase");
+        let mut reg = registrar_at(&root);
+        let action = bindings::ulite::ulb::task_registrar::Action::WriteFile(
+            bindings::ulite::ulb::task_registrar::WriteFileArgs {
+                path: "out.txt".to_owned(),
+                contents: "x".to_owned(),
+            },
+        );
+        let task = bindings::ulite::ulb::task_registrar::Task {
+            name: "write".to_owned(),
+            inputs: vec!["in.txt".to_owned()],
+            outputs: vec!["out.txt".to_owned()],
+            depends_on: Vec::new(),
+            action,
+        };
+        reg.register(task).expect("registers");
+        let stored = reg.graph.get("app", "write").expect("stored task");
+        assert_eq!(
+            stored.action,
+            TaskAction::WriteFile {
+                to: root.join("out.txt"),
+                contents: "x".to_owned(),
+            }
+        );
+        assert_eq!(stored.inputs, vec![root.join("in.txt")]);
+        assert_eq!(stored.outputs, vec![root.join("out.txt")]);
+    }
+
+    #[test]
+    fn write_action_validates_path() {
+        let root = temp_dir("path-write");
+        let reg = registrar_at(&root);
+        let action = bindings::ulite::ulb::task_registrar::Action::WriteFile(
+            bindings::ulite::ulb::task_registrar::WriteFileArgs {
+                path: "../../escape".to_owned(),
+                contents: "x".to_owned(),
+            },
+        );
+        let error = reg.validate_action_paths(&action).expect_err("escape");
+        assert!(error.contains("resolves outside"));
+    }
+
+    #[test]
+    fn run_tool_action_validates_cwd() {
+        let root = temp_dir("path-cwd");
+        let reg = registrar_at(&root);
+        let action = bindings::ulite::ulb::task_registrar::Action::RunTool(
+            bindings::ulite::ulb::task_registrar::RunToolArgs {
+                tool: bindings::ulite::ulb::task_registrar::AllowlistedTool::Echo,
+                args: vec![],
+                cwd: "/outside".to_owned(),
+            },
+        );
+        let error = reg.validate_action_paths(&action).expect_err("escape");
+        assert!(error.contains("resolves outside"));
     }
 }
