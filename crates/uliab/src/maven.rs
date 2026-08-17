@@ -32,13 +32,19 @@
 //! Artifacts are cached content-addressed under the resolver's cache
 //! directory (default `~/.cache/uliab/modules`): a jar/POM is only reused
 //! from the cache when its recorded SHA-256 matches the file on disk, and a
-//! mismatch triggers a refetch. Repositories are tried in order, so a local
+//! mismatch triggers a refetch. A download streams through a temporary
+//! `.part` file while its SHA-256 is hashed incrementally, so an artifact
+//! is never buffered in memory and only an intact, digest-matched file
+//! ever appears in the cache. Repositories are tried in order, so a local
 //! filesystem repository (plain path or `file://`) in front of the default
 //! repositories keeps resolution offline for tests.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 
 use sha2::{Digest, Sha256};
 
@@ -420,7 +426,7 @@ impl Resolver {
         artifact: &str,
         version: &str,
         extension: &str,
-    ) -> Result<(PathBuf, Vec<u8>), ResolveError> {
+    ) -> Result<PathBuf, ResolveError> {
         let rel = format!(
             "{}/{}/{}/{}-{}.{}",
             group.replace('.', "/"),
@@ -431,19 +437,18 @@ impl Resolver {
             extension
         );
         let cache_file = self.cache_dir.join(&rel);
-        if let Some(bytes) = verified_cached(&cache_file) {
-            return Ok((cache_file, bytes));
+        if verified_cached(&cache_file) {
+            return Ok(cache_file);
         }
-        let bytes = self.fetch_from_repos(&rel)?;
-        write_cached(&cache_file, &bytes);
-        Ok((cache_file, bytes))
+        self.fetch_from_repos(&rel, &cache_file)?;
+        Ok(cache_file)
     }
 
-    fn fetch_from_repos(&self, rel: &str) -> Result<Vec<u8>, ResolveError> {
+    fn fetch_from_repos(&self, rel: &str, cache_file: &Path) -> Result<(), ResolveError> {
         let mut first_failure: Option<String> = None;
         for repo in &self.repos {
-            match fetch_one(repo, rel) {
-                Ok(bytes) => return Ok(bytes),
+            match download_into(repo, rel, cache_file) {
+                Ok(()) => return Ok(()),
                 Err(FetchError::Miss) => {}
                 Err(FetchError::Fail(message)) => {
                     first_failure.get_or_insert(message);
@@ -474,56 +479,118 @@ enum FetchError {
     Fail(String),
 }
 
-fn fetch_one(repo: &MavenRepo, rel: &str) -> Result<Vec<u8>, FetchError> {
+/// The largest artifact a download accepts, in bytes: a guard against a
+/// repository streaming garbage instead of an artifact (ureq's own
+/// `read_to_vec` cap no longer applies — bodies stream to disk).
+const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Downloads `rel` from `repo` into `cache_file`, streaming the body
+/// through a temporary `<cache_file>.part` while its SHA-256 is hashed
+/// incrementally, then atomically renaming the file into place and
+/// recording the digest in a sibling `<cache_file>.sha256`. A failed or
+/// truncated download removes the partial file, so a broken artifact can
+/// never be mistaken for a cached one.
+///
+/// A `file://` or plain-path repository streams a local file; a real
+/// scheme (the Maven repos) is fetched over HTTP.
+fn download_into(repo: &MavenRepo, rel: &str, cache_file: &Path) -> Result<(), FetchError> {
     let url = repo.url_for(rel);
     if !url.contains("://") || url.starts_with("file://") {
         let path = url.strip_prefix("file://").unwrap_or(&url);
-        return match std::fs::read(path) {
-            Ok(bytes) => Ok(bytes),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(FetchError::Miss),
-            Err(error) => Err(FetchError::Fail(error.to_string())),
+        let source = match std::fs::File::open(path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(FetchError::Miss);
+            }
+            Err(error) => return Err(FetchError::Fail(error.to_string())),
         };
+        return stream_to(&mut BufReader::new(source), cache_file, None).map_err(FetchError::Fail);
     }
-    match ureq::get(&url).call() {
-        Ok(response) => response
-            .into_body()
-            .with_config()
-            // ureq caps `read_to_vec` at 10 MB by default; the KSP toolchain
-            // jar (`symbol-processing-aa`) is tens of megabytes, so artifacts
-            // in that class must not be silently refused.
-            .limit(256 * 1024 * 1024)
-            .read_to_vec()
-            .map_err(|error| FetchError::Fail(format!("reading response body: {error}"))),
-        Err(ureq::Error::StatusCode(404)) => Err(FetchError::Miss),
-        Err(ureq::Error::StatusCode(code)) => Err(FetchError::Fail(format!("HTTP {code}"))),
-        Err(other) => Err(FetchError::Fail(other.to_string())),
-    }
+    let response = match ureq::get(&url).call() {
+        Ok(response) => response,
+        Err(ureq::Error::StatusCode(404)) => return Err(FetchError::Miss),
+        Err(ureq::Error::StatusCode(code)) => return Err(FetchError::Fail(format!("HTTP {code}"))),
+        Err(other) => return Err(FetchError::Fail(other.to_string())),
+    };
+    let mut body = response.into_body().into_reader();
+    stream_to(&mut body, cache_file, Some(MAX_ARTIFACT_BYTES)).map_err(FetchError::Fail)
 }
 
-/// Reads a cached artifact, returning `None` when it is missing or does not
-/// match its recorded SHA-256. The digest is stored in a sibling
-/// `<file>.sha256` so a POM and its jar (which share `<artifact>-<version>`
-/// up to their extension) never collide.
-fn verified_cached(path: &Path) -> Option<Vec<u8>> {
-    let bytes = std::fs::read(path).ok()?;
-    let recorded = std::fs::read_to_string(sha_path(path)).ok()?;
-    if recorded.trim() != hex(&Sha256::digest(&bytes)) {
-        return None;
+/// Streams `source` into `cache_file`, hashing as it goes: the body is
+/// written to a temporary `<cache_file>.part`, the digest is recorded in
+/// a sibling `<cache_file>.sha256`, and only then is the partial file
+/// renamed over `cache_file` (atomic within the cache directory). Any
+/// failure — including a body larger than `cap` bytes, when given —
+/// removes the partial file and reports an error, leaving the cache
+/// exactly as it was.
+fn stream_to(source: &mut dyn Read, cache_file: &Path, cap: Option<u64>) -> Result<(), String> {
+    let part = PathBuf::from(format!("{}.part", cache_file.display()));
+    let outcome = (|| -> Result<(), String> {
+        if let Some(parent) = cache_file.parent()
+            && std::fs::create_dir_all(parent).is_err()
+        {
+            return Err(format!("creating cache directory '{}'", parent.display()));
+        }
+        let mut file = std::fs::File::create(&part)
+            .map_err(|error| format!("creating '{}': {error}", part.display()))?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 16 * 1024];
+        let mut total = 0u64;
+        loop {
+            let read = source
+                .read(&mut buffer)
+                .map_err(|error| format!("reading download: {error}"))?;
+            if read == 0 {
+                break;
+            }
+            total += read as u64;
+            if let Some(cap) = cap
+                && total > cap
+            {
+                return Err(format!("artifact exceeds the {cap} byte limit"));
+            }
+            hasher.update(&buffer[..read]);
+            file.write_all(&buffer[..read])
+                .map_err(|error| format!("writing '{}': {error}", part.display()))?;
+        }
+        drop(file);
+        let digest = hex(&hasher.finalize());
+        std::fs::write(sha_path(cache_file), digest)
+            .map_err(|error| format!("recording '{}': {error}", sha_path(cache_file).display()))?;
+        std::fs::rename(&part, cache_file)
+            .map_err(|error| format!("moving '{}': {error}", part.display()))?;
+        Ok(())
+    })();
+    if let Err(message) = outcome {
+        let _ = std::fs::remove_file(&part);
+        return Err(message);
     }
-    Some(bytes)
+    Ok(())
 }
 
-fn write_cached(path: &Path, bytes: &[u8]) {
-    if let Some(parent) = path.parent()
-        && std::fs::create_dir_all(parent).is_err()
-    {
-        return;
+/// Returns whether the cached artifact at `path` is intact: it exists
+/// and its content hashes to the digest recorded in the sibling
+/// `<path>.sha256`. The file is read in chunks, so verifying a large
+/// cached jar never loads it into memory.
+fn verified_cached(path: &Path) -> bool {
+    let recorded = match std::fs::read_to_string(sha_path(path)) {
+        Ok(recorded) => recorded,
+        Err(_) => return false,
+    };
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => hasher.update(&buffer[..read]),
+            Err(_) => return false,
+        }
     }
-    let digest = hex(&Sha256::digest(bytes));
-    if std::fs::write(path, bytes).is_err() || std::fs::write(sha_path(path), digest).is_err() {
-        // A failed cache write must not fail resolution: the artifact is
-        // already in hand, and the cache is purely an acceleration.
-    }
+    recorded.trim() == hex(&hasher.finalize())
 }
 
 fn sha_path(path: &Path) -> PathBuf {
@@ -842,9 +909,13 @@ impl<'a> Session<'a> {
         }
         self.seen.insert(key.clone());
 
-        let (_, pom_bytes) = self
+        let pom_path = self
             .resolver
             .fetch_cached(group, artifact, version, "pom")?;
+        let pom_bytes = std::fs::read(&pom_path).map_err(|error| ResolveError::Fetch {
+            artifact: format!("{group}:{artifact}:{version}"),
+            message: format!("reading cached POM: {error}"),
+        })?;
         let pom = parse_pom(&pom_bytes).map_err(|message| ResolveError::Parser {
             artifact: format!("{group}:{artifact}:{version}"),
             message,
@@ -1052,7 +1123,7 @@ impl<'a> Session<'a> {
             match packaging.as_str() {
                 "pom" => {}
                 "jar" => {
-                    let (path, _) = self
+                    let path = self
                         .resolver
                         .fetch_cached(group, artifact, version, "jar")?;
                     jars.push(path);
