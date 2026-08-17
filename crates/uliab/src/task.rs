@@ -15,6 +15,7 @@
 //! module model, so the same executor drives every toolchain plugin.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -754,12 +755,12 @@ fn fingerprint(task: &Task, ctx: &FingerprintContext) -> String {
     for input in &task.inputs {
         match std::fs::metadata(input) {
             Ok(metadata) if metadata.is_dir() => hash_directory(&mut hasher, input),
-            _ => match std::fs::read(input) {
-                Ok(bytes) => {
+            _ => match streamed_digest(input) {
+                Some(digest) => {
                     hasher.update([1u8]);
-                    hasher.update(Sha256::digest(&bytes));
+                    hasher.update(digest);
                 }
-                Err(_) => hasher.update([0u8]),
+                None => hasher.update([0u8]),
             },
         }
     }
@@ -783,16 +784,35 @@ fn hash_directory(hasher: &mut Sha256, dir: &Path) {
     hasher.update([2u8]);
     for file in files {
         let relative = file.strip_prefix(dir).unwrap_or(&file);
-        match std::fs::read(&file) {
-            Ok(bytes) => {
+        match streamed_digest(&file) {
+            Some(digest) => {
                 hasher.update([1u8]);
                 hasher.update(relative.as_os_str().as_encoded_bytes());
                 hasher.update([0u8]);
-                hasher.update(Sha256::digest(&bytes));
+                hasher.update(digest);
             }
-            Err(_) => hasher.update([0u8]),
+            None => hasher.update([0u8]),
         }
     }
+}
+
+/// Hashes the contents of `file` with SHA-256 in chunks, so hashing a
+/// large input never buffers it in memory. Returns `None` when the file
+/// cannot be read, matching how [`fingerprint`] treats an unreadable
+/// input. The digest is chunk-invariant, so it equals the one-shot
+/// `Sha256::digest` of the same content byte for byte.
+fn streamed_digest(file: &Path) -> Option<[u8; 32]> {
+    let mut reader = BufReader::new(std::fs::File::open(file).ok()?);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Some(hasher.finalize().into())
 }
 
 /// Collects every file (not directory) under `dir`, recursively.
