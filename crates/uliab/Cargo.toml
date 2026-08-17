@@ -8,7 +8,10 @@ license = "GPL-3.0"
 [dependencies]
 ulb-lang = { path = "../ulb-lang" }
 ulb-plugin-sdk = { path = "../ulb-plugin-sdk" }
-wasmtime = "47"
+# The `cache` feature keeps compiled plugin artifacts in the engine's
+# on-disk compilation cache (`~/.cache/wasmtime`), so a plugin compiled
+# once for a given engine configuration is not recompiled on later loads.
+wasmtime = { version = "47", features = ["cache"] }
 # The wasm32-wasip2 std runtime imports wasi:io/poll (and friends) even in a
 # pure-compute plugin, so the linker must be able to satisfy those imports.
 wasmtime-wasi = "47"

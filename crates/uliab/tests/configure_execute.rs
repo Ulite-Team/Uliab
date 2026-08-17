@@ -294,3 +294,37 @@ fn legacy_component_still_instantiates_and_runs() {
     assert!(matches!(error, HostError::Load(_)));
     assert!(error.to_string().contains("configure"));
 }
+
+#[test]
+fn compiled_components_are_cached_on_disk() {
+    let plugin = build_fixture("ulb-plugin-fixture");
+    let cache_dir = temp_workdir("wasm-cache");
+    let host = PluginHost::with_cache_dir(cache_dir.clone()).expect("host engine");
+
+    let manifest = host
+        .manifest_of_bytes(&std::fs::read(&plugin).unwrap())
+        .unwrap();
+    assert_eq!(manifest.name, "ulite/fixture");
+
+    // Compiling the component must have written an artifact into the
+    // cache: `<dir>/modules/<compiler>/<hash>` (written synchronously by
+    // the cache on a miss).
+    let modules = cache_dir.join("modules");
+    assert!(modules.is_dir(), "cache should hold compiled artifacts");
+    let mut module_entries = std::fs::read_dir(&modules).expect("modules dir");
+    let compiler_dir = module_entries.next().expect("compiler dir").unwrap().path();
+    assert!(compiler_dir.is_dir());
+    let mut artifacts = std::fs::read_dir(&compiler_dir).expect("compiler dir");
+    assert!(
+        artifacts.next().is_some(),
+        "an artifact file should be cached"
+    );
+
+    // A second host sharing the cache still loads and reports the same
+    // component.
+    let host = PluginHost::with_cache_dir(cache_dir).expect("host engine");
+    let manifest = host
+        .manifest_of_bytes(&std::fs::read(&plugin).unwrap())
+        .unwrap();
+    assert_eq!(manifest.name, "ulite/fixture");
+}
