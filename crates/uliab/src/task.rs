@@ -1058,6 +1058,56 @@ mod tests {
         assert_eq!(baseline, fingerprint(&task, &ctx("cfg")));
     }
 
+    /// Deterministic, non-trivial content that crosses many 16 KiB
+    /// hashing chunks (1 MiB of pseudo-random bytes).
+    fn pseudo_random_bytes(len: usize) -> Vec<u8> {
+        (0..len).map(|index| (index % 251) as u8).collect()
+    }
+
+    #[test]
+    fn streamed_digest_matches_one_shot_hashing() {
+        let root = temp_dir("streamed-digest");
+        let file = root.join("big.bin");
+        let content = pseudo_random_bytes(1024 * 1024);
+        std::fs::write(&file, &content).unwrap();
+        let one_shot = Sha256::digest(&content);
+        let streamed = streamed_digest(&file).expect("reads");
+        assert_eq!(streamed.as_slice(), one_shot.as_slice());
+        assert_eq!(streamed, streamed_digest(&file).expect("reads again"));
+    }
+
+    #[test]
+    fn directory_fingerprint_tracks_bytes_across_chunk_boundaries() {
+        let root = temp_dir("fingerprint-boundary");
+        let dir = root.join("res");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("big.bin");
+        let mut content = pseudo_random_bytes(1024 * 1024);
+        std::fs::write(&file, &content).unwrap();
+        let task = Task::leaf(
+            "res",
+            "app",
+            vec![dir.clone()],
+            vec![],
+            TaskAction::RunTool {
+                tool: AllowlistedTool::Echo,
+                args: vec!["x".to_owned()],
+                cwd: root.clone(),
+            },
+        );
+
+        let baseline = fingerprint(&task, &ctx("cfg"));
+        assert_eq!(baseline, fingerprint(&task, &ctx("cfg")));
+
+        content[16 * 1024 + 7] ^= 0xff;
+        std::fs::write(&file, &content).unwrap();
+        assert_ne!(baseline, fingerprint(&task, &ctx("cfg")));
+
+        content[16 * 1024 + 7] ^= 0xff;
+        std::fs::write(&file, &content).unwrap();
+        assert_eq!(baseline, fingerprint(&task, &ctx("cfg")));
+    }
+
     #[test]
     fn aapt2_runs_the_build_tools_binary_without_the_dir_argument() {
         let root = temp_dir("aapt2");
