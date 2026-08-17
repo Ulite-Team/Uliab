@@ -1162,7 +1162,7 @@ impl<'a> Session<'a> {
                         let ((group, artifact), version) = &jars[index];
                         let outcome = resolver.fetch_cached(group, artifact, version, "jar");
                         if outcome.is_err() {
-                            failed.store(true, Ordering::Relaxed);
+                            failed.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                         results.lock().unwrap()[index] = Some(outcome);
                     }
@@ -1198,6 +1198,9 @@ fn merge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::io::{BufRead, Write};
+    use std::sync::Arc;
 
     fn repo_pom(
         group: &str,
@@ -1701,6 +1704,196 @@ mod tests {
             .resolve(&[declared(MavenScope::Implementation, "com.example:one:1.0")])
             .expect("refetches and recovers");
         assert_eq!(std::fs::read(jar_path).unwrap(), b"one-1.0");
+    }
+
+    /// A localhost HTTP repository that serves the Maven layout from a
+    /// local root, used to exercise the streaming and parallel download
+    /// paths (`file://` repos are too fast to observe concurrency). Every
+    /// request is held open briefly while its connection is counted, so a
+    /// test can assert how many fetches ran at once; with `truncate`, jar
+    /// responses announce a longer body than they send, simulating a
+    /// download that breaks mid-body.
+    struct HttpRepo {
+        url: String,
+        root: PathBuf,
+        max_concurrent: Arc<std::sync::atomic::AtomicUsize>,
+        _thread: std::thread::JoinHandle<()>,
+    }
+
+    impl HttpRepo {
+        fn new(truncate: bool) -> HttpRepo {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "uliab-maven-http-test-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let max_concurrent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = in_flight.clone();
+            let high_water = max_concurrent.clone();
+            let serve_root = root.clone();
+            let thread = std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { break };
+                    let counter = counter.clone();
+                    let high_water = high_water.clone();
+                    let serve_root = serve_root.clone();
+                    let truncate = truncate;
+                    std::thread::spawn(move || {
+                        let mut stream = BufReader::new(stream);
+                        let mut request = String::new();
+                        if stream.read_line(&mut request).is_err() {
+                            return;
+                        }
+                        let path = request.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                        let serving = stream.get_mut();
+                        let file = serve_root.join(path.trim_start_matches('/'));
+                        let active = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        high_water.fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        let body = std::fs::read(&file).unwrap_or_default();
+                        let truncated = truncate
+                            && file.extension().is_some_and(|extension| extension == "jar");
+                        if body.is_empty() {
+                            let _ = serving.write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                        } else {
+                            let length = if truncated {
+                                body.len() + 100
+                            } else {
+                                body.len()
+                            };
+                            let _ = write!(
+                                serving,
+                                "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                            );
+                            let _ = serving.write_all(&body);
+                        }
+                        let _ = serving.flush();
+                        counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    });
+                }
+            });
+            HttpRepo {
+                url,
+                root,
+                max_concurrent,
+                _thread: thread,
+            }
+        }
+
+        fn add(&self, group: &str, artifact: &str, version: &str, children: &[(&str, &str, &str)]) {
+            write_artifact(
+                &self.root,
+                group,
+                artifact,
+                version,
+                &repo_pom(group, artifact, version, children),
+            );
+        }
+
+        fn resolver(&self) -> Resolver {
+            Resolver::new(
+                vec![MavenRepo::Custom(self.url.clone())],
+                Some(self.root.join("cache")),
+            )
+        }
+    }
+
+    fn part_files(root: &Path) -> Vec<PathBuf> {
+        let mut parts = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(".part"))
+                {
+                    parts.push(path);
+                }
+            }
+        }
+        parts
+    }
+
+    #[test]
+    fn download_records_the_streamed_digest() {
+        let repo = HttpRepo::new(false);
+        repo.add("com.example", "one", "1.0", &[]);
+        let resolution = repo
+            .resolver()
+            .resolve(&[declared(MavenScope::Implementation, "com.example:one:1.0")])
+            .expect("resolves");
+        let jar_path = &resolution.classpath.compile[0];
+        let bytes = std::fs::read(jar_path).unwrap();
+        let digest = hex(&Sha256::digest(&bytes));
+        let recorded = std::fs::read_to_string(sha_path(jar_path)).unwrap();
+        assert_eq!(recorded.trim(), digest);
+    }
+
+    #[test]
+    fn a_truncated_download_leaves_no_part_file() {
+        let repo = HttpRepo::new(true);
+        repo.add("com.example", "broken", "1.0", &[]);
+        let error = repo
+            .resolver()
+            .resolve(&[declared(
+                MavenScope::Implementation,
+                "com.example:broken:1.0",
+            )])
+            .expect_err("truncated jar fails resolution");
+        assert!(matches!(error, ResolveError::Fetch { .. }), "{error}");
+        assert!(
+            part_files(&repo.root.join("cache")).is_empty(),
+            "partial downloads must be removed"
+        );
+    }
+
+    #[test]
+    fn jar_downloads_run_in_parallel() {
+        let repo = HttpRepo::new(false);
+        for artifact in ["a", "b", "c", "d", "e", "f"] {
+            repo.add("com.example", artifact, "1.0", &[]);
+        }
+        let deps: Vec<DeclaredDep> = ["a", "b", "c", "d", "e", "f"]
+            .iter()
+            .map(|artifact| {
+                declared(
+                    MavenScope::Implementation,
+                    &format!("com.example:{artifact}:1.0"),
+                )
+            })
+            .collect();
+        let resolution = repo.resolver().resolve(&deps).expect("resolves");
+        assert_eq!(
+            jar_names(&resolution.classpath.compile),
+            vec![
+                "a-1.0.jar",
+                "b-1.0.jar",
+                "c-1.0.jar",
+                "d-1.0.jar",
+                "e-1.0.jar",
+                "f-1.0.jar"
+            ]
+        );
+        assert!(
+            repo.max_concurrent
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2,
+            "jar fetches should overlap on a worker pool"
+        );
     }
 
     #[test]
