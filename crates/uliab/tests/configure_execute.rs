@@ -83,7 +83,7 @@ fn configure_registers_tasks_that_execute_incrementally() {
     );
 
     let graph = host
-        .configure(&plugin, "app", &config_json)
+        .configure(&plugin, "app", &config_json, &workdir)
         .expect("plugin configures");
     assert_eq!(graph.len(), 2);
     let stage = graph.get("app", "stage").expect("stage task");
@@ -131,9 +131,10 @@ fn configure_registers_tasks_that_execute_incrementally() {
 #[test]
 fn configure_reports_plugin_rejection() {
     let plugin = build_fixture("ulb-plugin-fixture");
+    let workdir = temp_workdir("plugin-rejection");
     let host = PluginHost::new().expect("host engine");
     let error = host
-        .configure(&plugin, "app", "not json")
+        .configure(&plugin, "app", "not json", &workdir)
         .expect_err("plugin rejects bad config");
     assert!(matches!(error, HostError::Call(_)));
     assert!(error.to_string().contains("invalid module config JSON"));
@@ -154,7 +155,7 @@ fn write_file_task_generates_and_reruns_on_content_change() {
 
     let host = PluginHost::new().expect("host engine");
     let graph = host
-        .configure(&plugin, "app", &config_json)
+        .configure(&plugin, "app", &config_json, &workdir)
         .expect("plugin configures");
     assert_eq!(
         graph
@@ -191,7 +192,7 @@ fn write_file_task_generates_and_reruns_on_content_change() {
     // it to rerun, while the copy and echo tasks stay up-to-date.
     let changed_config_json = config_json.replace("\"contents\": \"v1\"", "\"contents\": \"v2\"");
     let changed_graph = host
-        .configure(&plugin, "app", &changed_config_json)
+        .configure(&plugin, "app", &changed_config_json, &workdir)
         .expect("plugin reconfigures");
     let third = executor
         .execute(&changed_graph, &ctx, &mut store)
@@ -201,8 +202,45 @@ fn write_file_task_generates_and_reruns_on_content_change() {
 }
 
 #[test]
+fn relative_paths_are_rebazed_and_executed_inside_the_project() {
+    let plugin = build_fixture("ulb-plugin-fixture");
+    let workdir = temp_workdir("relative-paths");
+    std::fs::write(workdir.join("in.txt"), "relative").unwrap();
+    // The plugin reports project-relative paths; the host must rebase them
+    // onto the project dir so execution does not depend on the directory
+    // the build process happens to run in.
+    let config_json = r#"{"source": "in.txt", "output": "out.txt"}"#;
+
+    let host = PluginHost::new().expect("host engine");
+    let graph = host
+        .configure(&plugin, "app", config_json, &workdir)
+        .expect("plugin configures");
+    let stage = graph.get("app", "stage").expect("stage task");
+    assert_eq!(
+        stage.action,
+        uliab::task::TaskAction::Copy {
+            from: workdir.join("in.txt"),
+            to: workdir.join("out.txt"),
+        }
+    );
+
+    let ctx = FingerprintContext {
+        plugin_version: "0.1.0".to_owned(),
+        config_hash: "cfg-relative".to_owned(),
+    };
+    let mut store = FingerprintStore::load(workdir.join("state.json")).unwrap();
+    let executor = Executor::new([uliab::task::AllowlistedTool::Echo]);
+    let result = executor
+        .execute(&graph, &ctx, &mut store)
+        .expect("schedules");
+    assert_eq!(result.ran, 2);
+    assert_eq!(std::fs::read(workdir.join("out.txt")).unwrap(), b"relative");
+}
+
+#[test]
 fn legacy_component_still_instantiates_and_runs() {
     let plugin = build_fixture("ulb-plugin-legacy-fixture");
+    let workdir = temp_workdir("legacy");
     let host = PluginHost::new().expect("host engine");
 
     let output = host.run(&plugin, "echo me").expect("legacy run");
@@ -212,7 +250,7 @@ fn legacy_component_still_instantiates_and_runs() {
     // fails at instantiation against the full world rather than pretending
     // to succeed.
     let error = host
-        .configure(&plugin, "app", "{}")
+        .configure(&plugin, "app", "{}", &workdir)
         .expect_err("legacy has no configure");
     assert!(matches!(error, HostError::Load(_)));
     assert!(error.to_string().contains("configure"));
