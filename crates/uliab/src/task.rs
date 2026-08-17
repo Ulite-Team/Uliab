@@ -15,6 +15,7 @@
 //! module model, so the same executor drives every toolchain plugin.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -754,12 +755,12 @@ fn fingerprint(task: &Task, ctx: &FingerprintContext) -> String {
     for input in &task.inputs {
         match std::fs::metadata(input) {
             Ok(metadata) if metadata.is_dir() => hash_directory(&mut hasher, input),
-            _ => match std::fs::read(input) {
-                Ok(bytes) => {
+            _ => match streamed_digest(input) {
+                Some(digest) => {
                     hasher.update([1u8]);
-                    hasher.update(Sha256::digest(&bytes));
+                    hasher.update(digest);
                 }
-                Err(_) => hasher.update([0u8]),
+                None => hasher.update([0u8]),
             },
         }
     }
@@ -783,16 +784,35 @@ fn hash_directory(hasher: &mut Sha256, dir: &Path) {
     hasher.update([2u8]);
     for file in files {
         let relative = file.strip_prefix(dir).unwrap_or(&file);
-        match std::fs::read(&file) {
-            Ok(bytes) => {
+        match streamed_digest(&file) {
+            Some(digest) => {
                 hasher.update([1u8]);
                 hasher.update(relative.as_os_str().as_encoded_bytes());
                 hasher.update([0u8]);
-                hasher.update(Sha256::digest(&bytes));
+                hasher.update(digest);
             }
-            Err(_) => hasher.update([0u8]),
+            None => hasher.update([0u8]),
         }
     }
+}
+
+/// Hashes the contents of `file` with SHA-256 in chunks, so hashing a
+/// large input never buffers it in memory. Returns `None` when the file
+/// cannot be read, matching how [`fingerprint`] treats an unreadable
+/// input. The digest is chunk-invariant, so it equals the one-shot
+/// `Sha256::digest` of the same content byte for byte.
+fn streamed_digest(file: &Path) -> Option<[u8; 32]> {
+    let mut reader = BufReader::new(std::fs::File::open(file).ok()?);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Some(hasher.finalize().into())
 }
 
 /// Collects every file (not directory) under `dir`, recursively.
@@ -1035,6 +1055,56 @@ mod tests {
         assert_ne!(baseline, fingerprint(&task, &ctx("cfg")));
 
         std::fs::remove_file(dir.join("values/extra.xml")).unwrap();
+        assert_eq!(baseline, fingerprint(&task, &ctx("cfg")));
+    }
+
+    /// Deterministic, non-trivial content that crosses many 16 KiB
+    /// hashing chunks (1 MiB of pseudo-random bytes).
+    fn pseudo_random_bytes(len: usize) -> Vec<u8> {
+        (0..len).map(|index| (index % 251) as u8).collect()
+    }
+
+    #[test]
+    fn streamed_digest_matches_one_shot_hashing() {
+        let root = temp_dir("streamed-digest");
+        let file = root.join("big.bin");
+        let content = pseudo_random_bytes(1024 * 1024);
+        std::fs::write(&file, &content).unwrap();
+        let one_shot = Sha256::digest(&content);
+        let streamed = streamed_digest(&file).expect("reads");
+        assert_eq!(streamed.as_slice(), one_shot.as_slice());
+        assert_eq!(streamed, streamed_digest(&file).expect("reads again"));
+    }
+
+    #[test]
+    fn directory_fingerprint_tracks_bytes_across_chunk_boundaries() {
+        let root = temp_dir("fingerprint-boundary");
+        let dir = root.join("res");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("big.bin");
+        let mut content = pseudo_random_bytes(1024 * 1024);
+        std::fs::write(&file, &content).unwrap();
+        let task = Task::leaf(
+            "res",
+            "app",
+            vec![dir.clone()],
+            vec![],
+            TaskAction::RunTool {
+                tool: AllowlistedTool::Echo,
+                args: vec!["x".to_owned()],
+                cwd: root.clone(),
+            },
+        );
+
+        let baseline = fingerprint(&task, &ctx("cfg"));
+        assert_eq!(baseline, fingerprint(&task, &ctx("cfg")));
+
+        content[16 * 1024 + 7] ^= 0xff;
+        std::fs::write(&file, &content).unwrap();
+        assert_ne!(baseline, fingerprint(&task, &ctx("cfg")));
+
+        content[16 * 1024 + 7] ^= 0xff;
+        std::fs::write(&file, &content).unwrap();
         assert_eq!(baseline, fingerprint(&task, &ctx("cfg")));
     }
 
