@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use wasmtime::component::{Component, Linker, ResourceTable};
-use wasmtime::{Config, Engine, Store};
+use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView, p2};
 
 use crate::task::{AllowlistedTool, Task as BuildTask, TaskAction, TaskGraph};
@@ -86,6 +86,9 @@ struct HostCtx {
     /// Refilled before every `manifest`/`configure`/`run` call; a plugin
     /// that exhausts it is trapped instead of running forever.
     fuel_budget: u64,
+    /// The store's resource limits; a linear-memory growth attempt past
+    /// them traps the plugin instead of letting it OOM the host process.
+    limits: StoreLimits,
 }
 
 /// The host side of a `configure` session: the graph being built, the
@@ -366,6 +369,12 @@ fn call_error(error: wasmtime::Error) -> HostError {
 /// entry-point call. Configurable via [`PluginHost::with_fuel_budget`].
 const PLUGIN_FUEL_BUDGET: u64 = 100_000_000;
 
+/// The default maximum linear memory, in bytes, a plugin store may grow
+/// to. SDK probing during `configure` stays far below this; 256 MB only
+/// rules out a genuinely runaway allocation. Configurable via
+/// [`PluginHost::with_memory_limit`].
+const PLUGIN_MEMORY_LIMIT: usize = 256 * 1024 * 1024;
+
 /// The embedded wasmtime engine that plugin components run in.
 pub struct PluginHost {
     engine: Engine,
@@ -378,6 +387,9 @@ pub struct PluginHost {
     /// Fuel granted to a plugin for each entry-point call; exhausting it
     /// traps the plugin (see [`PLUGIN_FUEL_BUDGET`]).
     fuel_budget: u64,
+    /// Maximum linear memory, in bytes, a plugin store may grow to (see
+    /// [`PLUGIN_MEMORY_LIMIT`]).
+    memory_limit: usize,
 }
 
 /// The identity a plugin reports in its `manifest` entry.
@@ -407,6 +419,7 @@ impl PluginHost {
             engine,
             android_sdk: Vec::new(),
             fuel_budget: PLUGIN_FUEL_BUDGET,
+            memory_limit: PLUGIN_MEMORY_LIMIT,
         })
     }
 
@@ -416,6 +429,15 @@ impl PluginHost {
     /// budget mid-call is trapped with a resource-budget error.
     pub fn with_fuel_budget(mut self, budget: u64) -> Self {
         self.fuel_budget = budget;
+        self
+    }
+
+    /// Caps the linear memory a plugin store may grow to, in bytes,
+    /// overriding [`PLUGIN_MEMORY_LIMIT`]. A plugin that grows past the
+    /// cap is trapped with a resource-budget error instead of being
+    /// allowed to OOM the host process.
+    pub fn with_memory_limit(mut self, limit: usize) -> Self {
+        self.memory_limit = limit;
         self
     }
 
@@ -610,6 +632,9 @@ impl PluginHost {
             |host| host,
         )
         .map_err(|error| HostError::Load(error.to_string()))?;
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(self.memory_limit)
+            .build();
         let mut store = Store::new(
             &self.engine,
             HostCtx {
@@ -617,8 +642,12 @@ impl PluginHost {
                 table: ResourceTable::new(),
                 registrar: None,
                 fuel_budget: self.fuel_budget,
+                limits,
             },
         );
+        // Resource limits are enforced through the store's limiter; a
+        // growth attempt past `memory_limit` traps the plugin.
+        store.limiter(|host| &mut host.limits);
         // Fuel metering is on for every store (see [`PluginHost::new`]),
         // so a store starts with zero fuel and the very first executed
         // guest instruction would trap; grant the entry-point budget
