@@ -238,6 +238,45 @@ fn relative_paths_are_rebazed_and_executed_inside_the_project() {
 }
 
 #[test]
+fn infinite_loop_plugin_is_terminated_by_fuel_budget() {
+    let plugin = build_fixture("ulb-plugin-fixture");
+    let workdir = temp_workdir("fuel-loop");
+    let host = PluginHost::new().expect("host engine");
+    // The fixture loops forever when configured with `infiniteLoop`; the
+    // fuel budget must trap it and surface a resource-budget error
+    // instead of hanging the build.
+    let error = host
+        .configure(
+            &plugin,
+            "app",
+            r#"{"source": "in.txt", "output": "out.txt", "infiniteLoop": true}"#,
+            &workdir,
+        )
+        .expect_err("fuel budget must stop the plugin");
+    assert!(matches!(error, HostError::Call(_)));
+    assert!(error.to_string().contains("resource budget"), "{error}");
+}
+
+#[test]
+fn memory_hog_plugin_is_terminated_by_memory_limit() {
+    let plugin = build_fixture("ulb-plugin-fixture");
+    let workdir = temp_workdir("memory-hog");
+    let host = PluginHost::new().expect("host engine");
+    // The fixture allocates 512 MB of linear memory when configured with
+    // `memoryHog`, past the host's default 256 MB cap; the resource
+    // limiter must trap it instead of letting the plugin OOM the host.
+    let error = host
+        .configure(
+            &plugin,
+            "app",
+            r#"{"source": "in.txt", "output": "out.txt", "memoryHog": true}"#,
+            &workdir,
+        )
+        .expect_err("memory limit must stop the plugin");
+    assert!(matches!(error, HostError::Call(_)));
+}
+
+#[test]
 fn legacy_component_still_instantiates_and_runs() {
     let plugin = build_fixture("ulb-plugin-legacy-fixture");
     let workdir = temp_workdir("legacy");

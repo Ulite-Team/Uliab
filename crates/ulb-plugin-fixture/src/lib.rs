@@ -64,6 +64,27 @@ impl exports::ulite::ulb::ulb_plugin::Guest for Fixture {
     fn configure(module_config: String) -> Result<(), String> {
         let config: serde_json::Value = serde_json::from_str(&module_config)
             .map_err(|error| format!("invalid module config JSON: {error}"))?;
+        // A `infiniteLoop` config key (true) makes configure loop forever,
+        // so the host tests can prove fuel metering terminates a runaway
+        // plugin instead of hanging the build. A `memoryHog` config key
+        // (true) makes it allocate 512 MB of linear memory, past the
+        // host's default memory cap, so the tests can prove the
+        // resource limiter traps a runaway allocation.
+        if config
+            .get("infiniteLoop")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            let mut n = 0u64;
+            loop {
+                n = n.wrapping_add(1);
+                std::hint::black_box(n);
+            }
+        }
+        if config.get("memoryHog").and_then(serde_json::Value::as_bool) == Some(true) {
+            let hog: Vec<u8> = std::hint::black_box(vec![0u8; 512 * 1024 * 1024]);
+            std::hint::black_box(&hog);
+        }
         let source = config
             .get("source")
             .and_then(serde_json::Value::as_str)
