@@ -1111,30 +1111,76 @@ impl<'a> Session<'a> {
             .collect()
     }
 
-    /// Downloads the jar for every node in `set`, returning their paths in
-    /// deterministic (`group`, `artifact`) order. Nodes whose packaging is
-    /// not a plain jar contribute no file; unsupported packaging is noted.
+    /// Downloads the jar for every node in `set` on a worker pool,
+    /// returning their paths in deterministic (`group`, `artifact`) order.
+    /// Nodes whose packaging is not a plain jar contribute no file;
+    /// unsupported packaging is noted. The first jar download to fail
+    /// aborts the remaining fetches and surfaces its error.
     fn materialize(
         &mut self,
         set: &BTreeMap<(String, String), (String, String)>,
     ) -> Result<Vec<PathBuf>, ResolveError> {
-        let mut jars = Vec::new();
-        for ((group, artifact), (version, packaging)) in set {
-            match packaging.as_str() {
-                "pom" => {}
-                "jar" => {
-                    let path = self
-                        .resolver
-                        .fetch_cached(group, artifact, version, "jar")?;
-                    jars.push(path);
+        let jars: Vec<((String, String), String)> = set
+            .iter()
+            .filter_map(|((group, artifact), (version, packaging))| {
+                if packaging == "jar" {
+                    Some(((group.clone(), artifact.clone()), version.clone()))
+                } else {
+                    None
                 }
-                other => self.notes.push(format!(
-                    "{group}:{artifact}:{version} uses packaging '{other}'; only jar \
+            })
+            .collect();
+        for ((group, artifact), (version, packaging)) in set {
+            if packaging != "pom" && packaging != "jar" {
+                self.notes.push(format!(
+                    "{group}:{artifact}:{version} uses packaging '{packaging}'; only jar \
                      artifacts are materialized for now"
-                )),
+                ));
             }
         }
-        Ok(jars)
+        let workers = std::thread::available_parallelism()
+            .map_or(4, |count| count.get().min(8))
+            .min(jars.len())
+            .max(1);
+        let queue = Mutex::new(VecDeque::from_iter(0..jars.len()));
+        let results = Mutex::new(vec![None; jars.len()]);
+        let failed = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let resolver = &self.resolver;
+                let jars = &jars;
+                let queue = &queue;
+                let results = &results;
+                let failed = &failed;
+                scope.spawn(move || {
+                    loop {
+                        if failed.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        let index = queue.lock().unwrap().pop_front();
+                        let Some(index) = index else { break };
+                        let ((group, artifact), version) = &jars[index];
+                        let outcome = resolver.fetch_cached(group, artifact, version, "jar");
+                        if outcome.is_err() {
+                            failed.store(true, Ordering::Relaxed);
+                        }
+                        results.lock().unwrap()[index] = Some(outcome);
+                    }
+                });
+            }
+        });
+        let results = results
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut jar_paths = Vec::with_capacity(jars.len());
+        for result in results {
+            match result {
+                Some(Ok(path)) => jar_paths.push(path),
+                Some(Err(error)) => return Err(error),
+                None => {}
+            }
+        }
+        Ok(jar_paths)
     }
 }
 
