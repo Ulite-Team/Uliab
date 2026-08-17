@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use wasmtime::component::{Component, Linker, ResourceTable};
-use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{Cache, CacheConfig, Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView, p2};
 
 use crate::task::{AllowlistedTool, Task as BuildTask, TaskAction, TaskGraph};
@@ -410,10 +410,37 @@ impl PluginHost {
     /// A host engine with the component model enabled and fuel metering
     /// on, so a plugin that loops forever is trapped when it exhausts
     /// its budget instead of hanging the build.
+    ///
+    /// Compiled plugin artifacts are kept in wasmtime's on-disk
+    /// compilation cache (defaulting to `~/.cache/wasmtime`), so a
+    /// plugin compiled once for a given engine configuration is not
+    /// recompiled on later loads. If the cache cannot be initialised
+    /// (for example on a system without a home directory) the host
+    /// keeps working without one.
     pub fn new() -> Result<Self, HostError> {
+        Self::from_cache_dir(None)
+    }
+
+    /// Like [`PluginHost::new`], but roots the compilation cache at
+    /// `dir` instead of the default user cache directory. The directory
+    /// is created if it does not exist.
+    pub fn with_cache_dir(dir: PathBuf) -> Result<Self, HostError> {
+        Self::from_cache_dir(Some(dir))
+    }
+
+    fn from_cache_dir(dir: Option<PathBuf>) -> Result<Self, HostError> {
         let mut config = Config::new();
         config.wasm_component_model(true);
         config.consume_fuel(true);
+        let mut cache_config = CacheConfig::new();
+        if let Some(dir) = dir {
+            cache_config.with_directory(dir);
+        }
+        // The cache is an acceleration only: a failure to set it up must
+        // not block plugin loading.
+        if let Ok(cache) = Cache::new(cache_config) {
+            config.cache(Some(cache));
+        }
         let engine = Engine::new(&config).map_err(|error| HostError::Load(error.to_string()))?;
         Ok(Self {
             engine,
