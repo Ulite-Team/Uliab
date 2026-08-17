@@ -82,6 +82,10 @@ struct HostCtx {
     /// module that owns it, so a `register-task` call that is not part of
     /// a `configure` session is refused.
     registrar: Option<RegistrarState>,
+    /// The fuel budget granted to the plugin for each entry-point call.
+    /// Refilled before every `manifest`/`configure`/`run` call; a plugin
+    /// that exhausts it is trapped instead of running forever.
+    fuel_budget: u64,
 }
 
 /// The host side of a `configure` session: the graph being built, the
@@ -337,6 +341,31 @@ impl std::fmt::Display for HostError {
 
 impl std::error::Error for HostError {}
 
+/// Maps a plugin entry-point call error into a [`HostError::Call`],
+/// translating a resource-limit trap into a clear budget message
+/// instead of the raw wasmtime trap text.
+fn call_error(error: wasmtime::Error) -> HostError {
+    // wasmtime's plain Display for a trap prints only the backtrace
+    // header; the trap cause ("all fuel consumed", "memory limit ...")
+    // sits in the error's source chain, which only the alternate
+    // formatter (`{:#}`) renders.
+    let message = format!("{error:#}");
+    if message.contains("all fuel consumed") {
+        return HostError::Call("plugin exceeded its resource budget (fuel exhausted)".to_owned());
+    }
+    if message.contains("memory limit") || message.contains("memory allocation") {
+        return HostError::Call(
+            "plugin exceeded its resource budget (linear memory limit)".to_owned(),
+        );
+    }
+    HostError::Call(error.to_string())
+}
+
+/// The default fuel budget, in wasmtime fuel units (roughly one per
+/// executed guest instruction), granted to a plugin for each
+/// entry-point call. Configurable via [`PluginHost::with_fuel_budget`].
+const PLUGIN_FUEL_BUDGET: u64 = 100_000_000;
+
 /// The embedded wasmtime engine that plugin components run in.
 pub struct PluginHost {
     engine: Engine,
@@ -346,6 +375,9 @@ pub struct PluginHost {
     /// `configure` instead of trusting the host to do Android-specific
     /// probing. An empty `Vec` leaves the guest filesystem empty.
     android_sdk: Vec<PathBuf>,
+    /// Fuel granted to a plugin for each entry-point call; exhausting it
+    /// traps the plugin (see [`PLUGIN_FUEL_BUDGET`]).
+    fuel_budget: u64,
 }
 
 /// The identity a plugin reports in its `manifest` entry.
@@ -363,15 +395,28 @@ pub struct PluginManifest {
 }
 
 impl PluginHost {
-    /// A host engine with the component model enabled.
+    /// A host engine with the component model enabled and fuel metering
+    /// on, so a plugin that loops forever is trapped when it exhausts
+    /// its budget instead of hanging the build.
     pub fn new() -> Result<Self, HostError> {
         let mut config = Config::new();
         config.wasm_component_model(true);
+        config.consume_fuel(true);
         let engine = Engine::new(&config).map_err(|error| HostError::Load(error.to_string()))?;
         Ok(Self {
             engine,
             android_sdk: Vec::new(),
+            fuel_budget: PLUGIN_FUEL_BUDGET,
         })
+    }
+
+    /// Sets the fuel budget granted to a plugin for each entry-point
+    /// call, overriding [`PLUGIN_FUEL_BUDGET`]. Fuel units are roughly
+    /// one per executed guest instruction; a plugin that exhausts its
+    /// budget mid-call is trapped with a resource-budget error.
+    pub fn with_fuel_budget(mut self, budget: u64) -> Self {
+        self.fuel_budget = budget;
+        self
     }
 
     /// Grants plugins read access to the Android SDK root `dir` during
@@ -407,13 +452,9 @@ impl PluginHost {
     /// entry point traps or the ABI check fails.
     pub fn run(&self, path: &Path, input: &str) -> Result<String, HostError> {
         let mut plugin = self.load_legacy(path)?;
-        let manifest = plugin
-            .manifest()
-            .map_err(|error| HostError::Call(error.to_string()))?;
+        let manifest = plugin.manifest()?;
         self.check_abi(&manifest)?;
-        plugin
-            .run(input)
-            .map_err(|error| HostError::Call(error.to_string()))
+        plugin.run(input)
     }
 
     /// Loads the component in `path`, runs its `configure` entry point
@@ -497,9 +538,7 @@ impl PluginHost {
         project_dir: &Path,
     ) -> Result<TaskGraph, HostError> {
         let mut plugin = self.load_full(path)?;
-        let manifest = plugin
-            .manifest()
-            .map_err(|error| HostError::Call(error.to_string()))?;
+        let manifest = plugin.manifest()?;
         self.check_abi(&manifest)?;
         let declared_tools = parse_declared_tools(&manifest)?;
         plugin.store.data_mut().registrar = Some(RegistrarState {
@@ -508,11 +547,14 @@ impl PluginHost {
             project_dir: project_dir.to_path_buf(),
             declared_tools,
         });
+        // `manifest` above consumed its fuel budget, so configure gets a
+        // fresh one for its own entry-point call.
+        plugin.refuel()?;
         let outcome = plugin
             .plugin
             .ulite_ulb_ulb_plugin()
             .call_configure(&mut plugin.store, config_json)
-            .map_err(|error| HostError::Call(error.to_string()))?;
+            .map_err(call_error)?;
         if let Err(message) = outcome {
             return Err(HostError::Call(format!(
                 "plugin '{}' rejected the configuration: {message}",
@@ -568,14 +610,22 @@ impl PluginHost {
             |host| host,
         )
         .map_err(|error| HostError::Load(error.to_string()))?;
-        let store = Store::new(
+        let mut store = Store::new(
             &self.engine,
             HostCtx {
                 wasi: self.wasi_context().map_err(HostError::Load)?,
                 table: ResourceTable::new(),
                 registrar: None,
+                fuel_budget: self.fuel_budget,
             },
         );
+        // Fuel metering is on for every store (see [`PluginHost::new`]),
+        // so a store starts with zero fuel and the very first executed
+        // guest instruction would trap; grant the entry-point budget
+        // before instantiation runs the component's initializers.
+        store
+            .set_fuel(self.fuel_budget)
+            .map_err(|error| HostError::Load(error.to_string()))?;
         Ok((linker, store))
     }
 
@@ -672,13 +722,26 @@ fn parse_declared_tools(manifest: &PluginManifest) -> Result<HashSet<Allowlisted
 }
 
 impl LoadedPlugin {
+    /// Grants the store a fresh fuel budget for one plugin entry-point
+    /// call. Fuel metering (enabled in [`PluginHost::new`]) traps a
+    /// plugin that exhausts its budget instead of letting it run
+    /// forever; this must be called before every `manifest`/`configure`/
+    /// `run` call.
+    fn refuel(&mut self) -> Result<(), HostError> {
+        let budget = self.store.data().fuel_budget;
+        self.store
+            .set_fuel(budget)
+            .map_err(|error| HostError::Load(error.to_string()))
+    }
+
     /// Calls the plugin's `manifest` entry point.
     fn manifest(&mut self) -> Result<PluginManifest, HostError> {
+        self.refuel()?;
         let manifest = self
             .plugin
             .ulite_ulb_ulb_plugin()
             .call_manifest(&mut self.store)
-            .map_err(|error| HostError::Call(error.to_string()))?;
+            .map_err(call_error)?;
         Ok(PluginManifest {
             name: manifest.name,
             version: manifest.version,
@@ -689,13 +752,22 @@ impl LoadedPlugin {
 }
 
 impl LoadedLegacyPlugin {
+    /// See [`LoadedPlugin::refuel`].
+    fn refuel(&mut self) -> Result<(), HostError> {
+        let budget = self.store.data().fuel_budget;
+        self.store
+            .set_fuel(budget)
+            .map_err(|error| HostError::Load(error.to_string()))
+    }
+
     /// Calls the plugin's `manifest` entry point.
     fn manifest(&mut self) -> Result<PluginManifest, HostError> {
+        self.refuel()?;
         let manifest = self
             .plugin
             .ulite_ulb_ulb_plugin()
             .call_manifest(&mut self.store)
-            .map_err(|error| HostError::Call(error.to_string()))?;
+            .map_err(call_error)?;
         Ok(PluginManifest {
             name: manifest.name,
             version: manifest.version,
@@ -706,10 +778,11 @@ impl LoadedLegacyPlugin {
 
     /// Calls the plugin's `run` entry point.
     fn run(&mut self, input: &str) -> Result<String, HostError> {
+        self.refuel()?;
         self.plugin
             .ulite_ulb_ulb_plugin()
             .call_run(&mut self.store, input)
-            .map_err(|error| HostError::Call(error.to_string()))
+            .map_err(call_error)
     }
 }
 
