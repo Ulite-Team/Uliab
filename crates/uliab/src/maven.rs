@@ -32,13 +32,19 @@
 //! Artifacts are cached content-addressed under the resolver's cache
 //! directory (default `~/.cache/uliab/modules`): a jar/POM is only reused
 //! from the cache when its recorded SHA-256 matches the file on disk, and a
-//! mismatch triggers a refetch. Repositories are tried in order, so a local
+//! mismatch triggers a refetch. A download streams through a temporary
+//! `.part` file while its SHA-256 is hashed incrementally, so an artifact
+//! is never buffered in memory and only an intact, digest-matched file
+//! ever appears in the cache. Repositories are tried in order, so a local
 //! filesystem repository (plain path or `file://`) in front of the default
 //! repositories keeps resolution offline for tests.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 
 use sha2::{Digest, Sha256};
 
@@ -420,7 +426,7 @@ impl Resolver {
         artifact: &str,
         version: &str,
         extension: &str,
-    ) -> Result<(PathBuf, Vec<u8>), ResolveError> {
+    ) -> Result<PathBuf, ResolveError> {
         let rel = format!(
             "{}/{}/{}/{}-{}.{}",
             group.replace('.', "/"),
@@ -431,19 +437,18 @@ impl Resolver {
             extension
         );
         let cache_file = self.cache_dir.join(&rel);
-        if let Some(bytes) = verified_cached(&cache_file) {
-            return Ok((cache_file, bytes));
+        if verified_cached(&cache_file) {
+            return Ok(cache_file);
         }
-        let bytes = self.fetch_from_repos(&rel)?;
-        write_cached(&cache_file, &bytes);
-        Ok((cache_file, bytes))
+        self.fetch_from_repos(&rel, &cache_file)?;
+        Ok(cache_file)
     }
 
-    fn fetch_from_repos(&self, rel: &str) -> Result<Vec<u8>, ResolveError> {
+    fn fetch_from_repos(&self, rel: &str, cache_file: &Path) -> Result<(), ResolveError> {
         let mut first_failure: Option<String> = None;
         for repo in &self.repos {
-            match fetch_one(repo, rel) {
-                Ok(bytes) => return Ok(bytes),
+            match download_into(repo, rel, cache_file) {
+                Ok(()) => return Ok(()),
                 Err(FetchError::Miss) => {}
                 Err(FetchError::Fail(message)) => {
                     first_failure.get_or_insert(message);
@@ -474,56 +479,118 @@ enum FetchError {
     Fail(String),
 }
 
-fn fetch_one(repo: &MavenRepo, rel: &str) -> Result<Vec<u8>, FetchError> {
+/// The largest artifact a download accepts, in bytes: a guard against a
+/// repository streaming garbage instead of an artifact (ureq's own
+/// `read_to_vec` cap no longer applies — bodies stream to disk).
+const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Downloads `rel` from `repo` into `cache_file`, streaming the body
+/// through a temporary `<cache_file>.part` while its SHA-256 is hashed
+/// incrementally, then atomically renaming the file into place and
+/// recording the digest in a sibling `<cache_file>.sha256`. A failed or
+/// truncated download removes the partial file, so a broken artifact can
+/// never be mistaken for a cached one.
+///
+/// A `file://` or plain-path repository streams a local file; a real
+/// scheme (the Maven repos) is fetched over HTTP.
+fn download_into(repo: &MavenRepo, rel: &str, cache_file: &Path) -> Result<(), FetchError> {
     let url = repo.url_for(rel);
     if !url.contains("://") || url.starts_with("file://") {
         let path = url.strip_prefix("file://").unwrap_or(&url);
-        return match std::fs::read(path) {
-            Ok(bytes) => Ok(bytes),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(FetchError::Miss),
-            Err(error) => Err(FetchError::Fail(error.to_string())),
+        let source = match std::fs::File::open(path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(FetchError::Miss);
+            }
+            Err(error) => return Err(FetchError::Fail(error.to_string())),
         };
+        return stream_to(&mut BufReader::new(source), cache_file, None).map_err(FetchError::Fail);
     }
-    match ureq::get(&url).call() {
-        Ok(response) => response
-            .into_body()
-            .with_config()
-            // ureq caps `read_to_vec` at 10 MB by default; the KSP toolchain
-            // jar (`symbol-processing-aa`) is tens of megabytes, so artifacts
-            // in that class must not be silently refused.
-            .limit(256 * 1024 * 1024)
-            .read_to_vec()
-            .map_err(|error| FetchError::Fail(format!("reading response body: {error}"))),
-        Err(ureq::Error::StatusCode(404)) => Err(FetchError::Miss),
-        Err(ureq::Error::StatusCode(code)) => Err(FetchError::Fail(format!("HTTP {code}"))),
-        Err(other) => Err(FetchError::Fail(other.to_string())),
-    }
+    let response = match ureq::get(&url).call() {
+        Ok(response) => response,
+        Err(ureq::Error::StatusCode(404)) => return Err(FetchError::Miss),
+        Err(ureq::Error::StatusCode(code)) => return Err(FetchError::Fail(format!("HTTP {code}"))),
+        Err(other) => return Err(FetchError::Fail(other.to_string())),
+    };
+    let mut body = response.into_body().into_reader();
+    stream_to(&mut body, cache_file, Some(MAX_ARTIFACT_BYTES)).map_err(FetchError::Fail)
 }
 
-/// Reads a cached artifact, returning `None` when it is missing or does not
-/// match its recorded SHA-256. The digest is stored in a sibling
-/// `<file>.sha256` so a POM and its jar (which share `<artifact>-<version>`
-/// up to their extension) never collide.
-fn verified_cached(path: &Path) -> Option<Vec<u8>> {
-    let bytes = std::fs::read(path).ok()?;
-    let recorded = std::fs::read_to_string(sha_path(path)).ok()?;
-    if recorded.trim() != hex(&Sha256::digest(&bytes)) {
-        return None;
+/// Streams `source` into `cache_file`, hashing as it goes: the body is
+/// written to a temporary `<cache_file>.part`, the digest is recorded in
+/// a sibling `<cache_file>.sha256`, and only then is the partial file
+/// renamed over `cache_file` (atomic within the cache directory). Any
+/// failure — including a body larger than `cap` bytes, when given —
+/// removes the partial file and reports an error, leaving the cache
+/// exactly as it was.
+fn stream_to(source: &mut dyn Read, cache_file: &Path, cap: Option<u64>) -> Result<(), String> {
+    let part = PathBuf::from(format!("{}.part", cache_file.display()));
+    let outcome = (|| -> Result<(), String> {
+        if let Some(parent) = cache_file.parent()
+            && std::fs::create_dir_all(parent).is_err()
+        {
+            return Err(format!("creating cache directory '{}'", parent.display()));
+        }
+        let mut file = std::fs::File::create(&part)
+            .map_err(|error| format!("creating '{}': {error}", part.display()))?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 16 * 1024];
+        let mut total = 0u64;
+        loop {
+            let read = source
+                .read(&mut buffer)
+                .map_err(|error| format!("reading download: {error}"))?;
+            if read == 0 {
+                break;
+            }
+            total += read as u64;
+            if let Some(cap) = cap
+                && total > cap
+            {
+                return Err(format!("artifact exceeds the {cap} byte limit"));
+            }
+            hasher.update(&buffer[..read]);
+            file.write_all(&buffer[..read])
+                .map_err(|error| format!("writing '{}': {error}", part.display()))?;
+        }
+        drop(file);
+        let digest = hex(&hasher.finalize());
+        std::fs::write(sha_path(cache_file), digest)
+            .map_err(|error| format!("recording '{}': {error}", sha_path(cache_file).display()))?;
+        std::fs::rename(&part, cache_file)
+            .map_err(|error| format!("moving '{}': {error}", part.display()))?;
+        Ok(())
+    })();
+    if let Err(message) = outcome {
+        let _ = std::fs::remove_file(&part);
+        return Err(message);
     }
-    Some(bytes)
+    Ok(())
 }
 
-fn write_cached(path: &Path, bytes: &[u8]) {
-    if let Some(parent) = path.parent()
-        && std::fs::create_dir_all(parent).is_err()
-    {
-        return;
+/// Returns whether the cached artifact at `path` is intact: it exists
+/// and its content hashes to the digest recorded in the sibling
+/// `<path>.sha256`. The file is read in chunks, so verifying a large
+/// cached jar never loads it into memory.
+fn verified_cached(path: &Path) -> bool {
+    let recorded = match std::fs::read_to_string(sha_path(path)) {
+        Ok(recorded) => recorded,
+        Err(_) => return false,
+    };
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => hasher.update(&buffer[..read]),
+            Err(_) => return false,
+        }
     }
-    let digest = hex(&Sha256::digest(bytes));
-    if std::fs::write(path, bytes).is_err() || std::fs::write(sha_path(path), digest).is_err() {
-        // A failed cache write must not fail resolution: the artifact is
-        // already in hand, and the cache is purely an acceleration.
-    }
+    recorded.trim() == hex(&hasher.finalize())
 }
 
 fn sha_path(path: &Path) -> PathBuf {
@@ -842,9 +909,13 @@ impl<'a> Session<'a> {
         }
         self.seen.insert(key.clone());
 
-        let (_, pom_bytes) = self
+        let pom_path = self
             .resolver
             .fetch_cached(group, artifact, version, "pom")?;
+        let pom_bytes = std::fs::read(&pom_path).map_err(|error| ResolveError::Fetch {
+            artifact: format!("{group}:{artifact}:{version}"),
+            message: format!("reading cached POM: {error}"),
+        })?;
         let pom = parse_pom(&pom_bytes).map_err(|message| ResolveError::Parser {
             artifact: format!("{group}:{artifact}:{version}"),
             message,
@@ -1040,30 +1111,76 @@ impl<'a> Session<'a> {
             .collect()
     }
 
-    /// Downloads the jar for every node in `set`, returning their paths in
-    /// deterministic (`group`, `artifact`) order. Nodes whose packaging is
-    /// not a plain jar contribute no file; unsupported packaging is noted.
+    /// Downloads the jar for every node in `set` on a worker pool,
+    /// returning their paths in deterministic (`group`, `artifact`) order.
+    /// Nodes whose packaging is not a plain jar contribute no file;
+    /// unsupported packaging is noted. The first jar download to fail
+    /// aborts the remaining fetches and surfaces its error.
     fn materialize(
         &mut self,
         set: &BTreeMap<(String, String), (String, String)>,
     ) -> Result<Vec<PathBuf>, ResolveError> {
-        let mut jars = Vec::new();
-        for ((group, artifact), (version, packaging)) in set {
-            match packaging.as_str() {
-                "pom" => {}
-                "jar" => {
-                    let (path, _) = self
-                        .resolver
-                        .fetch_cached(group, artifact, version, "jar")?;
-                    jars.push(path);
+        let jars: Vec<((String, String), String)> = set
+            .iter()
+            .filter_map(|((group, artifact), (version, packaging))| {
+                if packaging == "jar" {
+                    Some(((group.clone(), artifact.clone()), version.clone()))
+                } else {
+                    None
                 }
-                other => self.notes.push(format!(
-                    "{group}:{artifact}:{version} uses packaging '{other}'; only jar \
+            })
+            .collect();
+        for ((group, artifact), (version, packaging)) in set {
+            if packaging != "pom" && packaging != "jar" {
+                self.notes.push(format!(
+                    "{group}:{artifact}:{version} uses packaging '{packaging}'; only jar \
                      artifacts are materialized for now"
-                )),
+                ));
             }
         }
-        Ok(jars)
+        let workers = std::thread::available_parallelism()
+            .map_or(4, |count| count.get().min(8))
+            .min(jars.len())
+            .max(1);
+        let queue = Mutex::new(VecDeque::from_iter(0..jars.len()));
+        let results = Mutex::new(vec![None; jars.len()]);
+        let failed = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let resolver = &self.resolver;
+                let jars = &jars;
+                let queue = &queue;
+                let results = &results;
+                let failed = &failed;
+                scope.spawn(move || {
+                    loop {
+                        if failed.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        let index = queue.lock().unwrap().pop_front();
+                        let Some(index) = index else { break };
+                        let ((group, artifact), version) = &jars[index];
+                        let outcome = resolver.fetch_cached(group, artifact, version, "jar");
+                        if outcome.is_err() {
+                            failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        results.lock().unwrap()[index] = Some(outcome);
+                    }
+                });
+            }
+        });
+        let results = results
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut jar_paths = Vec::with_capacity(jars.len());
+        for result in results {
+            match result {
+                Some(Ok(path)) => jar_paths.push(path),
+                Some(Err(error)) => return Err(error),
+                None => {}
+            }
+        }
+        Ok(jar_paths)
     }
 }
 
@@ -1081,6 +1198,9 @@ fn merge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::io::{BufRead, Write};
+    use std::sync::Arc;
 
     fn repo_pom(
         group: &str,
@@ -1584,6 +1704,196 @@ mod tests {
             .resolve(&[declared(MavenScope::Implementation, "com.example:one:1.0")])
             .expect("refetches and recovers");
         assert_eq!(std::fs::read(jar_path).unwrap(), b"one-1.0");
+    }
+
+    /// A localhost HTTP repository that serves the Maven layout from a
+    /// local root, used to exercise the streaming and parallel download
+    /// paths (`file://` repos are too fast to observe concurrency). Every
+    /// request is held open briefly while its connection is counted, so a
+    /// test can assert how many fetches ran at once; with `truncate`, jar
+    /// responses announce a longer body than they send, simulating a
+    /// download that breaks mid-body.
+    struct HttpRepo {
+        url: String,
+        root: PathBuf,
+        max_concurrent: Arc<std::sync::atomic::AtomicUsize>,
+        _thread: std::thread::JoinHandle<()>,
+    }
+
+    impl HttpRepo {
+        fn new(truncate: bool) -> HttpRepo {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "uliab-maven-http-test-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let max_concurrent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = in_flight.clone();
+            let high_water = max_concurrent.clone();
+            let serve_root = root.clone();
+            let thread = std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { break };
+                    let counter = counter.clone();
+                    let high_water = high_water.clone();
+                    let serve_root = serve_root.clone();
+                    let truncate = truncate;
+                    std::thread::spawn(move || {
+                        let mut stream = BufReader::new(stream);
+                        let mut request = String::new();
+                        if stream.read_line(&mut request).is_err() {
+                            return;
+                        }
+                        let path = request.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                        let serving = stream.get_mut();
+                        let file = serve_root.join(path.trim_start_matches('/'));
+                        let active = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        high_water.fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        let body = std::fs::read(&file).unwrap_or_default();
+                        let truncated = truncate
+                            && file.extension().is_some_and(|extension| extension == "jar");
+                        if body.is_empty() {
+                            let _ = serving.write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                        } else {
+                            let length = if truncated {
+                                body.len() + 100
+                            } else {
+                                body.len()
+                            };
+                            let _ = write!(
+                                serving,
+                                "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                            );
+                            let _ = serving.write_all(&body);
+                        }
+                        let _ = serving.flush();
+                        counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    });
+                }
+            });
+            HttpRepo {
+                url,
+                root,
+                max_concurrent,
+                _thread: thread,
+            }
+        }
+
+        fn add(&self, group: &str, artifact: &str, version: &str, children: &[(&str, &str, &str)]) {
+            write_artifact(
+                &self.root,
+                group,
+                artifact,
+                version,
+                &repo_pom(group, artifact, version, children),
+            );
+        }
+
+        fn resolver(&self) -> Resolver {
+            Resolver::new(
+                vec![MavenRepo::Custom(self.url.clone())],
+                Some(self.root.join("cache")),
+            )
+        }
+    }
+
+    fn part_files(root: &Path) -> Vec<PathBuf> {
+        let mut parts = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(".part"))
+                {
+                    parts.push(path);
+                }
+            }
+        }
+        parts
+    }
+
+    #[test]
+    fn download_records_the_streamed_digest() {
+        let repo = HttpRepo::new(false);
+        repo.add("com.example", "one", "1.0", &[]);
+        let resolution = repo
+            .resolver()
+            .resolve(&[declared(MavenScope::Implementation, "com.example:one:1.0")])
+            .expect("resolves");
+        let jar_path = &resolution.classpath.compile[0];
+        let bytes = std::fs::read(jar_path).unwrap();
+        let digest = hex(&Sha256::digest(&bytes));
+        let recorded = std::fs::read_to_string(sha_path(jar_path)).unwrap();
+        assert_eq!(recorded.trim(), digest);
+    }
+
+    #[test]
+    fn a_truncated_download_leaves_no_part_file() {
+        let repo = HttpRepo::new(true);
+        repo.add("com.example", "broken", "1.0", &[]);
+        let error = repo
+            .resolver()
+            .resolve(&[declared(
+                MavenScope::Implementation,
+                "com.example:broken:1.0",
+            )])
+            .expect_err("truncated jar fails resolution");
+        assert!(matches!(error, ResolveError::Fetch { .. }), "{error}");
+        assert!(
+            part_files(&repo.root.join("cache")).is_empty(),
+            "partial downloads must be removed"
+        );
+    }
+
+    #[test]
+    fn jar_downloads_run_in_parallel() {
+        let repo = HttpRepo::new(false);
+        for artifact in ["a", "b", "c", "d", "e", "f"] {
+            repo.add("com.example", artifact, "1.0", &[]);
+        }
+        let deps: Vec<DeclaredDep> = ["a", "b", "c", "d", "e", "f"]
+            .iter()
+            .map(|artifact| {
+                declared(
+                    MavenScope::Implementation,
+                    &format!("com.example:{artifact}:1.0"),
+                )
+            })
+            .collect();
+        let resolution = repo.resolver().resolve(&deps).expect("resolves");
+        assert_eq!(
+            jar_names(&resolution.classpath.compile),
+            vec![
+                "a-1.0.jar",
+                "b-1.0.jar",
+                "c-1.0.jar",
+                "d-1.0.jar",
+                "e-1.0.jar",
+                "f-1.0.jar"
+            ]
+        );
+        assert!(
+            repo.max_concurrent
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2,
+            "jar fetches should overlap on a worker pool"
+        );
     }
 
     #[test]
