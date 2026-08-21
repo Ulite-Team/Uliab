@@ -1131,15 +1131,15 @@ impl<'a> Evaluator<'a> {
     /// [`Value::ProjectRef`] that the driver resolves to a classpath entry
     /// at build time.
     fn eval_project_ref(&mut self, args: &[Argument], span: Span) -> Value {
-        let Some(path) = self.single_positional_string(args, span, "project") else {
-            return Value::Invalid("project() call".to_owned());
+        let Some(path) = self.single_positional_string(args, span, "project(...)") else {
+            return Value::Invalid("bad project() call".to_owned());
         };
         if !path.starts_with(':') {
             self.error(
                 span,
                 format!("project(\"{path}\") module path must start with ':' (e.g. \":shared\")"),
             );
-            return Value::Invalid("project() call".to_owned());
+            return Value::Invalid("bad project() call".to_owned());
         }
         Value::ProjectRef(path)
     }
@@ -2504,6 +2504,46 @@ deps {
                 .iter()
                 .any(|d| d.message.contains("'project' requires a string value")),
             "expected non-string project error, got: {:?}",
+            outcome.diagnostics
+        );
+    }
+
+    #[test]
+    fn settings_repositories_non_string_maven_is_error() {
+        let src = r#"
+            project "X"
+            module "app"
+            repositories {
+                maven 42
+            }
+        "#;
+        let outcome = evaluate_settings(src);
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("'maven' requires a string URL")),
+            "expected non-string maven error, got: {:?}",
+            outcome.diagnostics
+        );
+    }
+
+    #[test]
+    fn settings_repositories_unknown_entry_is_error() {
+        let src = r#"
+            project "X"
+            module "app"
+            repositories {
+                ivy "https://repo.example"
+            }
+        "#;
+        let outcome = evaluate_settings(src);
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("unknown repositories entry")),
+            "expected unknown repos entry error, got: {:?}",
             outcome.diagnostics
         );
     }
