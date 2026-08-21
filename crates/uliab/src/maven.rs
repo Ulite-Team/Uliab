@@ -194,12 +194,16 @@ pub fn parse_deps_block(block: &Value) -> Result<Vec<DeclaredDep>, String> {
         match value {
             Value::List(items) => {
                 for item in items {
+                    if matches!(item, Value::ProjectRef(_)) {
+                        continue;
+                    }
                     deps.push(DeclaredDep {
                         scope,
                         dependency: parse_coordinate_value(item, scope_name)?,
                     });
                 }
             }
+            Value::ProjectRef(_) => continue,
             other => deps.push(DeclaredDep {
                 scope,
                 dependency: parse_coordinate_value(other, scope_name)?,
@@ -207,6 +211,59 @@ pub fn parse_deps_block(block: &Value) -> Result<Vec<DeclaredDep>, String> {
         }
     }
     Ok(deps)
+}
+
+/// Extracts project-module dependencies from a `deps {}` block.
+///
+/// Walks every scope entry and collects `(scope, module_path)` pairs for
+/// each [`Value::ProjectRef`] found — as single values or inside a
+/// [`Value::List`]. Non-project-ref entries are ignored; the caller
+/// resolves those via [`parse_deps_block`] and the Maven resolver.
+///
+/// The module path retains its leading `:` (e.g. `":shared"`).
+///
+/// # Examples
+///
+/// ```
+/// use ulb_lang::eval::Value;
+/// use uliab::maven::{extract_project_deps, MavenScope};
+///
+/// let deps = Value::Block(
+///     [(
+///         "implementation".to_owned(),
+///         Value::ProjectRef(":shared".to_owned()),
+///     )]
+///     .into_iter()
+///     .collect(),
+/// );
+/// let refs = extract_project_deps(&deps);
+/// assert_eq!(refs, vec![(MavenScope::Implementation, ":shared".to_owned())]);
+/// ```
+pub fn extract_project_deps(block: &Value) -> Vec<(MavenScope, String)> {
+    let entries = match block {
+        Value::Block(entries) => entries,
+        _ => return Vec::new(),
+    };
+    let mut refs = Vec::new();
+    for (scope_name, value) in entries {
+        let Some(scope) = MavenScope::from_name(scope_name) else {
+            continue;
+        };
+        match value {
+            Value::ProjectRef(path) => {
+                refs.push((scope, path.clone()));
+            }
+            Value::List(items) => {
+                for item in items {
+                    if let Value::ProjectRef(path) = item {
+                        refs.push((scope, path.clone()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    refs
 }
 
 fn parse_coordinate_value(value: &Value, scope: &str) -> Result<Dependency, String> {
@@ -234,6 +291,7 @@ fn kind(value: &Value) -> &'static str {
         Value::Coordinate(_) => "coordinate",
         Value::Block(_) => "block",
         Value::Invalid(_) => "an unresolved value",
+        Value::ProjectRef(_) => "project reference",
     }
 }
 

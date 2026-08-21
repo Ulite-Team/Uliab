@@ -49,6 +49,10 @@ pub enum AllowlistedTool {
     /// the action names that directory as its first argument and the host
     /// resolves `<dir>/aapt2` for it.
     Aapt2,
+    /// `apksigner` — APK signing tool. Like `aapt2`, the binary lives
+    /// under an Android SDK `build-tools` directory and the action carries
+    /// that directory as its first argument.
+    Apksigner,
 }
 
 impl AllowlistedTool {
@@ -65,6 +69,7 @@ impl AllowlistedTool {
             Self::Jar => "jar",
             Self::Java => "java",
             Self::Aapt2 => "aapt2",
+            Self::Apksigner => "apksigner",
         }
     }
 
@@ -82,6 +87,7 @@ impl AllowlistedTool {
             "jar" => Some(Self::Jar),
             "java" => Some(Self::Java),
             "aapt2" => Some(Self::Aapt2),
+            "apksigner" => Some(Self::Apksigner),
             _ => None,
         }
     }
@@ -735,6 +741,34 @@ fn resolve_tool(tool: AllowlistedTool, args: &[String]) -> Result<(String, &[Str
                     binary.display()
                 ));
             }
+            Ok((binary.display().to_string(), &args[1..]))
+        }
+        AllowlistedTool::Apksigner => {
+            let dir = args.first().ok_or_else(|| {
+                "tool 'apksigner' requires the build-tools directory as its first argument"
+                    .to_owned()
+            })?;
+            let base = std::path::PathBuf::from(dir);
+            let candidates: Vec<String> = if cfg!(windows) {
+                vec!["apksigner.bat".to_owned(), "apksigner.exe".to_owned()]
+            } else {
+                vec!["apksigner".to_owned()]
+            };
+            let mut found = None;
+            for name in &candidates {
+                let path = base.join(name);
+                if path.exists() {
+                    found = Some(path);
+                    break;
+                }
+            }
+            let binary = found.ok_or_else(|| {
+                format!(
+                    "apksigner binary not found in '{}' (looked for {})",
+                    dir,
+                    candidates.join(", ")
+                )
+            })?;
             Ok((binary.display().to_string(), &args[1..]))
         }
         _ => Ok((tool.as_str().to_owned(), args)),

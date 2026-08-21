@@ -17,6 +17,7 @@ interface task-registrar {
         jar,
         java,
         aapt2,
+        apksigner,
     }
 
     /// Arguments for an action that copies one file to another.

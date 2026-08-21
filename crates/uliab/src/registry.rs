@@ -95,7 +95,7 @@ pub struct PluginIndexEntry {
 ///     "ulite/hello": {
 ///       "versions": {
 ///         "0.1.0": {
-///           "abi": { "min": "0.4", "max": "0.5" },
+///           "abi": { "min": "0.4", "max": "0.6" },
 ///           "artifact_url": "file:///tmp/hello_plugin.wasm"
 ///         }
 ///       }
@@ -618,6 +618,7 @@ fn value_kind(value: &ulb_lang::eval::Value) -> &'static str {
         Value::Coordinate(_) => "coordinate",
         Value::Block(_) => "block",
         Value::Invalid(_) => "invalid",
+        Value::ProjectRef(_) => "project reference",
     }
 }
 
@@ -668,11 +669,11 @@ mod tests {
             "ulite/hello": {
               "versions": {
                 "0.1.0": {
-                  "abi": { "min": "0.4", "max": "0.5" },
+                  "abi": { "min": "0.4", "max": "0.6" },
                   "artifact_url": "artifacts/hello_plugin.wasm"
                 },
                 "0.2.0": {
-                  "abi": { "min": "0.4", "max": "0.5" },
+                  "abi": { "min": "0.4", "max": "0.6" },
                   "artifact_url": "artifacts/hello_plugin.wasm"
                 }
               }
@@ -846,7 +847,7 @@ mod tests {
             version: "0.2.0".to_owned(),
             abi: AbiRange {
                 min: "0.4".to_owned(),
-                max: "0.5".to_owned(),
+                max: "0.6".to_owned(),
             },
         };
         std::fs::write(
@@ -891,7 +892,7 @@ mod tests {
                   "artifact_url": "artifacts/hello_plugin.wasm"
                 },
                 "0.2.0": {
-                  "abi": { "min": "0.4", "max": "0.5" },
+                  "abi": { "min": "0.4", "max": "0.6" },
                   "artifact_url": "artifacts/hello_plugin.wasm"
                 }
               }
