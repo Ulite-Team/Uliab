@@ -49,6 +49,10 @@ pub enum AllowlistedTool {
     /// the action names that directory as its first argument and the host
     /// resolves `<dir>/aapt2` for it.
     Aapt2,
+    /// `apksigner` — APK signing tool. Like `aapt2`, the binary lives
+    /// under an Android SDK `build-tools` directory and the action carries
+    /// that directory as its first argument.
+    Apksigner,
 }
 
 impl AllowlistedTool {
@@ -65,6 +69,7 @@ impl AllowlistedTool {
             Self::Jar => "jar",
             Self::Java => "java",
             Self::Aapt2 => "aapt2",
+            Self::Apksigner => "apksigner",
         }
     }
 
@@ -82,6 +87,7 @@ impl AllowlistedTool {
             "jar" => Some(Self::Jar),
             "java" => Some(Self::Java),
             "aapt2" => Some(Self::Aapt2),
+            "apksigner" => Some(Self::Apksigner),
             _ => None,
         }
     }
@@ -732,6 +738,21 @@ fn resolve_tool(tool: AllowlistedTool, args: &[String]) -> Result<(String, &[Str
             if !binary.exists() {
                 return Err(format!(
                     "aapt2 binary '{}' does not exist",
+                    binary.display()
+                ));
+            }
+            Ok((binary.display().to_string(), &args[1..]))
+        }
+        AllowlistedTool::Apksigner => {
+            let dir = args.first().ok_or_else(|| {
+                "tool 'apksigner' requires the build-tools directory as its first argument"
+                    .to_owned()
+            })?;
+            let binary = std::path::PathBuf::from(dir)
+                .join(format!("apksigner{}", std::env::consts::EXE_SUFFIX));
+            if !binary.exists() {
+                return Err(format!(
+                    "apksigner binary '{}' does not exist",
                     binary.display()
                 ));
             }

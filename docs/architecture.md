@@ -12,12 +12,13 @@ architectural decision in the project so far — §3 explains why and how.
 
 **Implementation status:** `ulb-lang`, the `uliab` CLI (plugin host,
 task engine, Maven resolver, registry client), the tree-sitter grammar,
-the LSP, and the `ulite/jvm` plugin (plain Java and Kotlin/JVM, including
-KSP and JUnit Platform test running) are implemented and building. The
-plugin registry is live on GitHub — `index.json` on the `ulb-plugins`
-default branch, `.wasm` artifacts as release assets. `ulite/android` and
-`ulite/kmp` are the remaining roadmap plugins. Each section below says
-what is implemented today versus designed-but-not-yet-built.
+the LSP, the `ulite/jvm` plugin (Java + Kotlin/JVM incl. KSP + JUnit),
+the `ulite/android` plugin (compile + full APK packaging chain), the
+`ulite/kmp` plugin (JVM target: commonMain + jvmMain → jar), and
+multi-module `settings.ulb` support are implemented and building. The
+plugin registry is live on GitHub. Remaining roadmap items: module
+dependency syntax, APK signing, build variants, `uliab init`,
+KMP Android/native targets.
 
 ---
 
@@ -277,9 +278,10 @@ fn run_tool(&mut self, tool: AllowlistedTool, args: Vec<String>, cwd: &Path)
 
 `AllowlistedTool` is a closed enum the *core* defines — currently `cp`,
 `cat`, `mkdir`, `echo` for filesystem plumbing, `javac`, `kotlinc`,
-`jar`, `java` for the JVM toolchain, and `aapt2` (resolved under the
-Android SDK `build-tools` directory a task names as its first argument)
-for asset packaging (see `docs/abi.md` for the exact set) — and a plugin
+`jar`, `java` for the JVM toolchain, `aapt2` and `apksigner` (both
+resolved under the Android SDK `build-tools` directory a task names as
+its first argument) for asset packaging and APK signing (see
+`docs/abi.md` for the exact set) — and a plugin
 manifest must declare which tools it needs (checked at load time, so a
 plugin can't silently start invoking something new after being
 installed). The plugin computes *what* to run (e.g. every `kotlinc` flag
@@ -445,10 +447,12 @@ compile slice (`ulb-plugins/android-plugin`, `docs/android-plugin.md`):
 an `android {}` block with `compileSdk`, `sources`, `classesDir`, and an
 optional `sdkDir`, toolchain discovery of the platform jar and the
 highest `build-tools` release carrying `aapt2`/`d8` (both the resolved
-root and a module-declared `sdkDir` are preopened read-only, §3.2), and
-a `compile` task that runs javac against the platform jar. The variant
-matrix, manifest merging, and `aapt2`/`d8` packaging remain future
-slices of the same plugin.
+root and a module-declared `sdkDir` are preopened read-only, §3.2), a
+`compile` task that runs javac against the platform jar, and APK signing
+via `apksigner` when the module's `signing {}` block is present (passwords
+written to temp files and passed via `--ks-pass file:`/`--key-pass file:`).
+The variant matrix, manifest merging, and additional packaging features
+remain future slices of the same plugin.
 
 ### 5.3 `ulite/kmp` — depends on `ulite/jvm`, optionally `ulite/android`
 
@@ -477,12 +481,15 @@ Unchanged and still core, because every plugin needs it:
 ### 6.1 Graph model
 
 `settings.ulb` declares the module list; each `build.ulb`'s `deps {}`
-block declares project-module dependencies. The current driver builds a
-single module — it evaluates `libs.ulb`, `conventions.ulb`, and the
-module's `build.ulb` and resolves that one module's plugins and
-dependencies — so the `settings.ulb` step is not implemented yet, and
-module-reference syntax inside `deps {}` remains deferred (the resolver's
-internal shape already accommodates it).
+block declares project-module dependencies. The driver evaluates all
+modules in a first pass, discovers each module's output artifact
+(`jvm.jarFile` or `android.apk`), then resolves `project(":mod")` refs
+in a second pass before configuring plugins. The resolver skips
+`ProjectRef` entries during Maven resolution; `extract_project_deps`
+collects them for the host, and `resolve_project_classpath` maps them to
+jar paths on the classpath. The `api`/`implementation` distinction
+carries through: both inject the referenced module's jar into compile and
+runtime classpaths, while `runtimeOnly` injects into runtime only.
 
 ### 6.2 `api` vs `implementation` classpath rules (core resolver, jvm-family-wide)
 
@@ -572,33 +579,38 @@ one repo produces a `PROGRESS.md` entry in the others; the
 ## 9. End-to-end build pipeline
 
 ```
-1. Parse+eval libs.ulb             → version catalog + plugin coordinates
-2. Parse+eval conventions.ulb      → convention + fn tables
-3. Parse+eval build.ulb            → generic Value module model
-4. Resolve every entry of libs.ulb's `plugins {}` table against the registry
-5. Load each resolved plugin (cache hit, or fetch from the registry — §3.6)
-6. Each plugin's configure() validates its owned keys in the module model
+1. Parse+eval settings.ulb           → project name, module list (absent = single-module)
+2. Parse+eval libs.ulb               → version catalog + plugin coordinates
+3. Parse+eval conventions.ulb        → convention + fn tables
+4. For each module directory (multi) or single module:
+   a. Parse+eval build.ulb           → generic Value module model
+   b. Discover module output          (jvm.jarFile / android.apk) — multi only
+5. Resolve every entry of libs.ulb's `plugins {}` table against the registry
+6. Load each resolved plugin (cache hit, or fetch from the registry — §3.6)
+7. Each plugin's configure() validates its owned keys in the module model
    and registers tasks into the core task engine (§3.2, §4)
-7. Resolve external Maven deps against repos → cache (§7) — core, shared
+8. Resolve external Maven deps against repos → cache (§7) — core, shared
    by every plugin active on the module. The module's top-level `deps {}`
    block resolves to the `classpath` configuration key; every nested
    `deps {}` block — `commonMain.deps`, `androidMain.deps`, or deeper such
    as `kmp.commonMain.deps` — resolves independently and is injected as
    `classpathSourceSets`, mapping each source-set path to its own classpath
    (§5.3). Both are part of the configuration hash (§10)
-8. Derive the full task DAG (§4); fingerprint inputs; schedule waves
-9. Execute: each task's action runs via `run_tool`/`copy`/`write` (§3.5)
-   inside a sandboxed working directory
-10. Record fingerprints for the next build
+9. Resolve `project(":mod")` refs against discovered outputs; merge the
+   referenced module's jar into the depending module's classpath (multi only)
+10. Derive the full task DAG (§4); fingerprint inputs; schedule waves
+11. Execute: each task's action runs via `run_tool`/`copy`/`write` (§3.5)
+    inside a sandboxed working directory
+12. Record fingerprints for the next build
 ```
 
-Steps 1–7 are the "configuration phase" (deterministic, side-effect-free
-except cache reads/writes and plugin-loading I/O). Steps 8–10 are the
-"execution phase." A `settings.ulb` step (project name, module list, repo
-declarations) is designed but not implemented; when it lands it sits at
-the head of this list. This is the same two-phase shape as before the
-redesign; what changed is that steps 4–7 didn't exist as *core*
-responsibilities before (they were folded into hardcoded Android logic).
+Steps 1–9 are the "configuration phase" (deterministic, side-effect-free
+except cache reads/writes and plugin-loading I/O). Steps 10–12 are the
+"execution phase." A project without `settings.ulb` follows steps 2–12
+over a single module (backward-compatible). This is the same two-phase
+shape as before the redesign; what changed is that steps 4–9 didn't
+exist as *core* responsibilities before (they were folded into hardcoded
+Android logic).
 
 ---
 
@@ -637,14 +649,23 @@ responsibilities before (they were folded into hardcoded Android logic).
 | 7b (done) | Core task engine (§4) + fingerprinting (§10), target-agnostic | schedules/executes a task graph a test plugin registers |
 | 7c (done) | Core Maven resolver + classpath rules (§6, §7) | `deps {}` resolves to a real classpath, shared by any plugin |
 | 8a (done) | `ulite/jvm` plugin | builds a plain Java or Kotlin/JVM module end-to-end (incl. KSP, tests) |
-| 8b (next) | `ulite/android` plugin (depends on 8a) | builds a real Android module end-to-end |
-| 8c | `ulite/kmp` plugin (depends on 8a, 8b) | builds a real KMP module end-to-end |
+| 8b (done) | `ulite/android` plugin (depends on 8a) | builds a real Android module end-to-end (compile + APK packaging) |
+| 8c (done, jvm slice) | `ulite/kmp` plugin (depends on 8a, 8b) | jvm target: commonMain + jvmMain → jar; Android/native targets deferred |
+| 9 (done) | Multi-module `settings.ulb` | project name, module list, per-module build.ulb, extra repos |
+| 10 (done) | Module dependency syntax | `implementation project(":shared")` in deps {}, cross-module classpath |
+| 11 (done) | APK signing | release/debug keystores, signing {} block, v1/v2/v3 schemes |
+| 12 | Build variants | debug/release/flavor splits, per-variant task naming |
+| 13 | `uliab init` | scaffold new project from templates |
+| 14 | KMP Android target | androidMain source set, plugin-to-plugin composition |
 
 Phases 2–6 are sequential (each depends on the previous); 7a/7b/7c are
 independent core services and were built in parallel on top of 4. 8a
-landed before 8b/8c (both depend on it); 8b and 8c can proceed in
-parallel after that. This replaces the old single "7+" bucket, which was
-hiding most of the project's remaining size behind one line.
+landed before 8b/8c (both depend on it); 8b and 8c landed in parallel.
+Phase 9 (settings.ulb) landed after 8c. Phase 10 (module dependency
+syntax) landed after 9. Phase 11 (APK signing) landed after 10.
+Phases 12–14 are the remaining
+path to a production-ready build tool: 12 adds build-quality splits,
+13 improves developer experience, and 14 completes the KMP story.
 
 ---
 
@@ -657,10 +678,7 @@ find-all-references/advanced semantic tokens.
 
 New from this redesign, explicitly not designed yet:
 - Plugin-to-plugin dependency / cross-plugin composition in the ABI
-  (§5.2 — `ulite/android` reusing `ulite/jvm`'s tasks is designed on
-  paper only).
+  (§5.2 — needed for KMP Android target, not designed yet).
 - `ulb-lsp` loading plugin manifests for plugin-owned diagnostics (§8).
-- Non-JVM KMP native targets (iOS, desktop) beyond "delegates to a future
-  plugin, not designed" (§5.3).
-- Module-project dependency declaration syntax inside `deps {}` and the
-  `settings.ulb` module list (§6.1, deferred since before this redesign).
+- Non-JVM KMP native targets (iOS, desktop) — deferred until cross-
+  compilation toolchain integration is designed.

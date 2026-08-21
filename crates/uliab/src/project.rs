@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ulb_lang::eval::Definitions;
+use ulb_lang::eval::{Definitions, SettingsModel};
 use ulb_lang::parse;
 
 use crate::registry::PluginSpec;
@@ -117,4 +117,99 @@ pub fn spec_label(spec: &PluginSpec) -> String {
         Some(version) => format!("{}@{}", spec.name, version),
         None => format!("{} (newest compatible)", spec.name),
     }
+}
+
+/// Resolved project settings from `settings.ulb`.
+///
+/// Wraps the evaluator's [`SettingsModel`] with resolved absolute module
+/// directories so the driver can iterate modules without re-resolving paths.
+pub struct ProjectSettings {
+    /// The raw evaluator model (project name, module paths, extra repos,
+    /// lspCompat flag).
+    pub model: SettingsModel,
+    /// Absolute paths to each module's root directory, derived by joining
+    /// the project root with each `module "path"` declaration.
+    pub module_dirs: Vec<PathBuf>,
+    /// The project root directory these settings were read from.
+    pub project_dir: PathBuf,
+}
+
+/// Reads `<dir>/settings.ulb` and evaluates it into a [`ProjectSettings`].
+///
+/// Returns `Ok(None)` when the file does not exist — a project without
+/// `settings.ulb` is a single-module project, not an error. Returns errors
+/// for parse failures, evaluation diagnostics, or missing `module`
+/// declarations in a file that exists.
+///
+/// # Errors
+///
+/// Returns an error when `settings.ulb` exists but cannot be read, has parse
+/// or evaluation errors, or declares no modules.
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+/// use std::path::PathBuf;
+/// use uliab::project::read_settings;
+///
+/// let dir = std::env::temp_dir().join(format!(
+///     "uliab-settings-test-{}", std::process::id()
+/// ));
+/// fs::create_dir_all(&dir).unwrap();
+/// fs::write(
+///     dir.join("settings.ulb"),
+///     "project \"MyApp\"\nmodule \"app\"\nmodule \"shared\"\n",
+/// )
+/// .unwrap();
+///
+/// let settings = read_settings(&dir).expect("reads settings.ulb").expect("settings exist");
+/// assert_eq!(settings.model.project_name.as_deref(), Some("MyApp"));
+/// assert_eq!(settings.model.modules, vec!["app", "shared"]);
+/// assert_eq!(settings.module_dirs.len(), 2);
+/// assert!(settings.module_dirs[0].ends_with("app"));
+/// assert!(settings.module_dirs[1].ends_with("shared"));
+///
+/// let _ = fs::remove_dir_all(&dir);
+/// ```
+pub fn read_settings(dir: &Path) -> Result<Option<ProjectSettings>, String> {
+    let settings_path = dir.join("settings.ulb");
+    let source = match std::fs::read_to_string(&settings_path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!("reading {}: {error}", settings_path.display()));
+        }
+    };
+
+    let outcome = ulb_lang::eval::evaluate_settings(&source);
+    if !outcome.diagnostics.is_empty() {
+        let messages = outcome
+            .diagnostics
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!("{}: {messages}", settings_path.display()));
+    }
+
+    if outcome.model.modules.is_empty() {
+        return Err(format!(
+            "{} declares no modules; add at least one 'module \"path\"' declaration",
+            settings_path.display()
+        ));
+    }
+
+    let module_dirs = outcome
+        .model
+        .modules
+        .iter()
+        .map(|path| dir.join(path))
+        .collect();
+
+    Ok(Some(ProjectSettings {
+        model: outcome.model,
+        module_dirs,
+        project_dir: dir.to_path_buf(),
+    }))
 }

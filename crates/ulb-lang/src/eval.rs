@@ -79,6 +79,11 @@ pub enum Value {
     /// must skip it rather than guess at its meaning, mirroring
     /// [`crate::ast::StatementKind::Invalid`].
     Invalid(String),
+    /// A project-module reference produced by `project(":module")` inside a
+    /// `deps {}` block. The string is the module path (with leading `:`)
+    /// as written in the source. The driver resolves this to an actual
+    /// classpath entry at build time (ARCHITECTURE.md §6.1).
+    ProjectRef(String),
 }
 
 impl Value {
@@ -95,6 +100,7 @@ impl Value {
             Value::Version(v) => Some(v.to_string()),
             Value::Coordinate(c) => Some(c.clone()),
             Value::Invalid(_) => None,
+            Value::ProjectRef(_) => None,
             Value::List(_) | Value::Block(_) | Value::Properties(_) => None,
         }
     }
@@ -957,6 +963,7 @@ impl<'a> Evaluator<'a> {
             "env" => self.eval_env(args, span),
             "props" => self.eval_props(args, span),
             "ver" => self.eval_ver(args, span),
+            "project" => self.eval_project_ref(args, span),
             other => {
                 self.error(
                     span,
@@ -1117,6 +1124,26 @@ impl<'a> Evaluator<'a> {
         current
     }
 
+    /// Evaluates a `project(":module")` call — a module dependency
+    /// reference used inside `deps {}` blocks (ARCHITECTURE.md §6.1).
+    /// The single positional argument must be a string literal naming the
+    /// module path with a leading `:` (e.g. `":shared"`). The result is a
+    /// [`Value::ProjectRef`] that the driver resolves to a classpath entry
+    /// at build time.
+    fn eval_project_ref(&mut self, args: &[Argument], span: Span) -> Value {
+        let Some(path) = self.single_positional_string(args, span, "project") else {
+            return Value::Invalid("project() call".to_owned());
+        };
+        if !path.starts_with(':') {
+            self.error(
+                span,
+                format!("project(\"{path}\") module path must start with ':' (e.g. \":shared\")"),
+            );
+            return Value::Invalid("project() call".to_owned());
+        }
+        Value::ProjectRef(path)
+    }
+
     fn eval_versioned(&mut self, base: &Expr, version: &VersionRef, span: Span) -> Value {
         let base_value = self.eval_expr(base);
         let coordinate = match &base_value {
@@ -1252,6 +1279,7 @@ fn value_kind_name(value: &Value) -> &'static str {
         Value::Coordinate(_) => "coordinate",
         Value::Block(_) => "block",
         Value::Invalid(_) => "invalid",
+        Value::ProjectRef(_) => "project reference",
     }
 }
 
@@ -1277,6 +1305,232 @@ fn parse_properties(contents: &str) -> BTreeMap<String, String> {
         }
     }
     map
+}
+
+/// Evaluates a `settings.ulb` source into a structured [`SettingsModel`].
+///
+/// The settings file uses the same DSL constructs as `build.ulb` (pair
+/// statements, blocks) but with a fixed, known set of keys — the evaluator
+/// validates those keys and rejects anything it does not recognize rather
+/// than building a free-form model. This keeps settings.ulb simple and
+/// predictable: the file is not a second build DSL, it is a project
+/// manifest.
+///
+/// # Settings keys (GRAMMAR.md §6.1)
+///
+/// | Statement | Model field | Constraint |
+/// |---|---|---|
+/// | `project "Name"` | `project_name` | exactly one; duplicate is an error |
+/// | `module "path"` | `modules` | repeatable; each path is relative to the project root |
+/// | `repositories { maven "url" }` | `extra_repos` | at most one block; additive over Google Maven + Maven Central |
+/// | `lspCompat true` | `lsp_compat` | optional; defaults to `false` |
+///
+/// # Errors
+///
+/// Returns diagnostics for unknown keys, duplicate `project` declarations,
+/// malformed `repositories` blocks, or non-boolean `lspCompat` values.
+///
+/// # Examples
+///
+/// ```
+/// use ulb_lang::eval::evaluate_settings;
+///
+/// let src = r#"
+///     project "SampleApp"
+///     module "app"
+///     module "shared"
+///     repositories {
+///         maven "https://maven.pkg.jetbrains.space/public/p/compose/dev"
+///     }
+///     lspCompat true
+/// "#;
+/// let outcome = evaluate_settings(src);
+/// assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+/// ```
+#[must_use]
+pub fn evaluate_settings(source: &str) -> SettingsOutcome {
+    let parsed = crate::parser::parse(source);
+    let mut diagnostics = parsed.diagnostics;
+
+    let mut project_name = None;
+    let mut modules = Vec::new();
+    let mut extra_repos = Vec::new();
+    let mut lsp_compat = false;
+    let mut seen_repositories_block = false;
+
+    for stmt in &parsed.file.statements {
+        match &stmt.kind {
+            StatementKind::Pair { key, value } => match key.text.as_str() {
+                "project" => {
+                    if let Some(name) = extract_string(value) {
+                        if project_name.is_some() {
+                            diagnostics.push(Diagnostic {
+                                message: "duplicate 'project' declaration; settings.ulb may contain exactly one"
+                                    .to_owned(),
+                                span: stmt.span,
+                                severity: Severity::Error,
+                            });
+                        } else {
+                            project_name = Some(name);
+                        }
+                    } else {
+                        diagnostics.push(Diagnostic {
+                            message: "'project' requires a string value".to_owned(),
+                            span: value.span,
+                            severity: Severity::Error,
+                        });
+                    }
+                }
+                "module" => {
+                    if let Some(path) = extract_string(value) {
+                        modules.push(path);
+                    } else {
+                        diagnostics.push(Diagnostic {
+                            message: "'module' requires a string value".to_owned(),
+                            span: value.span,
+                            severity: Severity::Error,
+                        });
+                    }
+                }
+                "lspCompat" => {
+                    if let ExprKind::Bool(b) = &value.kind {
+                        lsp_compat = *b;
+                    } else {
+                        diagnostics.push(Diagnostic {
+                            message: "'lspCompat' requires a boolean value".to_owned(),
+                            span: value.span,
+                            severity: Severity::Error,
+                        });
+                    }
+                }
+                other => {
+                    diagnostics.push(Diagnostic {
+                        message: format!("unknown settings key '{other}'"),
+                        span: key.span,
+                        severity: Severity::Error,
+                    });
+                }
+            },
+            StatementKind::BlockStmt { path, block } if path.segments.len() == 1 => {
+                match path.segments[0].text.as_str() {
+                    "repositories" => {
+                        if seen_repositories_block {
+                            diagnostics.push(Diagnostic {
+                                message: "duplicate 'repositories' block; settings.ulb may contain at most one"
+                                    .to_owned(),
+                                span: stmt.span,
+                                severity: Severity::Error,
+                            });
+                        }
+                        seen_repositories_block = true;
+                        for repo_stmt in &block.statements {
+                            match &repo_stmt.kind {
+                                StatementKind::Pair { key, value } if key.text == "maven" => {
+                                    if let Some(url) = extract_string(value) {
+                                        extra_repos.push(url);
+                                    } else {
+                                        diagnostics.push(Diagnostic {
+                                            message: "'maven' requires a string URL".to_owned(),
+                                            span: value.span,
+                                            severity: Severity::Error,
+                                        });
+                                    }
+                                }
+                                StatementKind::Invalid { .. } => {}
+                                _ => {
+                                    diagnostics.push(Diagnostic {
+                                        message:
+                                            "unknown repositories entry; expected 'maven \"url\"'"
+                                                .to_owned(),
+                                        span: repo_stmt.span,
+                                        severity: Severity::Error,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    other => {
+                        diagnostics.push(Diagnostic {
+                            message: format!("unknown settings block '{other}'"),
+                            span: path.span,
+                            severity: Severity::Error,
+                        });
+                    }
+                }
+            }
+            StatementKind::BlockStmt { path, .. } => {
+                diagnostics.push(Diagnostic {
+                    message: format!(
+                        "unknown settings block '{}'",
+                        path.segments
+                            .iter()
+                            .map(|s| s.text.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".")
+                    ),
+                    span: path.span,
+                    severity: Severity::Error,
+                });
+            }
+            StatementKind::Invalid { .. } => {}
+            _ => {
+                diagnostics.push(Diagnostic {
+                    message: "unexpected statement in settings.ulb; expected 'project', 'module', 'repositories', or 'lspCompat'"
+                        .to_owned(),
+                    span: stmt.span,
+                    severity: Severity::Error,
+                });
+            }
+        }
+    }
+
+    SettingsOutcome {
+        model: SettingsModel {
+            project_name,
+            modules,
+            extra_repos,
+            lsp_compat,
+        },
+        diagnostics,
+    }
+}
+
+/// Extracts a plain string value from an expression that is a single-part
+/// string literal with no interpolation. Returns `None` when the expression
+/// is not a string or contains interpolation parts.
+fn extract_string(expr: &Expr) -> Option<String> {
+    if let ExprKind::Str(str_expr) = &expr.kind
+        && str_expr.parts.len() == 1
+        && let StrPart::Literal(s) = &str_expr.parts[0]
+    {
+        return Some(s.clone());
+    }
+    None
+}
+
+/// The resolved settings model produced by [`evaluate_settings`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsModel {
+    /// The project name from `project "Name"`. `None` when the declaration
+    /// is missing — the caller may choose to error or use a default.
+    pub project_name: Option<String>,
+    /// Module paths declared via `module "path"`, in declaration order.
+    pub modules: Vec<String>,
+    /// Extra Maven repository URLs declared inside `repositories { maven "..." }`,
+    /// in declaration order. Additive over the default Google Maven + Maven
+    /// Central repositories.
+    pub extra_repos: Vec<String>,
+    /// Whether `lspCompat true` was declared (defaults to `false`).
+    pub lsp_compat: bool,
+}
+
+/// The result of evaluating a `settings.ulb` file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsOutcome {
+    /// The resolved settings model.
+    pub model: SettingsModel,
+    /// Diagnostics raised during evaluation.
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 #[cfg(test)]
@@ -1958,6 +2212,221 @@ deps {
         assert_eq!(
             deps["implementation"],
             Value::Coordinate("androidx.core:core-ktx:1.16.0".to_owned())
+        );
+    }
+
+    #[test]
+    fn settings_full_example() {
+        let src = r#"
+            project "SampleApp"
+            module "app"
+            module "shared"
+            repositories {
+                maven "https://maven.pkg.jetbrains.space/public/p/compose/dev"
+            }
+            lspCompat true
+        "#;
+        let outcome = evaluate_settings(src);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        assert_eq!(outcome.model.project_name.as_deref(), Some("SampleApp"));
+        assert_eq!(outcome.model.modules, vec!["app", "shared"]);
+        assert_eq!(
+            outcome.model.extra_repos,
+            vec!["https://maven.pkg.jetbrains.space/public/p/compose/dev"]
+        );
+        assert!(outcome.model.lsp_compat);
+    }
+
+    #[test]
+    fn settings_minimal() {
+        let src = r#"
+            project "MyApp"
+            module "app"
+        "#;
+        let outcome = evaluate_settings(src);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        assert_eq!(outcome.model.project_name.as_deref(), Some("MyApp"));
+        assert_eq!(outcome.model.modules, vec!["app"]);
+        assert!(outcome.model.extra_repos.is_empty());
+        assert!(!outcome.model.lsp_compat);
+    }
+
+    #[test]
+    fn settings_empty_modules_list() {
+        let src = "project \"Empty\"";
+        let outcome = evaluate_settings(src);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        assert_eq!(outcome.model.project_name.as_deref(), Some("Empty"));
+        assert!(outcome.model.modules.is_empty());
+    }
+
+    #[test]
+    fn settings_duplicate_project_is_error() {
+        let src = r#"
+            project "A"
+            project "B"
+        "#;
+        let outcome = evaluate_settings(src);
+        assert_eq!(outcome.diagnostics.len(), 1);
+        assert!(
+            outcome.diagnostics[0]
+                .message
+                .contains("duplicate 'project'")
+        );
+    }
+
+    #[test]
+    fn settings_unknown_key_is_error() {
+        let src = r#"
+            project "X"
+            unknownKey "value"
+        "#;
+        let outcome = evaluate_settings(src);
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("unknown settings key 'unknownKey'"))
+        );
+    }
+
+    #[test]
+    fn settings_unknown_block_is_error() {
+        let src = r#"
+            project "X"
+            android { compileSdk 37 }
+        "#;
+        let outcome = evaluate_settings(src);
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("unknown settings block 'android'"))
+        );
+    }
+
+    #[test]
+    fn settings_multiple_repositories_maven_entries() {
+        let src = r#"
+            project "X"
+            module "app"
+            repositories {
+                maven "https://repo1.example.com/m2"
+                maven "https://repo2.example.com/m2"
+            }
+        "#;
+        let outcome = evaluate_settings(src);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        assert_eq!(outcome.model.extra_repos.len(), 2);
+        assert_eq!(outcome.model.extra_repos[0], "https://repo1.example.com/m2");
+        assert_eq!(outcome.model.extra_repos[1], "https://repo2.example.com/m2");
+    }
+
+    #[test]
+    fn settings_duplicate_repositories_block_is_error() {
+        let src = r#"
+            project "X"
+            repositories { maven "https://a.com" }
+            repositories { maven "https://b.com" }
+        "#;
+        let outcome = evaluate_settings(src);
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("duplicate 'repositories'"))
+        );
+    }
+
+    #[test]
+    fn settings_lsp_compat_default_false() {
+        let src = "project \"X\"";
+        let outcome = evaluate_settings(src);
+        assert!(outcome.diagnostics.is_empty());
+        assert!(!outcome.model.lsp_compat);
+    }
+
+    #[test]
+    fn project_ref_basic() {
+        let conventions = "";
+        let libs = "";
+        let build = r#"
+            deps {
+                implementation project(":shared")
+            }
+        "#;
+        let outcome = evaluate_project(conventions, libs, build);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        let Value::Block(top) = &outcome.model else {
+            panic!("expected Block");
+        };
+        let Value::Block(deps) = &top["deps"] else {
+            panic!("expected deps Block");
+        };
+        assert_eq!(
+            deps["implementation"],
+            Value::ProjectRef(":shared".to_owned())
+        );
+    }
+
+    #[test]
+    fn project_ref_in_list() {
+        let conventions = "";
+        let libs = "";
+        let build = r#"
+            deps {
+                implementation [ project(":shared"), "g:a:1" ]
+            }
+        "#;
+        let outcome = evaluate_project(conventions, libs, build);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        let Value::Block(top) = &outcome.model else {
+            panic!("expected Block");
+        };
+        let Value::Block(deps) = &top["deps"] else {
+            panic!("expected deps Block");
+        };
+        let Value::List(items) = &deps["implementation"] else {
+            panic!("expected List");
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], Value::ProjectRef(":shared".to_owned()));
+        assert_eq!(items[1], Value::Str("g:a:1".to_owned()));
+    }
+
+    #[test]
+    fn project_ref_missing_leading_colon_is_error() {
+        let conventions = "";
+        let libs = "";
+        let build = r#"
+            deps {
+                implementation project("shared")
+            }
+        "#;
+        let outcome = evaluate_project(conventions, libs, build);
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("must start with ':'"))
+        );
+    }
+
+    #[test]
+    fn project_ref_wrong_arity_is_error() {
+        let conventions = "";
+        let libs = "";
+        let build = r#"
+            deps {
+                implementation project()
+            }
+        "#;
+        let outcome = evaluate_project(conventions, libs, build);
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("exactly one argument"))
         );
     }
 }

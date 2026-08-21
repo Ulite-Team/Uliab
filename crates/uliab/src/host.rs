@@ -309,6 +309,7 @@ impl From<bindings::ulite::ulb::task_registrar::AllowlistedTool> for crate::task
             W::Jar => Self::Jar,
             W::Java => Self::Java,
             W::Aapt2 => Self::Aapt2,
+            W::Apksigner => Self::Apksigner,
         }
     }
 }

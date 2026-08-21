@@ -265,7 +265,7 @@ One per module (the `module` entries in `settings.ulb` locate them).
 | `buildTypes { ... }` | build types — plugin-owned (Appendix A) |
 | `productFlavors { ... }` | product flavors and dimensions — plugin-owned (Appendix A) |
 | `signing { ... }` | signing config — plugin-owned (Appendix A) |
-| `deps { ... }` | module dependencies |
+| `deps { ... }` | module dependencies (coordinates, aliases, or `project(":module")` refs) |
 | `<sourceSet>.deps { ... }` | source-set-scoped dependencies (§6.4) |
 | `task "name" { ... }` | custom task (§6.5) |
 | `if ... { } else { }` | top-level conditional configuration |
@@ -622,8 +622,13 @@ a scope name:
 | `testImplementation` | `test` compilation/runtime |
 | `androidTestImplementation` | `androidTest` compilation/runtime |
 
-Each takes a coordinate string, an alias reference, or a
-`"group:artifact" @ ref` versioned coordinate.
+Each takes a coordinate string, an alias reference, a
+`"group:artifact" @ ref` versioned coordinate, or a `project(":module")`
+call referencing another module declared in `settings.ulb` (§6.1). Project
+refs resolve to the target module's compiled output jar or APK and are
+added to the depending module's classpath; `api` and `implementation`
+inject into both compile and runtime, `runtimeOnly` into runtime only,
+`compileOnly` into compile only.
 
 ---
 
@@ -634,6 +639,7 @@ Each takes a coordinate string, an alias reference, or a
 | `env` | `env("NAME")` | string | missing variable → error |
 | `props` | `props("path")` / `props("path").key` | properties mapping / string | missing file or key → error |
 | `ver` | `ver(major=N, minor=N, patch=N)` | version value | missing/wrong-typed arg → error |
+| `project` | `project(":module")` | project-module reference | missing `:` prefix or unknown module → error |
 | `maven` | `maven "https://..."` (pair) | repository declaration | — |
 | `plugin` | `plugin "alias"` (pair) | plugin application | unknown alias → error |
 | `copy` | `copy(from="...", to="...")` | task action | only inside `run {}` |

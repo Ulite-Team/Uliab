@@ -135,7 +135,7 @@ pub struct BuildOptions {
 ///         "ulite/fixture": {
 ///             "versions": {
 ///                 "0.1.0": {
-///                     "abi": { "min": "0.4", "max": "0.5" },
+///                     "abi": { "min": "0.4", "max": "0.6" },
 ///                     "artifact_url": fixture.display().to_string(),
 ///                 }
 ///             }
@@ -162,9 +162,24 @@ pub fn build_project(dir: &Path, options: &BuildOptions) -> Result<BuildResult, 
     // module's derived build paths (which a plugin resolves against
     // `projectDir`) independent of the directory the tool was invoked from.
     let dir = canonical_project_dir(dir)?;
-    let conventions = read_source(&dir, "conventions.ulb", false)?;
-    let libs = read_source(&dir, "libs.ulb", true)?;
-    let build = read_source(&dir, "build.ulb", true)?;
+
+    // When a `settings.ulb` exists the project is multi-module: each
+    // declared module has its own `build.ulb`, and the project-wide
+    // `conventions.ulb`/`libs.ulb` are shared across them. The settings
+    // path is checked before reading any other file so a missing
+    // `settings.ulb` cleanly falls through to the single-module path.
+    if dir.join("settings.ulb").exists() {
+        return build_project_multi(&dir, options);
+    }
+
+    build_project_single(&dir, options)
+}
+
+/// Single-module build path: evaluates one `build.ulb` at the project root.
+fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResult, String> {
+    let conventions = read_source(dir, "conventions.ulb", false)?;
+    let libs = read_source(dir, "libs.ulb", true)?;
+    let build = read_source(dir, "build.ulb", true)?;
 
     let outcome = ulb_lang::eval::evaluate_project(&conventions, &libs, &build);
     if !outcome.diagnostics.is_empty() {
@@ -265,11 +280,11 @@ pub fn build_project(dir: &Path, options: &BuildOptions) -> Result<BuildResult, 
             serde_json::json!(sdk_root.display().to_string()),
         );
     }
-    let module_sdk_root = module_android_sdk_dir(&plugin_config, &dir);
+    let module_sdk_root = module_android_sdk_dir(&plugin_config, dir);
     let config_text = plugin_config.to_string();
     let config_hash = hex(&Sha256::digest(config_text.as_bytes()));
 
-    let libs = read_libs_plugins(&dir)?;
+    let libs = read_libs_plugins(dir)?;
     if libs.plugins.is_empty() {
         return Err(format!("{} declares no plugins", libs.libs_path.display()));
     }
@@ -304,7 +319,7 @@ pub fn build_project(dir: &Path, options: &BuildOptions) -> Result<BuildResult, 
             eprintln!("warning: {warning}");
         }
         let plugin_graph = host
-            .configure(&resolved.path, &resolved.name, &config_text, &dir)
+            .configure(&resolved.path, &resolved.name, &config_text, dir)
             .map_err(|error| format!("configuring {label}: {error}"))?;
         for task in plugin_graph.tasks() {
             graph
@@ -330,6 +345,250 @@ pub fn build_project(dir: &Path, options: &BuildOptions) -> Result<BuildResult, 
         AllowlistedTool::Jar,
         AllowlistedTool::Java,
         AllowlistedTool::Aapt2,
+        AllowlistedTool::Apksigner,
+    ]);
+    let result = executor
+        .execute(&graph, &ctx, &mut store)
+        .map_err(|error| format!("scheduling the build: {error}"))?;
+    store.save()?;
+    Ok(result)
+}
+
+/// Multi-module build path: evaluates each module's `build.ulb` declared in
+/// `settings.ulb`, sharing the project-wide `conventions.ulb`/`libs.ulb`.
+///
+/// Each module is built independently — its `build.ulb` is evaluated against
+/// the project-root conventions and libs, its `deps {}` is resolved, and
+/// every plugin declared in the project's `libs.ulb` is configured with that
+/// module's model. Task identities are prefixed with the module path
+/// (`<module>/<plugin>::<task>`) so two modules using the same plugin
+/// produce distinct tasks. All module graphs are merged into one build and
+/// executed together over a shared fingerprint store at the project root.
+///
+/// # Errors
+///
+/// Returns an error when `settings.ulb` cannot be read or evaluated, when a
+/// module directory does not exist, when a module's `build.ulb` is missing
+/// or fails to evaluate, when a plugin refuses a module's configuration, or
+/// when the merged task graph has cycles or unknown dependencies.
+fn build_project_multi(dir: &Path, options: &BuildOptions) -> Result<BuildResult, String> {
+    let settings = project::read_settings(dir)?
+        .expect("callers check settings.ulb exists before calling build_project_multi");
+
+    let conventions = read_source(dir, "conventions.ulb", false)?;
+    let libs_src = read_source(dir, "libs.ulb", true)?;
+
+    let libs_project = read_libs_plugins(dir)?;
+    if libs_project.plugins.is_empty() {
+        return Err(format!(
+            "{} declares no plugins",
+            libs_project.libs_path.display()
+        ));
+    }
+
+    let source = options
+        .registry
+        .clone()
+        .unwrap_or(RegistrySource::Url(DEFAULT_REGISTRY.to_owned()));
+    let registry = Registry::new(source, options.cache_dir.clone());
+    let sdk_root = checked_sdk_root(options.android_sdk.as_deref())?;
+
+    let repos = options
+        .repos
+        .clone()
+        .unwrap_or_else(|| vec![maven::MavenRepo::Google, maven::MavenRepo::Central]);
+
+    // ── Pass 1: evaluate every module and discover its output artifact. ──
+    // This must happen before dependency resolution so that cross-module
+    // `project(":shared")` refs can locate the target module's jar/apk.
+    struct EvaluatedModule {
+        rel: String,
+        dir: PathBuf,
+        model: Value,
+        output: Option<PathBuf>,
+    }
+    let mut modules: Vec<EvaluatedModule> = Vec::with_capacity(settings.module_dirs.len());
+    for module_dir in &settings.module_dirs {
+        let module_rel = module_dir
+            .strip_prefix(dir)
+            .unwrap_or(module_dir)
+            .to_string_lossy()
+            .into_owned();
+
+        if !module_dir.is_dir() {
+            return Err(format!(
+                "module directory '{}' does not exist (declared in settings.ulb as '{module_rel}')",
+                module_dir.display()
+            ));
+        }
+
+        let build = read_source(module_dir, "build.ulb", true)?;
+        let outcome = ulb_lang::eval::evaluate_project(&conventions, &libs_src, &build);
+        if !outcome.diagnostics.is_empty() {
+            let messages = outcome
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(format!(
+                "evaluating {}/build.ulb: {messages}",
+                module_dir.display()
+            ));
+        }
+
+        let output = discover_module_output(&outcome.model, module_dir);
+        modules.push(EvaluatedModule {
+            rel: module_rel,
+            dir: module_dir.clone(),
+            model: outcome.model,
+            output,
+        });
+    }
+
+    // Build the module-rel → output map for project-dep resolution.
+    let module_outputs: std::collections::HashMap<String, PathBuf> = modules
+        .iter()
+        .filter_map(|m| Some((m.rel.clone(), m.output.clone()?)))
+        .collect();
+
+    // ── Pass 2: resolve deps (Maven + project) and configure plugins. ──
+    let mut graph = TaskGraph::new();
+    let mut plugin_versions = Vec::new();
+    let mut config_hashes = Vec::new();
+
+    for m in &modules {
+        let model_json = module_model_to_json(&m.model)?;
+
+        // Resolve Maven deps (project refs are skipped by parse_deps_block).
+        let mut classpath = match &m.model {
+            Value::Block(entries) if entries.contains_key("deps") => {
+                let resolution = resolve_model_deps(&m.model, &repos, options.cache_dir.clone())?;
+                for note in &resolution.notes {
+                    eprintln!("note: [{}] {}", m.rel, note);
+                }
+                resolution.classpath
+            }
+            Value::Block(_) => maven::Classpath::default(),
+            other => {
+                return Err(format!(
+                    "the module model of {}/build.ulb is not a block (found {})",
+                    m.dir.display(),
+                    value_kind(other)
+                ));
+            }
+        };
+
+        // Resolve cross-module project deps and merge into classpath.
+        if let Value::Block(deps_entries) = &m.model
+            && let Some(deps_block) = deps_entries.get("deps")
+        {
+            let project_refs = maven::extract_project_deps(deps_block);
+            if !project_refs.is_empty() {
+                let project_cp = resolve_project_classpath(
+                    &project_refs,
+                    &module_outputs,
+                    &settings.model.modules,
+                )?;
+                classpath.compile.extend(project_cp.compile);
+                classpath.runtime.extend(project_cp.runtime);
+                classpath.test_compile.extend(project_cp.test_compile);
+                classpath.test_runtime.extend(project_cp.test_runtime);
+            }
+        }
+
+        let mut plugin_config = model_json;
+        let plugin_config_object = plugin_config
+            .as_object_mut()
+            .expect("the module model serialized to an object");
+        plugin_config_object.insert("classpath".to_owned(), classpath.to_json());
+
+        let source_sets =
+            resolve_source_set_classpaths(&m.model, &repos, options.cache_dir.clone())?;
+        if !source_sets.is_empty() {
+            let mut source_set_map = serde_json::Map::new();
+            for (path, source_set_classpath) in source_sets {
+                source_set_map.insert(path, source_set_classpath.to_json());
+            }
+            plugin_config_object.insert(
+                "classpathSourceSets".to_owned(),
+                serde_json::Value::Object(source_set_map),
+            );
+        }
+
+        plugin_config_object.insert(
+            "projectDir".to_owned(),
+            serde_json::json!(m.dir.display().to_string()),
+        );
+        plugin_config_object.insert("modulePath".to_owned(), serde_json::json!(m.rel));
+
+        if let Some(sdk_root) = &sdk_root {
+            plugin_config_object.insert(
+                "androidSdkDir".to_owned(),
+                serde_json::json!(sdk_root.display().to_string()),
+            );
+        }
+        let module_sdk_root = module_android_sdk_dir(&plugin_config, &m.dir);
+        let mut sdk_roots_extra = Vec::new();
+        if let Some(root) = &sdk_root {
+            sdk_roots_extra.push(root.clone());
+        }
+        if let Some(module_root) = module_sdk_root
+            && !sdk_roots_extra.contains(&module_root)
+        {
+            sdk_roots_extra.push(module_root);
+        }
+        let module_host = {
+            let base = PluginHost::new().map_err(|error| error.to_string())?;
+            sdk_roots_extra
+                .into_iter()
+                .fold(base, |h, root| h.with_android_sdk(root))
+        };
+
+        let config_text = plugin_config.to_string();
+        config_hashes.push(hex(&Sha256::digest(config_text.as_bytes())));
+
+        for spec in &libs_project.plugins {
+            let label = format!("{}/{}", m.rel, project::spec_label(spec));
+            let resolved = registry
+                .resolve(spec)
+                .map_err(|error| format!("{label}: {error}"))?;
+            if let Some(warning) = &resolved.warning {
+                eprintln!("warning: {label}: {warning}");
+            }
+
+            let module_prefixed_name = format!("{}/{}", m.rel, resolved.name);
+
+            let plugin_graph = module_host
+                .configure(&resolved.path, &module_prefixed_name, &config_text, &m.dir)
+                .map_err(|error| format!("configuring {label}: {error}"))?;
+            for task in plugin_graph.tasks() {
+                let t: crate::task::Task = task.clone();
+                graph
+                    .register(t)
+                    .map_err(|error| format!("merging tasks from {label}: {error}"))?;
+            }
+            plugin_versions.push(format!("{}/{}@{}", m.rel, resolved.name, resolved.version));
+        }
+    }
+
+    let ctx = FingerprintContext {
+        plugin_version: plugin_versions.join(","),
+        config_hash: config_hashes.join(","),
+    };
+    let store_path = dir.join(".uliab").join("state.json");
+    let mut store = FingerprintStore::load(&store_path)?;
+    let executor = Executor::new([
+        AllowlistedTool::Copy,
+        AllowlistedTool::Cat,
+        AllowlistedTool::Mkdir,
+        AllowlistedTool::Echo,
+        AllowlistedTool::Javac,
+        AllowlistedTool::Kotlinc,
+        AllowlistedTool::Jar,
+        AllowlistedTool::Java,
+        AllowlistedTool::Aapt2,
+        AllowlistedTool::Apksigner,
     ]);
     let result = executor
         .execute(&graph, &ctx, &mut store)
@@ -485,6 +744,14 @@ fn module_model_to_json(model: &Value) -> Result<serde_json::Value, String> {
             Ok(serde_json::Value::Object(object))
         }
         Value::Invalid(message) => Err(format!("cannot serialize an unresolved value: {message}")),
+        Value::ProjectRef(path) => {
+            let mut map = serde_json::Map::new();
+            map.insert(
+                "project".to_owned(),
+                serde_json::Value::String(path.clone()),
+            );
+            Ok(serde_json::Value::Object(map))
+        }
     }
 }
 
@@ -754,7 +1021,98 @@ fn value_kind(value: &Value) -> &'static str {
         Value::Coordinate(_) => "a coordinate",
         Value::Block(_) => "a block",
         Value::Invalid(_) => "an unresolved value",
+        Value::ProjectRef(_) => "a project reference",
     }
+}
+
+/// Resolves a relative path against a base directory.
+fn resolve_path(base: &Path, relative: &str) -> PathBuf {
+    let path = Path::new(relative);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
+}
+
+/// Discovers a module's primary output artifact from its evaluated model.
+///
+/// Scans well-known output keys owned by plugin families (`jvm.jarFile`,
+/// `android.apk`) and resolves them against the module directory. Returns
+/// `None` when no recognized output key is present — the module either
+/// produces no file artifact (a library consumed only via classpath) or
+/// its plugin type is not yet supported for cross-module deps.
+fn discover_module_output(model: &Value, module_dir: &Path) -> Option<PathBuf> {
+    let block = match model {
+        Value::Block(entries) => entries,
+        _ => return None,
+    };
+    // JVM plugin: `jvm { jarFile "..." }`.
+    if let Some(Value::Block(jvm)) = block.get("jvm")
+        && let Some(Value::Str(jar)) = jvm.get("jarFile")
+    {
+        return Some(resolve_path(module_dir, jar));
+    }
+    // Android plugin: `android { apk "..." }`.
+    if let Some(Value::Block(android)) = block.get("android")
+        && let Some(Value::Str(apk)) = android.get("apk")
+    {
+        return Some(resolve_path(module_dir, apk));
+    }
+    None
+}
+
+/// Builds a [`maven::Classpath`] from project-module references.
+///
+/// Each `(scope, module_path)` pair is resolved against `module_outputs`
+/// (a map from module relative path to output artifact). `implementation`
+/// and `api` refs inject into both compile and runtime; `runtimeOnly`
+/// injects into runtime only; `compileOnly` injects into compile only.
+///
+/// Returns an error when a referenced module path does not appear in
+/// `settings_modules` or has no discoverable output.
+fn resolve_project_classpath(
+    project_refs: &[(maven::MavenScope, String)],
+    module_outputs: &std::collections::HashMap<String, PathBuf>,
+    settings_modules: &[String],
+) -> Result<maven::Classpath, String> {
+    let mut classpath = maven::Classpath::default();
+    for (scope, module_path) in project_refs {
+        // Strip the leading ':' — settings modules are declared without it.
+        let module_name = module_path.strip_prefix(':').unwrap_or(module_path);
+        if !settings_modules.iter().any(|m| m == module_name) {
+            return Err(format!(
+                "project(\"{module_path}\"): module '{module_name}' is not declared in settings.ulb"
+            ));
+        }
+        let output = module_outputs.get(module_name).ok_or_else(|| {
+            format!(
+                "project(\"{module_path}\"): module '{module_name}' has no discoverable output \
+                 (expected jvm.jarFile or android.apk in its build.ulb)"
+            )
+        })?;
+        match scope {
+            maven::MavenScope::Api | maven::MavenScope::Implementation => {
+                classpath.compile.push(output.clone());
+                classpath.runtime.push(output.clone());
+            }
+            maven::MavenScope::RuntimeOnly => {
+                classpath.runtime.push(output.clone());
+            }
+            maven::MavenScope::CompileOnly => {
+                classpath.compile.push(output.clone());
+            }
+            maven::MavenScope::TestImplementation => {
+                classpath.test_compile.push(output.clone());
+                classpath.test_runtime.push(output.clone());
+            }
+            maven::MavenScope::Ksp | maven::MavenScope::AndroidTestImplementation => {
+                // KSP and androidTest are not project-dep targets in the
+                // initial implementation; silently skip.
+            }
+        }
+    }
+    Ok(classpath)
 }
 
 #[cfg(test)]
