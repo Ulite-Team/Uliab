@@ -659,8 +659,8 @@ Android logic).
 | 9 (done) | Multi-module `settings.ulb` | project name, module list, per-module build.ulb, extra repos |
 | 10 (done) | Module dependency syntax | `implementation project(":shared")` in deps {}, cross-module classpath |
 | 11 (done) | APK signing | release/debug keystores, signing {} block, v1/v2/v3 schemes |
-| 12 | Build variants | debug/release/flavor splits, per-variant task naming |
-| 13 | `uliab init` | scaffold new project from templates |
+| 12 (done) | Build variants | debug/release/flavor splits, per-variant task naming |
+| 13 (done) | `uliab init` | scaffold new project from templates |
 | 14 | KMP Android target | androidMain source set, plugin-to-plugin composition |
 
 Phases 2–6 are sequential (each depends on the previous); 7a/7b/7c are
@@ -668,9 +668,8 @@ independent core services and were built in parallel on top of 4. 8a
 landed before 8b/8c (both depend on it); 8b and 8c landed in parallel.
 Phase 9 (settings.ulb) landed after 8c. Phase 10 (module dependency
 syntax) landed after 9. Phase 11 (APK signing) landed after 10.
-Phases 12–14 are the remaining
-path to a production-ready build tool: 12 adds build-quality splits,
-13 improves developer experience, and 14 completes the KMP story.
+Phase 12 (build variants) landed after 11. Phase 13 (`uliab init`)
+landed after 12. Phase 14 completes the KMP story.
 
 ---
 
