@@ -631,7 +631,8 @@ call referencing another module declared in `settings.ulb` (§6.1). Project
 refs resolve to the target module's compiled output jar or APK and are
 added to the depending module's classpath; `api` and `implementation`
 inject into both compile and runtime, `runtimeOnly` into runtime only,
-`compileOnly` into compile only.
+`compileOnly` into compile only, and `testImplementation` into test
+compile and test runtime.
 
 ---
 
@@ -648,8 +649,9 @@ inject into both compile and runtime, `runtimeOnly` into runtime only,
 | `copy` | `copy(from="...", to="...")` | task action | only inside `run {}` |
 | `exec` | `exec(command="...", args=[...])` | task action | only inside `run {}`; command must be allowlisted |
 
-`env`, `props`, `ver` are usable in any expression position. `copy`/`exec`
-are usable only as statements inside a `task`'s `run {}` block.
+`env`, `props`, `ver`, `project` are usable in any expression position.
+`copy`/`exec` are usable only as statements inside a `task`'s `run {}`
+block.
 
 ---
 

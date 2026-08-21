@@ -748,14 +748,27 @@ fn resolve_tool(tool: AllowlistedTool, args: &[String]) -> Result<(String, &[Str
                 "tool 'apksigner' requires the build-tools directory as its first argument"
                     .to_owned()
             })?;
-            let binary = std::path::PathBuf::from(dir)
-                .join(format!("apksigner{}", std::env::consts::EXE_SUFFIX));
-            if !binary.exists() {
-                return Err(format!(
-                    "apksigner binary '{}' does not exist",
-                    binary.display()
-                ));
+            let base = std::path::PathBuf::from(dir);
+            let candidates: Vec<String> = if cfg!(windows) {
+                vec!["apksigner.bat".to_owned(), "apksigner.exe".to_owned()]
+            } else {
+                vec!["apksigner".to_owned()]
+            };
+            let mut found = None;
+            for name in &candidates {
+                let path = base.join(name);
+                if path.exists() {
+                    found = Some(path);
+                    break;
+                }
             }
+            let binary = found.ok_or_else(|| {
+                format!(
+                    "apksigner binary not found in '{}' (looked for {})",
+                    dir,
+                    candidates.join(", ")
+                )
+            })?;
             Ok((binary.display().to_string(), &args[1..]))
         }
         _ => Ok((tool.as_str().to_owned(), args)),

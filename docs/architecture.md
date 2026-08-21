@@ -16,9 +16,8 @@ the LSP, the `ulite/jvm` plugin (Java + Kotlin/JVM incl. KSP + JUnit),
 the `ulite/android` plugin (compile + full APK packaging chain), the
 `ulite/kmp` plugin (JVM target: commonMain + jvmMain → jar), and
 multi-module `settings.ulb` support are implemented and building. The
-plugin registry is live on GitHub. Remaining roadmap items: module
-dependency syntax, APK signing, build variants, `uliab init`,
-KMP Android/native targets.
+plugin registry is live on GitHub. Remaining roadmap items:
+`uliab init`, KMP Android/native targets.
 
 ---
 
@@ -493,7 +492,8 @@ in a second pass before configuring plugins. The resolver skips
 collects them for the host, and `resolve_project_classpath` maps them to
 jar paths on the classpath. The `api`/`implementation` distinction
 carries through: both inject the referenced module's jar into compile and
-runtime classpaths, while `runtimeOnly` injects into runtime only.
+runtime classpaths, `runtimeOnly` injects into runtime only, and
+`testImplementation` injects into the test compile and runtime classpaths.
 
 ### 6.2 `api` vs `implementation` classpath rules (core resolver, jvm-family-wide)
 
@@ -591,17 +591,18 @@ one repo produces a `PROGRESS.md` entry in the others; the
    b. Discover module output          (jvm.jarFile / android.apk) — multi only
 5. Resolve every entry of libs.ulb's `plugins {}` table against the registry
 6. Load each resolved plugin (cache hit, or fetch from the registry — §3.6)
-7. Each plugin's configure() validates its owned keys in the module model
-   and registers tasks into the core task engine (§3.2, §4)
-8. Resolve external Maven deps against repos → cache (§7) — core, shared
+7. Resolve external Maven deps against repos → cache (§7) — core, shared
    by every plugin active on the module. The module's top-level `deps {}`
    block resolves to the `classpath` configuration key; every nested
    `deps {}` block — `commonMain.deps`, `androidMain.deps`, or deeper such
    as `kmp.commonMain.deps` — resolves independently and is injected as
    `classpathSourceSets`, mapping each source-set path to its own classpath
    (§5.3). Both are part of the configuration hash (§10)
-9. Resolve `project(":mod")` refs against discovered outputs; merge the
+8. Resolve `project(":mod")` refs against discovered outputs; merge the
    referenced module's jar into the depending module's classpath (multi only)
+9. Each plugin's configure() validates its owned keys in the module model
+   (with resolved classpath) and registers tasks into the core task engine
+   (§3.2, §4)
 10. Derive the full task DAG (§4); fingerprint inputs; schedule waves
 11. Execute: each task's action runs via `run_tool`/`copy`/`write` (§3.5)
     inside a sandboxed working directory

@@ -968,7 +968,7 @@ impl<'a> Evaluator<'a> {
                 self.error(
                     span,
                     format!(
-                        "unknown function '{other}' in expression position (only env, props, ver are callable here)"
+                        "unknown function '{other}' in expression position (only env, props, ver, project are callable here)"
                     ),
                 );
                 Value::Invalid("unknown function".to_owned())
@@ -1383,7 +1383,15 @@ pub fn evaluate_settings(source: &str) -> SettingsOutcome {
                 }
                 "module" => {
                     if let Some(path) = extract_string(value) {
-                        modules.push(path);
+                        if modules.contains(&path) {
+                            diagnostics.push(Diagnostic {
+                                message: format!("duplicate module '{path}' in settings.ulb"),
+                                span: stmt.span,
+                                severity: Severity::Error,
+                            });
+                        } else {
+                            modules.push(path);
+                        }
                     } else {
                         diagnostics.push(Diagnostic {
                             message: "'module' requires a string value".to_owned(),
@@ -2427,6 +2435,76 @@ deps {
                 .diagnostics
                 .iter()
                 .any(|d| d.message.contains("exactly one argument"))
+        );
+    }
+
+    #[test]
+    fn settings_duplicate_module_is_error() {
+        let src = r#"
+            project "X"
+            module "app"
+            module "app"
+        "#;
+        let outcome = evaluate_settings(src);
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("duplicate module 'app'")),
+            "expected duplicate module error, got: {:?}",
+            outcome.diagnostics
+        );
+    }
+
+    #[test]
+    fn settings_module_non_string_is_error() {
+        let src = r#"
+            project "X"
+            module 42
+        "#;
+        let outcome = evaluate_settings(src);
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("'module' requires a string value")),
+            "expected non-string module error, got: {:?}",
+            outcome.diagnostics
+        );
+    }
+
+    #[test]
+    fn settings_lsp_compat_non_boolean_is_error() {
+        let src = r#"
+            project "X"
+            module "app"
+            lspCompat "yes"
+        "#;
+        let outcome = evaluate_settings(src);
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("'lspCompat' requires a boolean")),
+            "expected non-boolean lspCompat error, got: {:?}",
+            outcome.diagnostics
+        );
+    }
+
+    #[test]
+    fn settings_project_non_string_is_error() {
+        let src = r#"
+            project 42
+            module "app"
+        "#;
+        let outcome = evaluate_settings(src);
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("'project' requires a string value")),
+            "expected non-string project error, got: {:?}",
+            outcome.diagnostics
         );
     }
 }

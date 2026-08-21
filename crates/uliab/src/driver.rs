@@ -165,11 +165,11 @@ pub fn build_project(dir: &Path, options: &BuildOptions) -> Result<BuildResult, 
 
     // When a `settings.ulb` exists the project is multi-module: each
     // declared module has its own `build.ulb`, and the project-wide
-    // `conventions.ulb`/`libs.ulb` are shared across them. The settings
-    // path is checked before reading any other file so a missing
-    // `settings.ulb` cleanly falls through to the single-module path.
-    if dir.join("settings.ulb").exists() {
-        return build_project_multi(&dir, options);
+    // `conventions.ulb`/`libs.ulb` are shared across them. `read_settings`
+    // returns `Ok(None)` when the file does not exist, so a single read
+    // decides the build path without a redundant existence check.
+    if let Some(settings) = project::read_settings(&dir)? {
+        return build_project_multi(&dir, options, settings);
     }
 
     build_project_single(&dir, options)
@@ -371,10 +371,11 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
 /// module directory does not exist, when a module's `build.ulb` is missing
 /// or fails to evaluate, when a plugin refuses a module's configuration, or
 /// when the merged task graph has cycles or unknown dependencies.
-fn build_project_multi(dir: &Path, options: &BuildOptions) -> Result<BuildResult, String> {
-    let settings = project::read_settings(dir)?
-        .expect("callers check settings.ulb exists before calling build_project_multi");
-
+fn build_project_multi(
+    dir: &Path,
+    options: &BuildOptions,
+    settings: project::ProjectSettings,
+) -> Result<BuildResult, String> {
     let conventions = read_source(dir, "conventions.ulb", false)?;
     let libs_src = read_source(dir, "libs.ulb", true)?;
 
@@ -393,10 +394,13 @@ fn build_project_multi(dir: &Path, options: &BuildOptions) -> Result<BuildResult
     let registry = Registry::new(source, options.cache_dir.clone());
     let sdk_root = checked_sdk_root(options.android_sdk.as_deref())?;
 
-    let repos = options
+    let mut repos = options
         .repos
         .clone()
         .unwrap_or_else(|| vec![maven::MavenRepo::Google, maven::MavenRepo::Central]);
+    for url in settings.model.extra_repos.iter().rev() {
+        repos.insert(0, maven::MavenRepo::Custom(url.clone()));
+    }
 
     // ── Pass 1: evaluate every module and discover its output artifact. ──
     // This must happen before dependency resolution so that cross-module
@@ -408,13 +412,11 @@ fn build_project_multi(dir: &Path, options: &BuildOptions) -> Result<BuildResult
         output: Option<PathBuf>,
     }
     let mut modules: Vec<EvaluatedModule> = Vec::with_capacity(settings.module_dirs.len());
-    for module_dir in &settings.module_dirs {
-        let module_rel = module_dir
-            .strip_prefix(dir)
-            .unwrap_or(module_dir)
-            .to_string_lossy()
-            .into_owned();
-
+    for (module_dir, module_rel) in settings
+        .module_dirs
+        .iter()
+        .zip(settings.model.modules.iter())
+    {
         if !module_dir.is_dir() {
             return Err(format!(
                 "module directory '{}' does not exist (declared in settings.ulb as '{module_rel}')",
@@ -439,7 +441,7 @@ fn build_project_multi(dir: &Path, options: &BuildOptions) -> Result<BuildResult
 
         let output = discover_module_output(&outcome.model, module_dir);
         modules.push(EvaluatedModule {
-            rel: module_rel,
+            rel: module_rel.clone(),
             dir: module_dir.clone(),
             model: outcome.model,
             output,
@@ -1107,8 +1109,14 @@ fn resolve_project_classpath(
                 classpath.test_runtime.push(output.clone());
             }
             maven::MavenScope::Ksp | maven::MavenScope::AndroidTestImplementation => {
-                // KSP and androidTest are not project-dep targets in the
-                // initial implementation; silently skip.
+                eprintln!(
+                    "warning: project(\"{module_path}\"): {} scope is not supported for project dependencies; skipping",
+                    match scope {
+                        maven::MavenScope::Ksp => "ksp",
+                        maven::MavenScope::AndroidTestImplementation => "androidTestImplementation",
+                        _ => unreachable!(),
+                    }
+                );
             }
         }
     }
@@ -1340,5 +1348,129 @@ mod tests {
         );
         let error = resolve_source_set_classpaths(&model, &[], None).expect_err("malformed deps");
         assert!(error.contains("deps at 'commonMain'"), "{error}");
+    }
+
+    #[test]
+    fn discover_module_output_finds_jvm_jar() {
+        let model = Value::Block(
+            [(
+                "jvm".to_owned(),
+                Value::Block(
+                    [("jarFile".to_owned(), Value::Str("build/app.jar".to_owned()))]
+                        .into_iter()
+                        .collect(),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let output = discover_module_output(&model, Path::new("/project/app"));
+        assert_eq!(output, Some(PathBuf::from("/project/app/build/app.jar")));
+    }
+
+    #[test]
+    fn discover_module_output_finds_android_apk() {
+        let model = Value::Block(
+            [(
+                "android".to_owned(),
+                Value::Block(
+                    [("apk".to_owned(), Value::Str("build/app.apk".to_owned()))]
+                        .into_iter()
+                        .collect(),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let output = discover_module_output(&model, Path::new("/project/app"));
+        assert_eq!(output, Some(PathBuf::from("/project/app/build/app.apk")));
+    }
+
+    #[test]
+    fn discover_module_output_returns_none_for_unknown_plugin() {
+        let model = Value::Block(
+            [(
+                "web".to_owned(),
+                Value::Block(
+                    [("out".to_owned(), Value::Str("dist/index.html".to_owned()))]
+                        .into_iter()
+                        .collect(),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(discover_module_output(&model, Path::new("/project")), None);
+    }
+
+    #[test]
+    fn discover_module_output_returns_none_for_non_block() {
+        assert_eq!(
+            discover_module_output(&Value::Str("not a block".to_owned()), Path::new("/p")),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_project_classpath_implementation_injects_compile_and_runtime() {
+        let mut outputs = std::collections::HashMap::new();
+        outputs.insert(
+            "shared".to_owned(),
+            PathBuf::from("/project/shared/build/app.jar"),
+        );
+        let modules = vec!["shared".to_owned()];
+        let refs = vec![(maven::MavenScope::Implementation, ":shared".to_owned())];
+        let cp = resolve_project_classpath(&refs, &outputs, &modules).expect("resolves");
+        assert_eq!(cp.compile.len(), 1);
+        assert_eq!(cp.runtime.len(), 1);
+        assert_eq!(cp.test_compile.len(), 0);
+    }
+
+    #[test]
+    fn resolve_project_classpath_runtime_only_injects_runtime_only() {
+        let mut outputs = std::collections::HashMap::new();
+        outputs.insert(
+            "lib".to_owned(),
+            PathBuf::from("/project/lib/build/app.jar"),
+        );
+        let modules = vec!["lib".to_owned()];
+        let refs = vec![(maven::MavenScope::RuntimeOnly, ":lib".to_owned())];
+        let cp = resolve_project_classpath(&refs, &outputs, &modules).expect("resolves");
+        assert_eq!(cp.compile.len(), 0);
+        assert_eq!(cp.runtime.len(), 1);
+    }
+
+    #[test]
+    fn resolve_project_classpath_unknown_module_is_error() {
+        let outputs = std::collections::HashMap::new();
+        let modules = vec!["app".to_owned()];
+        let refs = vec![(maven::MavenScope::Implementation, ":missing".to_owned())];
+        let error = resolve_project_classpath(&refs, &outputs, &modules).expect_err("missing");
+        assert!(error.contains("not declared in settings"), "{error}");
+    }
+
+    #[test]
+    fn resolve_project_classpath_module_without_output_is_error() {
+        let outputs = std::collections::HashMap::new();
+        let modules = vec!["shared".to_owned()];
+        let refs = vec![(maven::MavenScope::Implementation, ":shared".to_owned())];
+        let error = resolve_project_classpath(&refs, &outputs, &modules).expect_err("no output");
+        assert!(error.contains("no discoverable output"), "{error}");
+    }
+
+    #[test]
+    fn resolve_project_classpath_test_impl_injects_test_buckets() {
+        let mut outputs = std::collections::HashMap::new();
+        outputs.insert(
+            "testlib".to_owned(),
+            PathBuf::from("/project/testlib/build/app.jar"),
+        );
+        let modules = vec!["testlib".to_owned()];
+        let refs = vec![(maven::MavenScope::TestImplementation, ":testlib".to_owned())];
+        let cp = resolve_project_classpath(&refs, &outputs, &modules).expect("resolves");
+        assert_eq!(cp.compile.len(), 0);
+        assert_eq!(cp.runtime.len(), 0);
+        assert_eq!(cp.test_compile.len(), 1);
+        assert_eq!(cp.test_runtime.len(), 1);
     }
 }

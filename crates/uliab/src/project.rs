@@ -200,12 +200,18 @@ pub fn read_settings(dir: &Path) -> Result<Option<ProjectSettings>, String> {
         ));
     }
 
-    let module_dirs = outcome
-        .model
-        .modules
-        .iter()
-        .map(|path| dir.join(path))
-        .collect();
+    let mut module_dirs = Vec::with_capacity(outcome.model.modules.len());
+    for path in &outcome.model.modules {
+        if std::path::Path::new(path).is_absolute() {
+            return Err(format!(
+                "module '{path}' must be a relative path (no leading '/')"
+            ));
+        }
+        if path.contains("..") {
+            return Err(format!("module '{path}' must not contain '..' segments"));
+        }
+        module_dirs.push(dir.join(path));
+    }
 
     Ok(Some(ProjectSettings {
         model: outcome.model,
