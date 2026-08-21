@@ -592,7 +592,10 @@ Named blocks (`debug`, `release`, or custom). Keys:
 | `versionNameSuffix` | string | appended to `versionName` |
 | `minSdk` | number | flavor-specific floor |
 
-The variant matrix is the cartesian product of build types × flavors; a
+> **Precedence.** When a flavor carries `minSdk`, it overrides the base
+> `android.minSdk` for that variant. When absent, the base value applies.
+
+The variant matrix is the cartesian product of build types x flavors; a
 variant is *valid* only if it contains exactly one flavor per dimension
 (see architecture.md §4).
 

@@ -443,16 +443,20 @@ host's `java` tool, and a `jar` packaging step. The host's `write` action
 
 Cross-plugin composition is designed on paper only: no plugin-to-plugin
 dependency mechanism exists in the ABI today. What exists so far is the
-compile slice (`ulb-plugins/android-plugin`, `docs/android-plugin.md`):
-an `android {}` block with `compileSdk`, `sources`, `classesDir`, and an
-optional `sdkDir`, toolchain discovery of the platform jar and the
-highest `build-tools` release carrying `aapt2`/`d8` (both the resolved
-root and a module-declared `sdkDir` are preopened read-only, §3.2), a
-`compile` task that runs javac against the platform jar, and APK signing
-via `apksigner` when the module's `signing {}` block is present (passwords
-written to temp files and passed via `--ks-pass file:`/`--key-pass file:`).
-The variant matrix, manifest merging, and additional packaging features
-remain future slices of the same plugin.
+compile and variant slice (`ulb-plugins/android-plugin`,
+`docs/android-plugin.md`): an `android {}` block with `compileSdk`,
+`sources`, `namespace`, manifest, and resource directory; toolchain
+discovery of the platform jar and the highest `build-tools` release
+carrying `aapt2`/`d8` (both the resolved root and a module-declared
+`sdkDir` are preopened read-only, §3.2); the variant matrix (build types
+x product flavors, or the default `[debug, release]` pair) with
+per-variant `linkResources`/`compile`/`d8`/`package`/`sign` tasks;
+flavor-level `minSdk` override and `applicationIdSuffix` passed via
+`--rename-manifest-package` to `aapt2 link`; APK signing via `apksigner`
+when the module's `signing {}` block is present (passwords written to
+temp files and passed via `--ks-pass file:`/`--key-pass file:`).
+Manifest merging and additional packaging features remain future slices
+of the same plugin.
 
 ### 5.3 `ulite/kmp` — depends on `ulite/jvm`, optionally `ulite/android`
 
