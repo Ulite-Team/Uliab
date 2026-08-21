@@ -25,6 +25,7 @@ impl exports::ulite::ulb::ulb_plugin::Guest for Legacy {
             // the host's current ABI even though it predates `configure`.
             abi_version: ulb_plugin_sdk::ABI_VERSION.to_owned(),
             tools: Vec::new(),
+            dependencies: Vec::new(),
         }
     }
 

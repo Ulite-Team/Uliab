@@ -14,7 +14,7 @@
 //! is target-agnostic — it schedules and runs actions but never inspects a
 //! module model, so the same executor drives every toolchain plugin.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -262,6 +262,11 @@ impl TaskGraph {
         self.order.iter().map(|key| &self.tasks[key])
     }
 
+    /// Iterates tasks mutably in registration order.
+    pub fn tasks_mut(&mut self) -> impl Iterator<Item = &mut Task> {
+        self.tasks.values_mut()
+    }
+
     /// Partitions the graph into waves (ARCHITECTURE.md §4.2): every task
     /// lands in the wave one greater than the longest dependency chain
     /// feeding it, so tasks in the same wave are mutually independent and
@@ -327,6 +332,48 @@ impl TaskGraph {
         };
         depths.insert(key.to_owned(), depth);
         Ok(depth)
+    }
+
+    /// Resolves cross-plugin dependency references in `depends_on` entries.
+    ///
+    /// A cross-plugin dep uses the format `"plugin_name:task_name"` (single
+    /// colon). The `plugin_task_names` mapping tells which task names each
+    /// plugin registered. After resolution, every `"plugin:task"` entry is
+    /// replaced with the bare `task_name` — since all tasks in the graph
+    /// share the same module, `waves()` resolves the bare name correctly.
+    ///
+    /// Returns an error when a cross-plugin dep references a plugin that
+    /// has no matching task name in the graph.
+    pub fn resolve_cross_plugin_deps(
+        &mut self,
+        plugin_task_names: &HashMap<String, HashSet<String>>,
+    ) -> Result<(), GraphError> {
+        for key in self.order.clone() {
+            if let Some(task) = self.tasks.get_mut(&key) {
+                for dep in &mut task.depends_on {
+                    if let Some(colon_pos) = dep.find(':') {
+                        let plugin_name = &dep[..colon_pos];
+                        let task_name = &dep[colon_pos + 1..];
+                        if let Some(tasks) = plugin_task_names.get(plugin_name) {
+                            if tasks.contains(task_name) {
+                                *dep = task_name.to_owned();
+                            } else {
+                                return Err(GraphError::UnknownDependency {
+                                    task: key,
+                                    dep: dep.clone(),
+                                });
+                            }
+                        } else {
+                            return Err(GraphError::UnknownDependency {
+                                task: key,
+                                dep: dep.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 

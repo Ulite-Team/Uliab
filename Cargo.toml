@@ -5,6 +5,7 @@ members = [
     "crates/ulb-plugin-sdk",
     "crates/ulb-plugin-fixture",
     "crates/ulb-plugin-legacy-fixture",
+    "crates/ulb-plugin-cross-dep-fixture",
     "crates/uliab",
 ]
 

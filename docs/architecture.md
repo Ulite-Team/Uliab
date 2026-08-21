@@ -17,7 +17,7 @@ the `ulite/android` plugin (compile + full APK packaging chain), the
 `ulite/kmp` plugin (JVM target: commonMain + jvmMain → jar), and
 multi-module `settings.ulb` support are implemented and building. The
 plugin registry is live on GitHub. Remaining roadmap items:
-`uliab init`, KMP Android/native targets.
+`uliab init`, KMP Android target (plugin-to-plugin composition landed).
 
 ---
 
@@ -661,7 +661,7 @@ Android logic).
 | 11 (done) | APK signing | release/debug keystores, signing {} block, v1/v2/v3 schemes |
 | 12 (done) | Build variants | debug/release/flavor splits, per-variant task naming |
 | 13 (done) | `uliab init` | scaffold new project from templates |
-| 14 | KMP Android target | androidMain source set, plugin-to-plugin composition |
+| 14 | KMP Android target | plugin-to-plugin ABI composition (dependencies + cross-plugin dep resolution) |
 
 Phases 2–6 are sequential (each depends on the previous); 7a/7b/7c are
 independent core services and were built in parallel on top of 4. 8a
@@ -681,8 +681,6 @@ sources, general Android compat, remote cache, publishing, LSP rename/
 find-all-references/advanced semantic tokens.
 
 New from this redesign, explicitly not designed yet:
-- Plugin-to-plugin dependency / cross-plugin composition in the ABI
-  (§5.2 — needed for KMP Android target, not designed yet).
 - `ulb-lsp` loading plugin manifests for plugin-owned diagnostics (§8).
 - Non-JVM KMP native targets (iOS, desktop) — deferred until cross-
   compilation toolchain integration is designed.
