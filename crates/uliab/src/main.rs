@@ -35,6 +35,7 @@ use uliab::driver::{
     resolve_project_source_sets,
 };
 use uliab::host::PluginHost;
+use uliab::init::{self, ProjectType};
 use uliab::maven::{self, MavenRepo};
 use uliab::project::{self, read_libs_plugins};
 use uliab::registry::{Registry, RegistrySource};
@@ -42,12 +43,14 @@ use uliab::registry::{Registry, RegistrySource};
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("init") => cmd_init(&args[1..]),
         Some("run") => cmd_run(&args[1..]),
         Some("plugins") => cmd_plugins(&args[1..]),
         Some("build") => cmd_build(&args[1..]),
         Some("deps") => cmd_deps(&args[1..]),
         _ => {
-            eprintln!("usage: uliab <run|plugins|build|deps> …");
+            eprintln!("usage: uliab <init|run|plugins|build|deps> …");
+            eprintln!("  uliab init [NAME] [--type TYPE] [--dir DIR]");
             eprintln!("  uliab run <plugin.wasm> [input]");
             eprintln!("  uliab plugins list [--project DIR]");
             eprintln!(
@@ -58,6 +61,69 @@ fn main() -> ExitCode {
             );
             eprintln!("  uliab deps resolve [--project DIR] [--cache-dir DIR] [--repo REPO]");
             ExitCode::from(2)
+        }
+    }
+}
+
+fn cmd_init(args: &[String]) -> ExitCode {
+    let mut name: Option<String> = None;
+    let mut project_type = "jvm";
+    let mut dir: Option<PathBuf> = None;
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--type" => {
+                if let Some(value) = iter.next() {
+                    project_type = value;
+                }
+            }
+            "--dir" => {
+                if let Some(value) = iter.next() {
+                    dir = Some(PathBuf::from(value));
+                }
+            }
+            other if name.is_none() && !other.starts_with('-') => {
+                name = Some(other.to_owned());
+            }
+            other => {
+                eprintln!("error: unknown argument '{other}'");
+                eprintln!("usage: uliab init [NAME] [--type TYPE] [--dir DIR]");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let ptype = match ProjectType::parse(project_type) {
+        Ok(ptype) => ptype,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let target = dir.unwrap_or_else(|| PathBuf::from("."));
+    let module_dir = "app";
+
+    match init::scaffold(&target, ptype, module_dir, "") {
+        Ok(created) => {
+            println!(
+                "scaffolded {} project in {}",
+                match ptype {
+                    ProjectType::Jvm => "JVM",
+                    ProjectType::Android => "Android",
+                    ProjectType::Kmp => "KMP",
+                },
+                target.display()
+            );
+            for path in &created {
+                println!("  {}", path.display());
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
         }
     }
 }
