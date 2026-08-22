@@ -320,17 +320,23 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
         let resolved = registry
             .resolve(spec)
             .map_err(|error| format!("{label}: {error}"))?;
+        if plugin_tasks.contains_key(&resolved.name) {
+            return Err(format!(
+                "plugin '{}' is declared more than once in {}",
+                resolved.name,
+                libs.libs_path.display()
+            ));
+        }
         if let Some(warning) = &resolved.warning {
             eprintln!("warning: {warning}");
         }
         let result = host
             .configure(&resolved.path, &resolved.name, &config_text, dir)
             .map_err(|error| format!("configuring {label}: {error}"))?;
-        let task_names: HashSet<String> = result.graph.tasks().map(|t| t.name.clone()).collect();
-        plugin_tasks.insert(resolved.name.clone(), task_names);
-        // Validate that every cross-plugin reference in this plugin's
-        // tasks names a plugin listed in its declared `dependencies`.
+        // Single pass: validate undeclared cross-plugin refs, collect task
+        // names, and register every task into the merged graph.
         let deps_set: HashSet<&str> = result.dependencies.iter().map(|s| s.as_str()).collect();
+        let mut task_names = HashSet::new();
         for task in result.graph.tasks() {
             for dep in &task.depends_on {
                 if let Some((provider, task_name)) = split_cross_plugin_ref(dep)
@@ -342,13 +348,13 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
                     ));
                 }
             }
-        }
-        declared_deps.push((resolved.name.clone(), result.dependencies));
-        for task in result.graph.tasks() {
+            task_names.insert(task.name.clone());
             graph
                 .register(task.clone())
                 .map_err(|error| format!("merging tasks from {label}: {error}"))?;
         }
+        plugin_tasks.insert(resolved.name.clone(), task_names);
+        declared_deps.push((resolved.name.clone(), result.dependencies));
         plugin_versions.push(format!("{}@{}", resolved.name, resolved.version));
     }
 
@@ -589,11 +595,18 @@ fn build_project_multi(
         let config_text = plugin_config.to_string();
         config_hashes.push(hex(&Sha256::digest(config_text.as_bytes())));
 
+        let mut seen_in_module: HashSet<String> = HashSet::new();
         for spec in &libs_project.plugins {
             let label = format!("{}/{}", m.rel, project::spec_label(spec));
             let resolved = registry
                 .resolve(spec)
                 .map_err(|error| format!("{label}: {error}"))?;
+            if !seen_in_module.insert(resolved.name.clone()) {
+                return Err(format!(
+                    "plugin '{}' is declared more than once in libs.ulb",
+                    resolved.name
+                ));
+            }
             if let Some(warning) = &resolved.warning {
                 eprintln!("warning: {label}: {warning}");
             }
@@ -603,17 +616,10 @@ fn build_project_multi(
             let result = module_host
                 .configure(&resolved.path, &module_prefixed_name, &config_text, &m.dir)
                 .map_err(|error| format!("configuring {label}: {error}"))?;
-            let task_names: HashSet<String> =
-                result.graph.tasks().map(|t| t.name.clone()).collect();
-            // Union task names across modules so the cross-plugin resolution
-            // index covers every registered task.
-            all_plugin_tasks
-                .entry(resolved.name.clone())
-                .or_default()
-                .extend(task_names);
-            // Validate that every cross-plugin reference in this plugin's
-            // tasks names a plugin listed in its declared `dependencies`.
+            // Single pass: validate undeclared cross-plugin refs, collect
+            // task names, and register every task into the merged graph.
             let deps_set: HashSet<&str> = result.dependencies.iter().map(|s| s.as_str()).collect();
+            let mut task_names = HashSet::new();
             for task in result.graph.tasks() {
                 for dep in &task.depends_on {
                     if let Some((provider, task_name)) = split_cross_plugin_ref(dep)
@@ -625,14 +631,18 @@ fn build_project_multi(
                         ));
                     }
                 }
-            }
-            all_declared_deps.push((resolved.name.clone(), result.dependencies));
-            for task in result.graph.tasks() {
-                let t: crate::task::Task = task.clone();
+                task_names.insert(task.name.clone());
                 graph
-                    .register(t)
+                    .register(task.clone())
                     .map_err(|error| format!("merging tasks from {label}: {error}"))?;
             }
+            // Union task names across modules so the cross-plugin resolution
+            // index covers every registered task.
+            all_plugin_tasks
+                .entry(resolved.name.clone())
+                .or_default()
+                .extend(task_names);
+            all_declared_deps.push((resolved.name.clone(), result.dependencies));
             plugin_versions.push(format!("{}/{}@{}", m.rel, resolved.name, resolved.version));
         }
     }

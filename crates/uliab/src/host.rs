@@ -21,7 +21,9 @@ use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Cache, CacheConfig, Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView, p2};
 
-use crate::task::{AllowlistedTool, Task as BuildTask, TaskAction, TaskGraph};
+use crate::task::{
+    AllowlistedTool, Task as BuildTask, TaskAction, TaskGraph, split_cross_plugin_ref,
+};
 
 /// Generated host bindings for the `ulb-plugin` world.
 ///
@@ -645,17 +647,31 @@ impl PluginHost {
         // plugin's graph.  Cross-plugin references (identified by a
         // single-colon format like "plugin:task") point at tasks from other
         // plugins that have not been registered yet, so we strip them from
-        // a clone before validation.  The original graph (with cross-plugin
-        // refs intact) is returned to the driver, which resolves them after
-        // merging all plugin graphs.
-        let mut validation_graph = state.graph.clone();
-        validation_graph.strip_cross_plugin_refs();
-        validation_graph.waves().map_err(|error| {
-            HostError::Call(format!(
-                "plugin '{}' registered an invalid task graph: {error}",
-                manifest.name
-            ))
-        })?;
+        // a clone before validation when they are present.  The original
+        // graph (with cross-plugin refs intact) is returned to the driver,
+        // which resolves them after merging all plugin graphs.
+        let has_cross_refs = state.graph.tasks().any(|t| {
+            t.depends_on
+                .iter()
+                .any(|d| split_cross_plugin_ref(d).is_some())
+        });
+        if has_cross_refs {
+            let mut validation_graph = state.graph.clone();
+            validation_graph.strip_cross_plugin_refs();
+            validation_graph.waves().map_err(|error| {
+                HostError::Call(format!(
+                    "plugin '{}' registered an invalid task graph: {error}",
+                    manifest.name
+                ))
+            })?;
+        } else {
+            state.graph.waves().map_err(|error| {
+                HostError::Call(format!(
+                    "plugin '{}' registered an invalid task graph: {error}",
+                    manifest.name
+                ))
+            })?;
+        }
         Ok(ConfigureResult {
             graph: state.graph,
             dependencies,

@@ -372,3 +372,28 @@ fn an_explicit_sdk_override_that_does_not_exist_fails_the_build() {
     assert!(error.contains(&missing.display().to_string()), "{error}");
     assert!(error.contains("must name an existing directory"), "{error}");
 }
+
+#[test]
+fn duplicate_plugin_declaration_is_rejected() {
+    let fixture = build_fixture("ulb-plugin-fixture");
+    let project = TestProject::new("dup-plugin", &fixture);
+    project.write(
+        "build.ulb",
+        &format!(
+            "source = {:?}\noutput = {:?}\n",
+            project.dir.join("in.txt").display().to_string(),
+            project.dir.join("out.txt").display().to_string(),
+        ),
+    );
+    // Same plugin listed twice in libs.ulb.
+    project.write(
+        "libs.ulb",
+        "plugins {\n  fixture = \"ulite/fixture\" @ \"0.1.0\"\n  dup = \"ulite/fixture\" @ \"0.1.0\"\n}\n",
+    );
+
+    let error = build_project(&project.dir, &project.options()).expect_err("duplicate plugin");
+    assert!(
+        error.contains("declared more than once"),
+        "expected 'declared more than once', got: {error}"
+    );
+}

@@ -285,7 +285,8 @@ impl TaskGraph {
     /// stripping references that reference tasks from other plugins (which
     /// have not been registered yet at per-plugin validation time).
     pub fn strip_cross_plugin_refs(&mut self) {
-        for key in &self.order.clone() {
+        let keys: Vec<String> = self.order.to_vec();
+        for key in &keys {
             if let Some(task) = self.tasks.get_mut(key) {
                 task.depends_on
                     .retain(|dep| split_cross_plugin_ref(dep).is_none());
