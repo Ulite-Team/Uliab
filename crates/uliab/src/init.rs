@@ -102,6 +102,7 @@ fn generate_android(module_dir: &str, namespace: &str) -> ProjectFiles {
     let main_activity = format!("{module_dir}/src/main/java/{pkg_path}/MainActivity.java");
     let manifest = format!("{module_dir}/src/main/AndroidManifest.xml");
     let res_values = format!("{module_dir}/src/main/res/values/strings.xml");
+    let layout_main = format!("{module_dir}/src/main/res/layout/activity_main.xml");
 
     ProjectFiles {
         settings: format!(
@@ -139,7 +140,7 @@ android {{
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="{namespace}">
     <application android:label="@string/app_name">
-        <activity android:name=".{pkg_path}.MainActivity"
+        <activity android:name=".MainActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -155,6 +156,20 @@ android {{
                 res_values,
                 "<resources>\n    <string name=\"app_name\">MyApp</string>\n</resources>\n"
                     .to_string(),
+            ),
+            (
+                layout_main,
+                concat!(
+                    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n",
+                    "<LinearLayout xmlns:android=\"http://schemas.android.com/apk/res/android\"\n",
+                    "    android:layout_width=\"match_parent\"\n",
+                    "    android:layout_height=\"match_parent\">\n",
+                    "    <TextView\n",
+                    "        android:layout_width=\"wrap_content\"\n",
+                    "        android:layout_height=\"wrap_content\" />\n",
+                    "</LinearLayout>\n",
+                )
+                .to_string(),
             ),
             (
                 main_activity,
@@ -408,6 +423,7 @@ mod tests {
         assert!(paths.iter().any(|p| p.contains("AndroidManifest.xml")));
         assert!(paths.iter().any(|p| p.contains("strings.xml")));
         assert!(paths.iter().any(|p| p.contains("MainActivity.java")));
+        assert!(paths.iter().any(|p| p.contains("activity_main.xml")));
     }
 
     #[test]
@@ -433,6 +449,38 @@ mod tests {
         assert_eq!(files.scaffold_files.len(), 1);
         assert!(files.scaffold_files[0].0.ends_with("Main.kt"));
         assert!(files.scaffold_files[0].1.contains("fun main()"));
+    }
+
+    #[test]
+    fn android_template_activity_name_is_short_form() {
+        let files = generate(ProjectType::Android, "app", "com.example.test");
+        let manifest = &files
+            .scaffold_files
+            .iter()
+            .find(|(p, _)| p.contains("AndroidManifest.xml"))
+            .unwrap()
+            .1;
+        assert!(
+            manifest.contains("android:name=\".MainActivity\""),
+            "manifest should use short-form activity name, got: {manifest}"
+        );
+        assert!(
+            !manifest.contains("android:name=\".com/"),
+            "manifest must not contain forward slashes in activity name"
+        );
+    }
+
+    #[test]
+    fn android_template_layout_file_exists() {
+        let files = generate(ProjectType::Android, "app", "com.example.test");
+        let layout = &files
+            .scaffold_files
+            .iter()
+            .find(|(p, _)| p.contains("activity_main.xml"))
+            .unwrap()
+            .1;
+        assert!(layout.contains("LinearLayout"));
+        assert!(layout.contains("match_parent"));
     }
 
     #[test]

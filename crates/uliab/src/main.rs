@@ -111,7 +111,18 @@ fn cmd_init(args: &[String]) -> ExitCode {
     let target = dir.unwrap_or_else(|| PathBuf::from("."));
     let module_dir = "app";
 
-    match init::scaffold(&target, ptype, module_dir, &namespace.unwrap_or_default()) {
+    let ns = match ptype {
+        init::ProjectType::Android => match &namespace {
+            Some(ns) if !ns.is_empty() => ns.as_str(),
+            _ => {
+                eprintln!("error: --namespace is required for Android projects");
+                return ExitCode::from(2);
+            }
+        },
+        _ => namespace.as_deref().unwrap_or(""),
+    };
+
+    match init::scaffold(&target, ptype, module_dir, ns) {
         Ok(created) => {
             println!(
                 "scaffolded {} project in {}",
