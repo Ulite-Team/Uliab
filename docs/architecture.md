@@ -14,10 +14,11 @@ architectural decision in the project so far — §3 explains why and how.
 task engine, Maven resolver, registry client), the tree-sitter grammar,
 the LSP, the `ulite/jvm` plugin (Java + Kotlin/JVM incl. KSP + JUnit),
 the `ulite/android` plugin (compile + full APK packaging chain), the
-`ulite/kmp` plugin (JVM target: commonMain + jvmMain → jar), and
+`ulite/kmp` plugin (JVM + Android targets: commonMain + jvmMain → jar,
+commonMain + androidMain → per-variant merged dex into APK), and
 multi-module `settings.ulb` support are implemented and building. The
-plugin registry is live on GitHub. Remaining roadmap items:
-`uliab init`, KMP Android target (plugin-to-plugin composition landed).
+plugin registry is live on GitHub. Remaining roadmap item:
+`uliab init`.
 
 ---
 
@@ -473,7 +474,15 @@ of the same plugin.
   whatever future plugins own those toolchains (not designed yet —
   explicitly out of scope this pass, same as the old document's stance).
 
-Not started.
+The Android target is implemented: `compileAndroid<Variant>` compiles
+`commonMain` + `androidMain` kotlin, `jarKmpAndroid<Variant>` jars the
+output, `mergeDex<Variant>` re-runs d8 over both android's and kmp's
+classes jars, and `assembleAndroid<Variant>` grafts the merged dex into
+the APK. The kmp plugin declares `dependencies: ["ulite/android"]` and
+references android packaging tasks via cross-plugin composition
+(`ulite/android:jarClasses<Variant>`, `ulite/android:packageApk<Variant>`
+or `ulite/android:signApk<Variant>`). Variant discovery mirrors the
+android plugin's `compute_variants` logic.
 
 ---
 
