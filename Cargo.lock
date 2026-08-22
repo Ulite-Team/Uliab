@@ -1640,6 +1640,15 @@ name = "ulb-lang"
 version = "0.1.0"
 
 [[package]]
+name = "ulb-plugin-cross-dep-fixture"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "ulb-plugin-sdk",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "ulb-plugin-fixture"
 version = "0.1.0"
 dependencies = [

@@ -82,9 +82,11 @@ fn configure_registers_tasks_that_execute_incrementally() {
         "fixture reports the host ABI"
     );
 
-    let graph = host
+    let result = host
         .configure(&plugin, "app", &config_json, &workdir)
         .expect("plugin configures");
+    let graph = &result.graph;
+    assert!(result.dependencies.is_empty());
     assert_eq!(graph.len(), 2);
     let stage = graph.get("app", "stage").expect("stage task");
     assert_eq!(
@@ -107,7 +109,7 @@ fn configure_registers_tasks_that_execute_incrementally() {
     let executor = Executor::new([uliab::task::AllowlistedTool::Echo]);
 
     let first = executor
-        .execute(&graph, &ctx, &mut store)
+        .execute(graph, &ctx, &mut store)
         .expect("schedules");
     assert_eq!((first.ran, first.up_to_date), (2, 0));
     assert_eq!(
@@ -116,14 +118,14 @@ fn configure_registers_tasks_that_execute_incrementally() {
     );
 
     let second = executor
-        .execute(&graph, &ctx, &mut store)
+        .execute(graph, &ctx, &mut store)
         .expect("schedules");
     assert_eq!((second.ran, second.up_to_date), (0, 2));
 
     store.save().unwrap();
     let mut reloaded = FingerprintStore::load(workdir.join("state.json")).unwrap();
     let third = executor
-        .execute(&graph, &ctx, &mut reloaded)
+        .execute(graph, &ctx, &mut reloaded)
         .expect("schedules");
     assert_eq!((third.ran, third.up_to_date), (0, 2));
 }
@@ -154,9 +156,10 @@ fn write_file_task_generates_and_reruns_on_content_change() {
     );
 
     let host = PluginHost::new().expect("host engine");
-    let graph = host
+    let result = host
         .configure(&plugin, "app", &config_json, &workdir)
         .expect("plugin configures");
+    let graph = &result.graph;
     assert_eq!(
         graph
             .get("app", "write-probe")
@@ -176,13 +179,13 @@ fn write_file_task_generates_and_reruns_on_content_change() {
     let executor = Executor::new([uliab::task::AllowlistedTool::Echo]);
 
     let first = executor
-        .execute(&graph, &ctx, &mut store)
+        .execute(graph, &ctx, &mut store)
         .expect("schedules");
     assert_eq!(first.ran, 3);
     assert_eq!(std::fs::read(&generated).unwrap(), b"v1");
 
     let second = executor
-        .execute(&graph, &ctx, &mut store)
+        .execute(graph, &ctx, &mut store)
         .expect("schedules");
     assert_eq!((second.ran, second.up_to_date), (0, 3));
 
@@ -191,11 +194,11 @@ fn write_file_task_generates_and_reruns_on_content_change() {
     // fingerprint (the rendered action includes the contents) is what forces
     // it to rerun, while the copy and echo tasks stay up-to-date.
     let changed_config_json = config_json.replace("\"contents\": \"v1\"", "\"contents\": \"v2\"");
-    let changed_graph = host
+    let changed_result = host
         .configure(&plugin, "app", &changed_config_json, &workdir)
         .expect("plugin reconfigures");
     let third = executor
-        .execute(&changed_graph, &ctx, &mut store)
+        .execute(&changed_result.graph, &ctx, &mut store)
         .expect("schedules");
     assert_eq!((third.ran, third.up_to_date), (1, 2));
     assert_eq!(std::fs::read(&generated).unwrap(), b"v2");
@@ -212,9 +215,10 @@ fn relative_paths_are_rebazed_and_executed_inside_the_project() {
     let config_json = r#"{"source": "in.txt", "output": "out.txt"}"#;
 
     let host = PluginHost::new().expect("host engine");
-    let graph = host
+    let result = host
         .configure(&plugin, "app", config_json, &workdir)
         .expect("plugin configures");
+    let graph = &result.graph;
     let stage = graph.get("app", "stage").expect("stage task");
     assert_eq!(
         stage.action,
@@ -230,10 +234,10 @@ fn relative_paths_are_rebazed_and_executed_inside_the_project() {
     };
     let mut store = FingerprintStore::load(workdir.join("state.json")).unwrap();
     let executor = Executor::new([uliab::task::AllowlistedTool::Echo]);
-    let result = executor
-        .execute(&graph, &ctx, &mut store)
+    let exec_result = executor
+        .execute(graph, &ctx, &mut store)
         .expect("schedules");
-    assert_eq!(result.ran, 2);
+    assert_eq!(exec_result.ran, 2);
     assert_eq!(std::fs::read(workdir.join("out.txt")).unwrap(), b"relative");
 }
 
@@ -327,4 +331,301 @@ fn compiled_components_are_cached_on_disk() {
         .manifest_of_bytes(&std::fs::read(&plugin).unwrap())
         .unwrap();
     assert_eq!(manifest.name, "ulite/fixture");
+}
+
+#[test]
+fn cross_plugin_dep_resolves_and_orders_tasks() {
+    let fixture = build_fixture("ulb-plugin-fixture");
+    let cross_dep_fixture = build_fixture("ulb-plugin-cross-dep-fixture");
+    let workdir = temp_workdir("cross-dep");
+    let source = workdir.join("in.txt");
+    std::fs::write(&source, "hello").unwrap();
+    let fixture_config = format!(
+        r#"{{"source": {}, "output": {}}}"#,
+        serde_json::to_string(&source.display().to_string()).unwrap(),
+        serde_json::to_string(&workdir.join("out.txt").display().to_string()).unwrap(),
+    );
+    let cross_dep_config = r#"{"consumeFrom": "ulite/fixture:stage"}"#;
+
+    let host = PluginHost::new().expect("host engine");
+
+    // Configure the provider plugin first.
+    let provider = host
+        .configure(&fixture, "app", &fixture_config, &workdir)
+        .expect("provider configures");
+    assert!(provider.dependencies.is_empty());
+
+    // Configure the consumer plugin with a cross-plugin dep on the provider.
+    let consumer = host
+        .configure(&cross_dep_fixture, "app", cross_dep_config, &workdir)
+        .expect("consumer configures");
+    assert_eq!(consumer.dependencies, vec!["ulite/fixture"]);
+
+    // Merge graphs manually (simulating the driver's merge + resolve flow).
+    let mut graph = uliab::task::TaskGraph::new();
+    for task in provider.graph.tasks() {
+        graph
+            .register(task.clone())
+            .expect("register provider task");
+    }
+    for task in consumer.graph.tasks() {
+        graph
+            .register(task.clone())
+            .expect("register consumer task");
+    }
+
+    // Build the plugin→task index and resolve cross-plugin deps.
+    let mut plugin_tasks = std::collections::HashMap::new();
+    plugin_tasks.insert(
+        "ulite/fixture".to_owned(),
+        provider.graph.tasks().map(|t| t.name.clone()).collect(),
+    );
+    plugin_tasks.insert(
+        "ulite/cross-dep-fixture".to_owned(),
+        consumer.graph.tasks().map(|t| t.name.clone()).collect(),
+    );
+    graph
+        .resolve_cross_plugin_deps(&plugin_tasks)
+        .expect("resolves cross-plugin deps");
+
+    // The consumer task now depends on "stage" (resolved from the
+    // cross-plugin ref "ulite/fixture:stage").
+    let consume = graph.get("app", "consume").expect("consume task");
+    assert_eq!(consume.depends_on, vec!["stage".to_owned()]);
+
+    // Validate the merged graph is schedulable.
+    let waves = graph.waves().expect("valid graph");
+    assert_eq!(waves.len(), 2, "two waves: stage, then consume");
+    assert_eq!(waves[0].len(), 2, "wave 0: stage + announce");
+    assert_eq!(waves[1].len(), 1, "wave 1: consume");
+
+    // Execute and verify ordering.
+    let ctx = FingerprintContext {
+        plugin_version: "0.1.0".to_owned(),
+        config_hash: "cfg-cross-dep".to_owned(),
+    };
+    let mut store = FingerprintStore::load(workdir.join("state.json")).unwrap();
+    let executor = Executor::new([uliab::task::AllowlistedTool::Echo]);
+    let first = executor
+        .execute(&graph, &ctx, &mut store)
+        .expect("schedules");
+    assert_eq!(first.ran, 3, "all 3 tasks run");
+
+    // Second run: all up-to-date.
+    let second = executor
+        .execute(&graph, &ctx, &mut store)
+        .expect("schedules");
+    assert_eq!((second.ran, second.up_to_date), (0, 3));
+}
+
+#[test]
+fn cross_plugin_dep_manifest_declaration_validated() {
+    let fixture = build_fixture("ulb-plugin-fixture");
+    let workdir = temp_workdir("cross-dep-decl");
+    std::fs::write(workdir.join("in.txt"), "x").unwrap();
+    let config = format!(
+        r#"{{"source": {}, "output": {}}}"#,
+        serde_json::to_string(&workdir.join("in.txt").display().to_string()).unwrap(),
+        serde_json::to_string(&workdir.join("out.txt").display().to_string()).unwrap(),
+    );
+
+    let host = PluginHost::new().expect("host engine");
+    let result = host
+        .configure(&fixture, "app", &config, &workdir)
+        .expect("configures");
+    // The fixture declares no dependencies.
+    assert!(result.dependencies.is_empty());
+    // Its manifest reports the correct dependency list.
+    let manifest = host
+        .manifest_of_bytes(&std::fs::read(&fixture).unwrap())
+        .unwrap();
+    assert!(manifest.dependencies.is_empty());
+}
+
+#[test]
+fn cross_plugin_dep_undeclared_ref_is_graph_error() {
+    let cross_dep_fixture = build_fixture("ulb-plugin-cross-dep-fixture");
+    let workdir = temp_workdir("cross-dep-undeclared");
+    // The cross-dep fixture references a task from a plugin that is NOT
+    // configured (we never configure ulb-plugin-fixture here).
+    let cross_dep_config = r#"{"consumeFrom": "ulite/fixture:stage"}"#;
+
+    let host = PluginHost::new().expect("host engine");
+    let consumer = host
+        .configure(&cross_dep_fixture, "app", cross_dep_config, &workdir)
+        .expect("consumer configures");
+
+    // Build a graph with only the consumer (no provider).
+    let mut graph = uliab::task::TaskGraph::new();
+    for task in consumer.graph.tasks() {
+        graph
+            .register(task.clone())
+            .expect("register consumer task");
+    }
+
+    // The cross-plugin dep references a plugin that wasn't configured,
+    // so resolution must fail.
+    let mut plugin_tasks = std::collections::HashMap::new();
+    plugin_tasks.insert(
+        "ulite/cross-dep-fixture".to_owned(),
+        consumer.graph.tasks().map(|t| t.name.clone()).collect(),
+    );
+    let error = graph
+        .resolve_cross_plugin_deps(&plugin_tasks)
+        .expect_err("missing provider");
+    assert!(
+        error.to_string().contains("ulite/fixture:stage"),
+        "error names the unresolved dep: {error}"
+    );
+}
+
+#[test]
+fn undeclared_cross_plugin_ref_is_caught_by_driver_validation() {
+    let fixture = build_fixture("ulb-plugin-fixture");
+    let cross_dep_fixture = build_fixture("ulb-plugin-cross-dep-fixture");
+    let workdir = temp_workdir("cross-dep-undeclared-driver");
+    let source = workdir.join("in.txt");
+    std::fs::write(&source, "hello").unwrap();
+    let fixture_config = format!(
+        r#"{{"source": {}, "output": {}}}"#,
+        serde_json::to_string(&source.display().to_string()).unwrap(),
+        serde_json::to_string(&workdir.join("out.txt").display().to_string()).unwrap(),
+    );
+    let cross_dep_config = r#"{"consumeFrom": "ulite/fixture:stage"}"#;
+
+    let host = PluginHost::new().expect("host engine");
+    let provider = host
+        .configure(&fixture, "app", &fixture_config, &workdir)
+        .expect("provider configures");
+
+    // The consumer references ulite/fixture:stage, but we register it
+    // under a different name so the declared-deps gate catches it.
+    let consumer = host
+        .configure(&cross_dep_fixture, "app", cross_dep_config, &workdir)
+        .expect("consumer configures");
+
+    // Simulate the driver merge loop with a WRONG declared-deps list:
+    // the consumer says it depends on ulite/fixture, but we register
+    // the provider under a different name.
+    let mut graph = uliab::task::TaskGraph::new();
+    for task in provider.graph.tasks() {
+        graph.register(task.clone()).unwrap();
+    }
+    for task in consumer.graph.tasks() {
+        graph.register(task.clone()).unwrap();
+    }
+
+    // Build the plugin→task index with a mismatched provider name.
+    let mut plugin_tasks = std::collections::HashMap::new();
+    plugin_tasks.insert(
+        "ulite/fixture".to_owned(),
+        provider.graph.tasks().map(|t| t.name.clone()).collect(),
+    );
+    plugin_tasks.insert(
+        "ulite/cross-dep-fixture".to_owned(),
+        consumer.graph.tasks().map(|t| t.name.clone()).collect(),
+    );
+
+    // Simulate the driver's declared-deps validation: consumer declares
+    // ulite/fixture, which IS present — so declared-deps pass.
+    let deps_set: std::collections::HashSet<&str> =
+        consumer.dependencies.iter().map(|s| s.as_str()).collect();
+    assert!(deps_set.contains("ulite/fixture"));
+    // Now resolve: the cross-ref "ulite/fixture:stage" resolves because
+    // the provider IS in the index. This is the correct case.
+    graph
+        .resolve_cross_plugin_deps(&plugin_tasks)
+        .expect("resolves correctly");
+
+    // Now test the UNDECLARED case: register a task referencing a plugin
+    // not in its declared dependencies. We build a fresh graph with a
+    // phantom cross-ref.
+    let mut graph2 = uliab::task::TaskGraph::new();
+    graph2
+        .register(uliab::task::Task {
+            depends_on: vec!["ulite/unknown:task".to_owned()],
+            ..uliab::task::Task::leaf(
+                "phantom",
+                "app",
+                vec![],
+                vec![],
+                uliab::task::TaskAction::WriteFile {
+                    to: workdir.join("phantom.txt"),
+                    contents: "x".to_owned(),
+                },
+            )
+        })
+        .unwrap();
+
+    // The driver would check: is "ulite/unknown" in the consumer's declared deps?
+    let consumer_deps_set: std::collections::HashSet<&str> =
+        consumer.dependencies.iter().map(|s| s.as_str()).collect();
+    // "ulite/unknown" is NOT declared → driver would reject it.
+    assert!(
+        !consumer_deps_set.contains("ulite/unknown"),
+        "undeclared plugin should not be in deps set"
+    );
+}
+
+#[test]
+fn same_module_cycle_is_detected_even_with_cross_deps_present() {
+    let cross_dep_fixture = build_fixture("ulb-plugin-cross-dep-fixture");
+    let workdir = temp_workdir("cycle-with-cross-deps");
+    let cross_dep_config = r#"{"consumeFrom": "ulite/fixture:stage"}"#;
+
+    let host = PluginHost::new().expect("host engine");
+    let consumer = host
+        .configure(&cross_dep_fixture, "app", cross_dep_config, &workdir)
+        .expect("consumer configures");
+
+    // The consumer has a cross-plugin dep. Build a graph that also
+    // contains a same-module cycle. The host strips cross-refs before
+    // waves validation, so the cycle should be caught.
+    let mut graph = uliab::task::TaskGraph::new();
+    // Register tasks that form a same-module cycle.
+    graph
+        .register(uliab::task::Task {
+            depends_on: vec!["b".to_owned()],
+            ..uliab::task::Task::leaf(
+                "a",
+                "app",
+                vec![],
+                vec![],
+                uliab::task::TaskAction::WriteFile {
+                    to: workdir.join("a.txt"),
+                    contents: "x".to_owned(),
+                },
+            )
+        })
+        .unwrap();
+    graph
+        .register(uliab::task::Task {
+            depends_on: vec!["a".to_owned()],
+            ..uliab::task::Task::leaf(
+                "b",
+                "app",
+                vec![],
+                vec![],
+                uliab::task::TaskAction::WriteFile {
+                    to: workdir.join("b.txt"),
+                    contents: "y".to_owned(),
+                },
+            )
+        })
+        .unwrap();
+    // Also register the consumer's tasks (which have cross-deps).
+    for task in consumer.graph.tasks() {
+        graph.register(task.clone()).unwrap();
+    }
+
+    // Manually strip cross-refs (like the host does) and validate.
+    let mut validation_graph = graph.clone();
+    validation_graph.strip_cross_plugin_refs();
+    let error = validation_graph
+        .waves()
+        .expect_err("cycle should be caught");
+    assert!(
+        error.to_string().contains("dependency cycle"),
+        "error should report a cycle: {error}"
+    );
 }

@@ -58,6 +58,7 @@ impl exports::ulite::ulb::ulb_plugin::Guest for Fixture {
             version: "0.1.0".to_owned(),
             abi_version: ulb_plugin_sdk::ABI_VERSION.to_owned(),
             tools: vec!["echo".to_owned(), "mkdir".to_owned()],
+            dependencies: Vec::new(),
         }
     }
 

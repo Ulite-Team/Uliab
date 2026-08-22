@@ -192,6 +192,12 @@ impl RegistrarState {
     /// task is stored, so validation and execution agree no matter which
     /// directory the build is invoked from.
     fn register(&mut self, task: bindings::ulite::ulb::task_registrar::Task) -> Result<(), String> {
+        if task.name.contains(':') {
+            return Err(format!(
+                "task name '{}' contains a colon, which is reserved for cross-plugin dependency references",
+                task.name
+            ));
+        }
         if let bindings::ulite::ulb::task_registrar::Action::RunTool(args) = &task.action {
             let tool = AllowlistedTool::from(args.tool);
             if !self.declared_tools.contains(&tool) {
@@ -405,6 +411,21 @@ pub struct PluginManifest {
     /// (ARCHITECTURE.md §3.5); the registrar refuses a `run-tool` action
     /// whose tool is not declared here.
     pub tools: Vec<String>,
+    /// Plugin names this plugin requires at configure time. The host
+    /// validates that every declared dependency is present in the build;
+    /// a missing dependency is a configure-time error.
+    pub dependencies: Vec<String>,
+}
+
+/// The result of configuring a plugin: its task graph plus the list of
+/// plugin names it declares as dependencies.
+#[derive(Debug)]
+pub struct ConfigureResult {
+    /// The task graph the plugin registered during `configure`.
+    pub graph: TaskGraph,
+    /// Plugin names this plugin requires at configure time, declared in
+    /// its manifest `dependencies` field.
+    pub dependencies: Vec<String>,
 }
 
 impl PluginHost {
@@ -521,6 +542,11 @@ impl PluginHost {
     /// `project_dir`), and the assembled graph is validated once more for
     /// undefined dependencies and cycles before it is returned.
     ///
+    /// The returned [`ConfigureResult`] also carries the plugin's declared
+    /// `dependencies` list, which the driver uses to validate that all
+    /// required plugins are present and to resolve cross-plugin dependency
+    /// references at graph-merge time.
+    ///
     /// # Errors
     ///
     /// Returns [`HostError::Load`] for any failure reading or
@@ -566,7 +592,7 @@ impl PluginHost {
     /// );
     ///
     /// let host = PluginHost::new().expect("engine");
-    /// let graph = host
+    /// let result = host
     ///     .configure(&fixture, "app", &config, &workdir)
     ///     .expect("plugin configures");
     /// let ctx = FingerprintContext {
@@ -575,7 +601,7 @@ impl PluginHost {
     /// };
     /// let mut store = FingerprintStore::load(workdir.join("state.json")).unwrap();
     /// let result = Executor::new([uliab::task::AllowlistedTool::Echo])
-    ///     .execute(&graph, &ctx, &mut store)
+    ///     .execute(&result.graph, &ctx, &mut store)
     ///     .expect("schedules");
     /// assert_eq!(result.ran, 2);
     /// assert_eq!(std::fs::read(workdir.join("out.txt")).unwrap(), b"hello");
@@ -586,11 +612,12 @@ impl PluginHost {
         module: &str,
         config_json: &str,
         project_dir: &Path,
-    ) -> Result<TaskGraph, HostError> {
+    ) -> Result<ConfigureResult, HostError> {
         let mut plugin = self.load_full(path)?;
         let manifest = plugin.manifest()?;
         self.check_abi(&manifest)?;
         let declared_tools = parse_declared_tools(&manifest)?;
+        let dependencies = manifest.dependencies.clone();
         plugin.store.data_mut().registrar = Some(RegistrarState {
             graph: TaskGraph::new(),
             module: module.to_owned(),
@@ -614,16 +641,25 @@ impl PluginHost {
         let state = plugin.store.data_mut().registrar.take().ok_or_else(|| {
             HostError::Call("plugin configured without a task registrar".to_owned())
         })?;
-        // Validate the graph as a whole — the per-task checks during
-        // registration cannot catch a dependency on a task that is never
-        // registered, or a cycle.
-        state.graph.waves().map_err(|error| {
+        // Validate same-module dependencies and detect cycles within this
+        // plugin's graph.  Cross-plugin references (identified by a
+        // single-colon format like "plugin:task") point at tasks from other
+        // plugins that have not been registered yet, so we strip them from
+        // a clone before validation.  The original graph (with cross-plugin
+        // refs intact) is returned to the driver, which resolves them after
+        // merging all plugin graphs.
+        let mut validation_graph = state.graph.clone();
+        validation_graph.strip_cross_plugin_refs();
+        validation_graph.waves().map_err(|error| {
             HostError::Call(format!(
                 "plugin '{}' registered an invalid task graph: {error}",
                 manifest.name
             ))
         })?;
-        Ok(state.graph)
+        Ok(ConfigureResult {
+            graph: state.graph,
+            dependencies,
+        })
     }
 
     /// Reads and instantiates the component in `path` against the full
@@ -804,6 +840,7 @@ impl LoadedPlugin {
             version: manifest.version,
             abi_version: manifest.abi_version,
             tools: manifest.tools,
+            dependencies: manifest.dependencies,
         })
     }
 }
@@ -830,6 +867,7 @@ impl LoadedLegacyPlugin {
             version: manifest.version,
             abi_version: manifest.abi_version,
             tools: manifest.tools,
+            dependencies: manifest.dependencies,
         })
     }
 

@@ -27,7 +27,10 @@ use crate::project::{self, read_libs_plugins};
 use crate::registry::{Registry, RegistrySource};
 use crate::task::{
     AllowlistedTool, BuildResult, Executor, FingerprintContext, FingerprintStore, TaskGraph,
+    split_cross_plugin_ref,
 };
+
+use std::collections::{HashMap, HashSet};
 
 /// The registry index consulted when [`BuildOptions`] does not name one.
 pub const DEFAULT_REGISTRY: &str =
@@ -135,7 +138,7 @@ pub struct BuildOptions {
 ///         "ulite/fixture": {
 ///             "versions": {
 ///                 "0.1.0": {
-///                     "abi": { "min": "0.4", "max": "0.6" },
+///                     "abi": { "min": "0.4", "max": "0.7" },
 ///                     "artifact_url": fixture.display().to_string(),
 ///                 }
 ///             }
@@ -310,6 +313,8 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
 
     let mut graph = TaskGraph::new();
     let mut plugin_versions = Vec::new();
+    let mut plugin_tasks: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut declared_deps: Vec<(String, Vec<String>)> = Vec::new();
     for spec in &libs.plugins {
         let label = project::spec_label(spec);
         let resolved = registry
@@ -318,16 +323,48 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
         if let Some(warning) = &resolved.warning {
             eprintln!("warning: {warning}");
         }
-        let plugin_graph = host
+        let result = host
             .configure(&resolved.path, &resolved.name, &config_text, dir)
             .map_err(|error| format!("configuring {label}: {error}"))?;
-        for task in plugin_graph.tasks() {
+        let task_names: HashSet<String> = result.graph.tasks().map(|t| t.name.clone()).collect();
+        plugin_tasks.insert(resolved.name.clone(), task_names);
+        // Validate that every cross-plugin reference in this plugin's
+        // tasks names a plugin listed in its declared `dependencies`.
+        let deps_set: HashSet<&str> = result.dependencies.iter().map(|s| s.as_str()).collect();
+        for task in result.graph.tasks() {
+            for dep in &task.depends_on {
+                if let Some((provider, task_name)) = split_cross_plugin_ref(dep)
+                    && !deps_set.contains(provider)
+                {
+                    return Err(format!(
+                        "plugin '{}' references '{}:{}' in task '{}' but does not declare '{}' in its dependencies",
+                        resolved.name, provider, task_name, task.name, provider
+                    ));
+                }
+            }
+        }
+        declared_deps.push((resolved.name.clone(), result.dependencies));
+        for task in result.graph.tasks() {
             graph
                 .register(task.clone())
                 .map_err(|error| format!("merging tasks from {label}: {error}"))?;
         }
         plugin_versions.push(format!("{}@{}", resolved.name, resolved.version));
     }
+
+    // Validate declared dependencies and resolve cross-plugin dep references.
+    for (plugin_name, deps) in &declared_deps {
+        for dep in deps {
+            if !plugin_tasks.contains_key(dep) {
+                return Err(format!(
+                    "plugin '{plugin_name}' declares dependency '{dep}', which is not present in the build"
+                ));
+            }
+        }
+    }
+    graph
+        .resolve_cross_plugin_deps(&plugin_tasks)
+        .map_err(|error| format!("resolving cross-plugin dependencies: {error}"))?;
 
     let ctx = FingerprintContext {
         plugin_version: plugin_versions.join(","),
@@ -458,6 +495,8 @@ fn build_project_multi(
     let mut graph = TaskGraph::new();
     let mut plugin_versions = Vec::new();
     let mut config_hashes = Vec::new();
+    let mut all_plugin_tasks: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut all_declared_deps: Vec<(String, Vec<String>)> = Vec::new();
 
     for m in &modules {
         let model_json = module_model_to_json(&m.model)?;
@@ -561,10 +600,34 @@ fn build_project_multi(
 
             let module_prefixed_name = format!("{}/{}", m.rel, resolved.name);
 
-            let plugin_graph = module_host
+            let result = module_host
                 .configure(&resolved.path, &module_prefixed_name, &config_text, &m.dir)
                 .map_err(|error| format!("configuring {label}: {error}"))?;
-            for task in plugin_graph.tasks() {
+            let task_names: HashSet<String> =
+                result.graph.tasks().map(|t| t.name.clone()).collect();
+            // Union task names across modules so the cross-plugin resolution
+            // index covers every registered task.
+            all_plugin_tasks
+                .entry(resolved.name.clone())
+                .or_default()
+                .extend(task_names);
+            // Validate that every cross-plugin reference in this plugin's
+            // tasks names a plugin listed in its declared `dependencies`.
+            let deps_set: HashSet<&str> = result.dependencies.iter().map(|s| s.as_str()).collect();
+            for task in result.graph.tasks() {
+                for dep in &task.depends_on {
+                    if let Some((provider, task_name)) = split_cross_plugin_ref(dep)
+                        && !deps_set.contains(provider)
+                    {
+                        return Err(format!(
+                            "plugin '{}' references '{}:{}' in task '{}' but does not declare '{}' in its dependencies",
+                            resolved.name, provider, task_name, task.name, provider
+                        ));
+                    }
+                }
+            }
+            all_declared_deps.push((resolved.name.clone(), result.dependencies));
+            for task in result.graph.tasks() {
                 let t: crate::task::Task = task.clone();
                 graph
                     .register(t)
@@ -573,6 +636,20 @@ fn build_project_multi(
             plugin_versions.push(format!("{}/{}@{}", m.rel, resolved.name, resolved.version));
         }
     }
+
+    // Validate declared dependencies and resolve cross-plugin dep references.
+    for (plugin_name, deps) in &all_declared_deps {
+        for dep in deps {
+            if !all_plugin_tasks.contains_key(dep) {
+                return Err(format!(
+                    "plugin '{plugin_name}' declares dependency '{dep}', which is not present in the build"
+                ));
+            }
+        }
+    }
+    graph
+        .resolve_cross_plugin_deps(&all_plugin_tasks)
+        .map_err(|error| format!("resolving cross-plugin dependencies: {error}"))?;
 
     let ctx = FingerprintContext {
         plugin_version: plugin_versions.join(","),

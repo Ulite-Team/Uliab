@@ -14,7 +14,7 @@
 //! is target-agnostic — it schedules and runs actions but never inspects a
 //! module model, so the same executor drives every toolchain plugin.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -169,6 +169,23 @@ impl Task {
     }
 }
 
+/// Splits a dependency string into `(plugin_name, task_name)` when it
+/// uses the cross-plugin format `"plugin_name:task_name"` (single colon).
+///
+/// Task names and plugin names are not allowed to contain colons; this
+/// ensures unambiguous parsing. Returns `None` for bare same-module
+/// dependency references.
+#[must_use]
+pub fn split_cross_plugin_ref(dep: &str) -> Option<(&str, &str)> {
+    let colon_pos = dep.find(':')?;
+    let plugin_name = &dep[..colon_pos];
+    let task_name = &dep[colon_pos + 1..];
+    if plugin_name.is_empty() || task_name.is_empty() {
+        return None;
+    }
+    Some((plugin_name, task_name))
+}
+
 /// A graph-level problem that prevents a build from being scheduled
 /// (§4.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,6 +279,20 @@ impl TaskGraph {
         self.order.iter().map(|key| &self.tasks[key])
     }
 
+    /// Removes cross-plugin dependency references (`"plugin:task"` format)
+    /// from every task's `depends_on` list, leaving same-module bare names
+    /// intact. Used by the host to validate a plugin's own graph after
+    /// stripping references that reference tasks from other plugins (which
+    /// have not been registered yet at per-plugin validation time).
+    pub fn strip_cross_plugin_refs(&mut self) {
+        for key in &self.order.clone() {
+            if let Some(task) = self.tasks.get_mut(key) {
+                task.depends_on
+                    .retain(|dep| split_cross_plugin_ref(dep).is_none());
+            }
+        }
+    }
+
     /// Partitions the graph into waves (ARCHITECTURE.md §4.2): every task
     /// lands in the wave one greater than the longest dependency chain
     /// feeding it, so tasks in the same wave are mutually independent and
@@ -327,6 +358,45 @@ impl TaskGraph {
         };
         depths.insert(key.to_owned(), depth);
         Ok(depth)
+    }
+
+    /// Resolves cross-plugin dependency references in `depends_on` entries.
+    ///
+    /// A cross-plugin dep uses the format `"plugin_name:task_name"` (single
+    /// colon). The `plugin_task_names` mapping tells which task names each
+    /// plugin registered. After resolution, every `"plugin:task"` entry is
+    /// replaced with the bare `task_name` — since all tasks in the graph
+    /// share the same module, `waves()` resolves the bare name correctly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a cross-plugin dep references a plugin or
+    /// task name that has no matching entry in the graph.
+    pub fn resolve_cross_plugin_deps(
+        &mut self,
+        plugin_task_names: &HashMap<String, HashSet<String>>,
+    ) -> Result<(), GraphError> {
+        let keys: Vec<String> = self.order.to_vec();
+        for key in &keys {
+            if let Some(task) = self.tasks.get_mut(key) {
+                for dep in &mut task.depends_on {
+                    if let Some((plugin_name, task_name)) = split_cross_plugin_ref(dep) {
+                        match plugin_task_names.get(plugin_name) {
+                            Some(tasks) if tasks.contains(task_name) => {
+                                *dep = task_name.to_owned();
+                            }
+                            _ => {
+                                return Err(GraphError::UnknownDependency {
+                                    task: key.clone(),
+                                    dep: dep.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1583,5 +1653,114 @@ mod tests {
             .expect("schedules");
         assert_eq!(result.ran, 4);
         assert!(max_concurrent.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn split_cross_plugin_ref_parses_valid_format() {
+        assert_eq!(
+            split_cross_plugin_ref("ulite/fixture:stage"),
+            Some(("ulite/fixture", "stage"))
+        );
+    }
+
+    #[test]
+    fn split_cross_plugin_ref_returns_none_for_bare_names() {
+        assert_eq!(split_cross_plugin_ref("stage"), None);
+        assert_eq!(split_cross_plugin_ref("compileKotlin"), None);
+    }
+
+    #[test]
+    fn split_cross_plugin_ref_rejects_empty_parts() {
+        assert_eq!(split_cross_plugin_ref(":stage"), None);
+        assert_eq!(split_cross_plugin_ref("ulite/fixture:"), None);
+    }
+
+    #[test]
+    fn strip_cross_plugin_refs_removes_cross_deps() {
+        let mut graph = TaskGraph::new();
+        graph
+            .register(Task {
+                depends_on: vec!["stage".to_owned(), "ulite/fixture:stage".to_owned()],
+                ..copy_task("consume", "x", "y")
+            })
+            .unwrap();
+        graph.strip_cross_plugin_refs();
+        let task = graph.get("app", "consume").unwrap();
+        assert_eq!(task.depends_on, vec!["stage".to_owned()]);
+    }
+
+    #[test]
+    fn strip_cross_plugin_refs_preserves_bare_deps() {
+        let mut graph = TaskGraph::new();
+        graph
+            .register(Task {
+                depends_on: vec!["stage".to_owned()],
+                ..copy_task("consume", "x", "y")
+            })
+            .unwrap();
+        graph.strip_cross_plugin_refs();
+        let task = graph.get("app", "consume").unwrap();
+        assert_eq!(task.depends_on, vec!["stage".to_owned()]);
+    }
+
+    #[test]
+    fn resolve_cross_plugin_dep_orders_tasks() {
+        let mut graph = TaskGraph::new();
+        graph
+            .register(Task {
+                depends_on: vec!["ulite/fixture:stage".to_owned()],
+                ..copy_task("consume", "app", "y")
+            })
+            .unwrap();
+        graph.register(copy_task("stage", "a", "b")).unwrap();
+
+        let mut plugin_tasks = HashMap::new();
+        plugin_tasks.insert(
+            "ulite/fixture".to_owned(),
+            HashSet::from(["stage".to_owned()]),
+        );
+        graph.resolve_cross_plugin_deps(&plugin_tasks).unwrap();
+
+        let consume = graph.get("app", "consume").unwrap();
+        assert_eq!(consume.depends_on, vec!["stage".to_owned()]);
+
+        let waves = graph.waves().unwrap();
+        assert_eq!(waves.len(), 2, "stage in wave 0, consume in wave 1");
+    }
+
+    #[test]
+    fn resolve_rejects_undeclared_plugin() {
+        let mut graph = TaskGraph::new();
+        graph
+            .register(Task {
+                depends_on: vec!["ulite/unknown:task".to_owned()],
+                ..copy_task("a", "x", "y")
+            })
+            .unwrap();
+        let plugin_tasks = HashMap::new();
+        let error = graph
+            .resolve_cross_plugin_deps(&plugin_tasks)
+            .expect_err("unknown plugin");
+        assert!(error.to_string().contains("ulite/unknown:task"));
+    }
+
+    #[test]
+    fn resolve_rejects_unknown_task_within_known_plugin() {
+        let mut graph = TaskGraph::new();
+        graph
+            .register(Task {
+                depends_on: vec!["ulite/fixture:ghost".to_owned()],
+                ..copy_task("a", "x", "y")
+            })
+            .unwrap();
+        let mut plugin_tasks = HashMap::new();
+        plugin_tasks.insert(
+            "ulite/fixture".to_owned(),
+            HashSet::from(["stage".to_owned()]),
+        );
+        let error = graph
+            .resolve_cross_plugin_deps(&plugin_tasks)
+            .expect_err("unknown task");
+        assert!(error.to_string().contains("ulite/fixture:ghost"));
     }
 }

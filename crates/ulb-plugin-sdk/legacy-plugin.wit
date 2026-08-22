@@ -19,6 +19,7 @@ interface ulb-plugin {
         version: string,
         abi-version: string,
         tools: list<string>,
+        dependencies: list<string>,
     }
     manifest: func() -> plugin-manifest;
     run: func(input: string) -> string;

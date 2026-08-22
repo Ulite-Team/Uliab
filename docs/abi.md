@@ -6,7 +6,7 @@ one file — the host with `wasmtime::component::bindgen!`, plugins with
 `wit_bindgen::generate!` pointing at the same path — so there is no second
 copy of the interface to keep in sync.
 
-The current ABI version is `ulb_plugin_sdk::ABI_VERSION == "0.6"`.
+The current ABI version is `ulb_plugin_sdk::ABI_VERSION == "0.7"`.
 A plugin reports this value verbatim in its manifest; the host reads it
 back and refuses to run anything that disagrees, before executing any
 plugin code.
@@ -29,6 +29,7 @@ record plugin-manifest {
   version: string,
   abi-version: string,
   tools: list<string>,
+  dependencies: list<string>,
 }
 
 export manifest: func() -> plugin-manifest;
@@ -43,6 +44,9 @@ The host reads this on every load and cross-checks it:
   match. A later ABI major widens this to a compatible-range check.
 - `tools` lists every tool the plugin will request through `run-tool`.
   The host rejects any `run-tool` task whose tool was not declared here.
+- `dependencies` lists plugin names this plugin requires at configure time.
+  The host validates that every declared dependency is present in the build;
+  a missing dependency is a configure-time error.
 
 ### `task-registrar`
 
@@ -84,6 +88,8 @@ arguments to the tool.
 `register-task` errors on:
 
 - a task name that already exists in the module;
+- a task name containing a colon (`:`), which is reserved for cross-plugin
+  dependency references;
 - an action tool that is not in the allowlist;
 - an action tool that is not declared in the plugin's manifest `tools`.
 
@@ -100,6 +106,43 @@ module's resolved config block serialized as JSON (see
 validates its own keys, registers tasks, and returns. Tasks registered
 outside `configure` are impossible: the host only binds the registrar
 state during that call.
+
+## Cross-plugin dependencies
+
+A plugin can declare that it depends on another plugin's tasks by listing
+the other plugin's name in its manifest `dependencies` field and using the
+`"plugin_name:task_name"` format (single colon) in a task's `depends_on`
+entries. For example, a KMP plugin that needs the Android plugin's
+`compileKotlinDebug` task would register:
+
+```json
+{
+  "name": "ulite/kmp",
+  "dependencies": ["ulite/android"],
+  ...
+}
+```
+
+And register a task with:
+
+```json
+{
+  "name": "compileCommon",
+  "depends_on": ["ulite/android:compileKotlinDebug"],
+  ...
+}
+```
+
+The host resolves cross-plugin references at graph-merge time, after all
+plugins have configured. The driver builds a `plugin → task names` index,
+validates that every declared dependency is present in the build, and
+validates that every cross-plugin reference names a plugin listed in the
+consumer's declared `dependencies` — an undeclared reference is a build
+error. Finally it rewrites `"plugin:task"` entries to bare task names in
+the merged graph. Same-module deps (bare names) are validated per-plugin
+during `configure`; cross-plugin deps are deferred to the driver where all
+tasks are visible. Task names must not contain colons (`:`) — the colon
+is reserved as the cross-plugin reference separator.
 
 ## ABI versioning policy
 
