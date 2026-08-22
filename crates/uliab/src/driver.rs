@@ -314,7 +314,7 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
     let mut graph = TaskGraph::new();
     let mut plugin_versions = Vec::new();
     let mut plugin_tasks: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut declared_deps: Vec<(String, Vec<String>)> = Vec::new();
+    let mut declared_deps: Vec<(String, Vec<String>, HashSet<String>)> = Vec::new();
     for spec in &libs.plugins {
         let label = project::spec_label(spec);
         let resolved = registry
@@ -331,19 +331,21 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
         // Validate that every cross-plugin reference in this plugin's
         // tasks names a plugin listed in its declared `dependencies`.
         let deps_set: HashSet<&str> = result.dependencies.iter().map(|s| s.as_str()).collect();
+        let mut used_deps: HashSet<String> = HashSet::new();
         for task in result.graph.tasks() {
             for dep in &task.depends_on {
-                if let Some((provider, task_name)) = split_cross_plugin_ref(dep)
-                    && !deps_set.contains(provider)
-                {
-                    return Err(format!(
-                        "plugin '{}' references '{}:{}' in task '{}' but does not declare '{}' in its dependencies",
-                        resolved.name, provider, task_name, task.name, provider
-                    ));
+                if let Some((provider, task_name)) = split_cross_plugin_ref(dep) {
+                    used_deps.insert(provider.to_owned());
+                    if !deps_set.contains(provider) {
+                        return Err(format!(
+                            "plugin '{}' references '{}:{}' in task '{}' but does not declare '{}' in its dependencies",
+                            resolved.name, provider, task_name, task.name, provider
+                        ));
+                    }
                 }
             }
         }
-        declared_deps.push((resolved.name.clone(), result.dependencies));
+        declared_deps.push((resolved.name.clone(), result.dependencies, used_deps));
         for task in result.graph.tasks() {
             graph
                 .register(task.clone())
@@ -352,12 +354,15 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
         plugin_versions.push(format!("{}@{}", resolved.name, resolved.version));
     }
 
-    // Validate declared dependencies and resolve cross-plugin dep references.
-    for (plugin_name, deps) in &declared_deps {
+    // Validate declared dependencies that are actually referenced in cross-
+    // plugin task refs are present in the build. Declared but unreferenced
+    // dependencies are allowed — a plugin may declare optional capabilities
+    // that not every module configuration activates.
+    for (plugin_name, deps, used_deps) in &declared_deps {
         for dep in deps {
-            if !plugin_tasks.contains_key(dep) {
+            if used_deps.contains(dep.as_str()) && !plugin_tasks.contains_key(dep.as_str()) {
                 return Err(format!(
-                    "plugin '{plugin_name}' declares dependency '{dep}', which is not present in the build"
+                    "plugin '{plugin_name}' declares and references dependency '{dep}', which is not present in the build"
                 ));
             }
         }
@@ -496,7 +501,7 @@ fn build_project_multi(
     let mut plugin_versions = Vec::new();
     let mut config_hashes = Vec::new();
     let mut all_plugin_tasks: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut all_declared_deps: Vec<(String, Vec<String>)> = Vec::new();
+    let mut all_declared_deps: Vec<(String, Vec<String>, HashSet<String>)> = Vec::new();
 
     for m in &modules {
         let model_json = module_model_to_json(&m.model)?;
@@ -614,19 +619,21 @@ fn build_project_multi(
             // Validate that every cross-plugin reference in this plugin's
             // tasks names a plugin listed in its declared `dependencies`.
             let deps_set: HashSet<&str> = result.dependencies.iter().map(|s| s.as_str()).collect();
+            let mut used_deps: HashSet<String> = HashSet::new();
             for task in result.graph.tasks() {
                 for dep in &task.depends_on {
-                    if let Some((provider, task_name)) = split_cross_plugin_ref(dep)
-                        && !deps_set.contains(provider)
-                    {
-                        return Err(format!(
-                            "plugin '{}' references '{}:{}' in task '{}' but does not declare '{}' in its dependencies",
-                            resolved.name, provider, task_name, task.name, provider
-                        ));
+                    if let Some((provider, task_name)) = split_cross_plugin_ref(dep) {
+                        used_deps.insert(provider.to_owned());
+                        if !deps_set.contains(provider) {
+                            return Err(format!(
+                                "plugin '{}' references '{}:{}' in task '{}' but does not declare '{}' in its dependencies",
+                                resolved.name, provider, task_name, task.name, provider
+                            ));
+                        }
                     }
                 }
             }
-            all_declared_deps.push((resolved.name.clone(), result.dependencies));
+            all_declared_deps.push((resolved.name.clone(), result.dependencies, used_deps));
             for task in result.graph.tasks() {
                 let t: crate::task::Task = task.clone();
                 graph
@@ -637,12 +644,13 @@ fn build_project_multi(
         }
     }
 
-    // Validate declared dependencies and resolve cross-plugin dep references.
-    for (plugin_name, deps) in &all_declared_deps {
+    // Validate declared dependencies that are actually referenced in cross-
+    // plugin task refs are present in the build.
+    for (plugin_name, deps, used_deps) in &all_declared_deps {
         for dep in deps {
-            if !all_plugin_tasks.contains_key(dep) {
+            if used_deps.contains(dep.as_str()) && !all_plugin_tasks.contains_key(dep.as_str()) {
                 return Err(format!(
-                    "plugin '{plugin_name}' declares dependency '{dep}', which is not present in the build"
+                    "plugin '{plugin_name}' declares and references dependency '{dep}', which is not present in the build"
                 ));
             }
         }
