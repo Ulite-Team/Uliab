@@ -479,10 +479,13 @@ The Android target is implemented: `compileAndroid<Variant>` compiles
 output, `mergeDex<Variant>` re-runs d8 over both android's and kmp's
 classes jars, and `assembleAndroid<Variant>` grafts the merged dex into
 the APK. The kmp plugin declares `dependencies: ["ulite/android"]` and
-references android packaging tasks via cross-plugin composition
-(`ulite/android:jarClasses<Variant>`, `ulite/android:packageApk<Variant>`
-or `ulite/android:signApk<Variant>`). Variant discovery mirrors the
-android plugin's `compute_variants` logic.
+references android tasks via cross-plugin composition
+(`ulite/android:prepareBuildDir`, `ulite/android:jarClasses<Variant>`,
+`ulite/android:packageApk<Variant>`, `ulite/android:writeSigningPasswords`,
+`ulite/android:writeSigningKeyPassword`). Signing is handled by the kmp
+plugin's own `signKmpAndroid<Variant>` task, which runs after the dex
+graft so the APK is never modified after `apksigner` seals it. Variant
+discovery mirrors the android plugin's `compute_variants` logic.
 
 ---
 
