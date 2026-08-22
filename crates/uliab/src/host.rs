@@ -192,6 +192,12 @@ impl RegistrarState {
     /// task is stored, so validation and execution agree no matter which
     /// directory the build is invoked from.
     fn register(&mut self, task: bindings::ulite::ulb::task_registrar::Task) -> Result<(), String> {
+        if task.name.contains(':') {
+            return Err(format!(
+                "task name '{}' contains a colon, which is reserved for cross-plugin dependency references",
+                task.name
+            ));
+        }
         if let bindings::ulite::ulb::task_registrar::Action::RunTool(args) = &task.action {
             let tool = AllowlistedTool::from(args.tool);
             if !self.declared_tools.contains(&tool) {
@@ -635,23 +641,21 @@ impl PluginHost {
         let state = plugin.store.data_mut().registrar.take().ok_or_else(|| {
             HostError::Call("plugin configured without a task registrar".to_owned())
         })?;
-        // Validate the graph for same-module dependencies. Cross-plugin
-        // deps (identified by a single-colon format like "plugin:task")
-        // cannot be validated here — they reference tasks from other
-        // plugins that haven't been registered yet. The driver validates
-        // the fully resolved graph after merging all plugin graphs.
-        let has_cross_plugin_deps = state
-            .graph
-            .tasks()
-            .any(|t| t.depends_on.iter().any(|d| d.contains(':')));
-        if !has_cross_plugin_deps {
-            state.graph.waves().map_err(|error| {
-                HostError::Call(format!(
-                    "plugin '{}' registered an invalid task graph: {error}",
-                    manifest.name
-                ))
-            })?;
-        }
+        // Validate same-module dependencies and detect cycles within this
+        // plugin's graph.  Cross-plugin references (identified by a
+        // single-colon format like "plugin:task") point at tasks from other
+        // plugins that have not been registered yet, so we strip them from
+        // a clone before validation.  The original graph (with cross-plugin
+        // refs intact) is returned to the driver, which resolves them after
+        // merging all plugin graphs.
+        let mut validation_graph = state.graph.clone();
+        validation_graph.strip_cross_plugin_refs();
+        validation_graph.waves().map_err(|error| {
+            HostError::Call(format!(
+                "plugin '{}' registered an invalid task graph: {error}",
+                manifest.name
+            ))
+        })?;
         Ok(ConfigureResult {
             graph: state.graph,
             dependencies,

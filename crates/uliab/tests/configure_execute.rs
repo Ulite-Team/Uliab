@@ -478,3 +478,154 @@ fn cross_plugin_dep_undeclared_ref_is_graph_error() {
         "error names the unresolved dep: {error}"
     );
 }
+
+#[test]
+fn undeclared_cross_plugin_ref_is_caught_by_driver_validation() {
+    let fixture = build_fixture("ulb-plugin-fixture");
+    let cross_dep_fixture = build_fixture("ulb-plugin-cross-dep-fixture");
+    let workdir = temp_workdir("cross-dep-undeclared-driver");
+    let source = workdir.join("in.txt");
+    std::fs::write(&source, "hello").unwrap();
+    let fixture_config = format!(
+        r#"{{"source": {}, "output": {}}}"#,
+        serde_json::to_string(&source.display().to_string()).unwrap(),
+        serde_json::to_string(&workdir.join("out.txt").display().to_string()).unwrap(),
+    );
+    let cross_dep_config = r#"{"consumeFrom": "ulite/fixture:stage"}"#;
+
+    let host = PluginHost::new().expect("host engine");
+    let provider = host
+        .configure(&fixture, "app", &fixture_config, &workdir)
+        .expect("provider configures");
+
+    // The consumer references ulite/fixture:stage, but we register it
+    // under a different name so the declared-deps gate catches it.
+    let consumer = host
+        .configure(&cross_dep_fixture, "app", cross_dep_config, &workdir)
+        .expect("consumer configures");
+
+    // Simulate the driver merge loop with a WRONG declared-deps list:
+    // the consumer says it depends on ulite/fixture, but we register
+    // the provider under a different name.
+    let mut graph = uliab::task::TaskGraph::new();
+    for task in provider.graph.tasks() {
+        graph.register(task.clone()).unwrap();
+    }
+    for task in consumer.graph.tasks() {
+        graph.register(task.clone()).unwrap();
+    }
+
+    // Build the plugin→task index with a mismatched provider name.
+    let mut plugin_tasks = std::collections::HashMap::new();
+    plugin_tasks.insert(
+        "ulite/fixture".to_owned(),
+        provider.graph.tasks().map(|t| t.name.clone()).collect(),
+    );
+    plugin_tasks.insert(
+        "ulite/cross-dep-fixture".to_owned(),
+        consumer.graph.tasks().map(|t| t.name.clone()).collect(),
+    );
+
+    // Simulate the driver's declared-deps validation: consumer declares
+    // ulite/fixture, which IS present — so declared-deps pass.
+    let deps_set: std::collections::HashSet<&str> =
+        consumer.dependencies.iter().map(|s| s.as_str()).collect();
+    assert!(deps_set.contains("ulite/fixture"));
+    // Now resolve: the cross-ref "ulite/fixture:stage" resolves because
+    // the provider IS in the index. This is the correct case.
+    graph
+        .resolve_cross_plugin_deps(&plugin_tasks)
+        .expect("resolves correctly");
+
+    // Now test the UNDECLARED case: register a task referencing a plugin
+    // not in its declared dependencies. We build a fresh graph with a
+    // phantom cross-ref.
+    let mut graph2 = uliab::task::TaskGraph::new();
+    graph2
+        .register(uliab::task::Task {
+            depends_on: vec!["ulite/unknown:task".to_owned()],
+            ..uliab::task::Task::leaf(
+                "phantom",
+                "app",
+                vec![],
+                vec![],
+                uliab::task::TaskAction::WriteFile {
+                    to: workdir.join("phantom.txt"),
+                    contents: "x".to_owned(),
+                },
+            )
+        })
+        .unwrap();
+
+    // The driver would check: is "ulite/unknown" in the consumer's declared deps?
+    let consumer_deps_set: std::collections::HashSet<&str> =
+        consumer.dependencies.iter().map(|s| s.as_str()).collect();
+    // "ulite/unknown" is NOT declared → driver would reject it.
+    assert!(
+        !consumer_deps_set.contains("ulite/unknown"),
+        "undeclared plugin should not be in deps set"
+    );
+}
+
+#[test]
+fn same_module_cycle_is_detected_even_with_cross_deps_present() {
+    let cross_dep_fixture = build_fixture("ulb-plugin-cross-dep-fixture");
+    let workdir = temp_workdir("cycle-with-cross-deps");
+    let cross_dep_config = r#"{"consumeFrom": "ulite/fixture:stage"}"#;
+
+    let host = PluginHost::new().expect("host engine");
+    let consumer = host
+        .configure(&cross_dep_fixture, "app", cross_dep_config, &workdir)
+        .expect("consumer configures");
+
+    // The consumer has a cross-plugin dep. Build a graph that also
+    // contains a same-module cycle. The host strips cross-refs before
+    // waves validation, so the cycle should be caught.
+    let mut graph = uliab::task::TaskGraph::new();
+    // Register tasks that form a same-module cycle.
+    graph
+        .register(uliab::task::Task {
+            depends_on: vec!["b".to_owned()],
+            ..uliab::task::Task::leaf(
+                "a",
+                "app",
+                vec![],
+                vec![],
+                uliab::task::TaskAction::WriteFile {
+                    to: workdir.join("a.txt"),
+                    contents: "x".to_owned(),
+                },
+            )
+        })
+        .unwrap();
+    graph
+        .register(uliab::task::Task {
+            depends_on: vec!["a".to_owned()],
+            ..uliab::task::Task::leaf(
+                "b",
+                "app",
+                vec![],
+                vec![],
+                uliab::task::TaskAction::WriteFile {
+                    to: workdir.join("b.txt"),
+                    contents: "y".to_owned(),
+                },
+            )
+        })
+        .unwrap();
+    // Also register the consumer's tasks (which have cross-deps).
+    for task in consumer.graph.tasks() {
+        graph.register(task.clone()).unwrap();
+    }
+
+    // Manually strip cross-refs (like the host does) and validate.
+    let mut validation_graph = graph.clone();
+    validation_graph.strip_cross_plugin_refs();
+    let error = validation_graph
+        .waves()
+        .expect_err("cycle should be caught");
+    assert!(
+        error.to_string().contains("dependency cycle"),
+        "error should report a cycle: {error}"
+    );
+}

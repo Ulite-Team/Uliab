@@ -88,6 +88,8 @@ arguments to the tool.
 `register-task` errors on:
 
 - a task name that already exists in the module;
+- a task name containing a colon (`:`), which is reserved for cross-plugin
+  dependency references;
 - an action tool that is not in the allowlist;
 - an action tool that is not declared in the plugin's manifest `tools`.
 
@@ -133,10 +135,14 @@ And register a task with:
 
 The host resolves cross-plugin references at graph-merge time, after all
 plugins have configured. The driver builds a `plugin → task names` index,
-validates that every declared dependency is present, and rewrites
-`"plugin:task"` entries to bare task names in the merged graph. Same-module
-deps (bare names) are validated per-plugin during `configure`; cross-plugin
-deps are deferred to the driver where all tasks are visible.
+validates that every declared dependency is present in the build, and
+validates that every cross-plugin reference names a plugin listed in the
+consumer's declared `dependencies` — an undeclared reference is a build
+error. Finally it rewrites `"plugin:task"` entries to bare task names in
+the merged graph. Same-module deps (bare names) are validated per-plugin
+during `configure`; cross-plugin deps are deferred to the driver where all
+tasks are visible. Task names must not contain colons (`:`) — the colon
+is reserved as the cross-plugin reference separator.
 
 ## ABI versioning policy
 

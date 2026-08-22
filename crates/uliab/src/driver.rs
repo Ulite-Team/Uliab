@@ -27,6 +27,7 @@ use crate::project::{self, read_libs_plugins};
 use crate::registry::{Registry, RegistrySource};
 use crate::task::{
     AllowlistedTool, BuildResult, Executor, FingerprintContext, FingerprintStore, TaskGraph,
+    split_cross_plugin_ref,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -327,6 +328,21 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
             .map_err(|error| format!("configuring {label}: {error}"))?;
         let task_names: HashSet<String> = result.graph.tasks().map(|t| t.name.clone()).collect();
         plugin_tasks.insert(resolved.name.clone(), task_names);
+        // Validate that every cross-plugin reference in this plugin's
+        // tasks names a plugin listed in its declared `dependencies`.
+        let deps_set: HashSet<&str> = result.dependencies.iter().map(|s| s.as_str()).collect();
+        for task in result.graph.tasks() {
+            for dep in &task.depends_on {
+                if let Some((provider, task_name)) = split_cross_plugin_ref(dep)
+                    && !deps_set.contains(provider)
+                {
+                    return Err(format!(
+                        "plugin '{}' references '{}:{}' in task '{}' but does not declare '{}' in its dependencies",
+                        resolved.name, provider, task_name, task.name, provider
+                    ));
+                }
+            }
+        }
         declared_deps.push((resolved.name.clone(), result.dependencies));
         for task in result.graph.tasks() {
             graph
@@ -589,7 +605,27 @@ fn build_project_multi(
                 .map_err(|error| format!("configuring {label}: {error}"))?;
             let task_names: HashSet<String> =
                 result.graph.tasks().map(|t| t.name.clone()).collect();
-            all_plugin_tasks.insert(resolved.name.clone(), task_names);
+            // Union task names across modules so the cross-plugin resolution
+            // index covers every registered task.
+            all_plugin_tasks
+                .entry(resolved.name.clone())
+                .or_default()
+                .extend(task_names);
+            // Validate that every cross-plugin reference in this plugin's
+            // tasks names a plugin listed in its declared `dependencies`.
+            let deps_set: HashSet<&str> = result.dependencies.iter().map(|s| s.as_str()).collect();
+            for task in result.graph.tasks() {
+                for dep in &task.depends_on {
+                    if let Some((provider, task_name)) = split_cross_plugin_ref(dep)
+                        && !deps_set.contains(provider)
+                    {
+                        return Err(format!(
+                            "plugin '{}' references '{}:{}' in task '{}' but does not declare '{}' in its dependencies",
+                            resolved.name, provider, task_name, task.name, provider
+                        ));
+                    }
+                }
+            }
             all_declared_deps.push((resolved.name.clone(), result.dependencies));
             for task in result.graph.tasks() {
                 let t: crate::task::Task = task.clone();
