@@ -50,7 +50,7 @@ fn main() -> ExitCode {
         Some("deps") => cmd_deps(&args[1..]),
         _ => {
             eprintln!("usage: uliab <init|run|plugins|build|deps> …");
-            eprintln!("  uliab init [NAME] [--type TYPE] [--dir DIR]");
+            eprintln!("  uliab init [NAME] [--type TYPE] [--dir DIR] [--namespace NS]");
             eprintln!("  uliab run <plugin.wasm> [input]");
             eprintln!("  uliab plugins list [--project DIR]");
             eprintln!(
@@ -69,6 +69,7 @@ fn cmd_init(args: &[String]) -> ExitCode {
     let mut name: Option<String> = None;
     let mut project_type = "jvm";
     let mut dir: Option<PathBuf> = None;
+    let mut namespace: Option<String> = None;
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -83,12 +84,17 @@ fn cmd_init(args: &[String]) -> ExitCode {
                     dir = Some(PathBuf::from(value));
                 }
             }
+            "--namespace" => {
+                if let Some(value) = iter.next() {
+                    namespace = Some(value.clone());
+                }
+            }
             other if name.is_none() && !other.starts_with('-') => {
                 name = Some(other.to_owned());
             }
             other => {
                 eprintln!("error: unknown argument '{other}'");
-                eprintln!("usage: uliab init [NAME] [--type TYPE] [--dir DIR]");
+                eprintln!("usage: uliab init [NAME] [--type TYPE] [--dir DIR] [--namespace NS]");
                 return ExitCode::from(2);
             }
         }
@@ -105,7 +111,18 @@ fn cmd_init(args: &[String]) -> ExitCode {
     let target = dir.unwrap_or_else(|| PathBuf::from("."));
     let module_dir = "app";
 
-    match init::scaffold(&target, ptype, module_dir, "") {
+    let ns = match ptype {
+        init::ProjectType::Android => match &namespace {
+            Some(ns) if !ns.is_empty() => ns.as_str(),
+            _ => {
+                eprintln!("error: --namespace is required for Android projects");
+                return ExitCode::from(2);
+            }
+        },
+        _ => namespace.as_deref().unwrap_or(""),
+    };
+
+    match init::scaffold(&target, ptype, module_dir, ns) {
         Ok(created) => {
             println!(
                 "scaffolded {} project in {}",
