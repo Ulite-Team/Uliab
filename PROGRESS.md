@@ -43,7 +43,7 @@
 - [x] Phase 14 review fixes (2026-08-22): duplicate plugin declarations in `libs.ulb` now rejected with a clear error before any plugin is configured (single-module checks `plugin_tasks` map; multi-module tracks per-module seen set so different modules can configure the same plugin without false-positive). `configure()` only clones the task graph when cross-plugin refs actually exist (avoids an allocation on the fast path for plugins without cross-deps). `strip_cross_plugin_refs` avoids a temporary-ref double-clone of `order`. Driver merge loop consolidated from 3 passes (collect names, validate refs, register) into a single pass through each plugin's tasks. PR #15 updated: build/clippy/fmt/test/doc clean.
 
 ## Next up (priority order)
-1. After ulb-plugins release workflow runs, real registry builds work end-to-end at ABI 0.7
+1. Compose compiler plugin invocation — wire `@Composable` support into `ulite/android` and `ulite/jvm`
 2. KMP iOS/native targets — deferred until cross-compilation toolchain integration is designed
 
 ## Candidate phases — surfaced during real-project (NoteScribe) build planning, 2026-08-21
