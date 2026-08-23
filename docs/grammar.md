@@ -634,6 +634,12 @@ inject into both compile and runtime, `runtimeOnly` into runtime only,
 `compileOnly` into compile only, and `testImplementation` into test
 compile and test runtime.
 
+A dependency may also be specified as a two-part coordinate
+`"group:artifact"` with no version. The resolver resolves the version from
+the active BOM (Bill of Materials) via `dependencyManagement` — see
+`docs/maven-resolver.md`. If no BOM provides a version for the given
+`group:artifact`, the dependency is skipped with a note.
+
 ---
 
 ## Appendix C — builtin functions

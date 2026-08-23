@@ -204,7 +204,9 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
         .clone()
         .unwrap_or_else(|| vec![maven::MavenRepo::Google, maven::MavenRepo::Central]);
     let classpath = match &outcome.model {
-        Value::Block(entries) if entries.contains_key("deps") => {
+        Value::Block(entries)
+            if entries.contains_key("deps") || compose_deps(&outcome.model).is_some() =>
+        {
             let resolution = resolve_model_deps(&outcome.model, &repos, options.cache_dir.clone())?;
             for note in &resolution.notes {
                 eprintln!("note: {note}");
@@ -508,7 +510,9 @@ fn build_project_multi(
 
         // Resolve Maven deps (project refs are skipped by parse_deps_block).
         let mut classpath = match &m.model {
-            Value::Block(entries) if entries.contains_key("deps") => {
+            Value::Block(entries)
+                if entries.contains_key("deps") || compose_deps(&m.model).is_some() =>
+            {
                 let resolution = resolve_model_deps(&m.model, &repos, options.cache_dir.clone())?;
                 for note in &resolution.notes {
                     eprintln!("note: [{}] {}", m.rel, note);
@@ -1002,23 +1006,76 @@ fn evaluate_project_dir(dir: &Path) -> Result<ulb_lang::eval::EvalOutcome, Strin
 
 /// Resolves the `deps {}` block of an evaluated module model, erroring when
 /// the model declares none.
+/// Default Compose BOM version injected when `compose = true` but no
+/// `composeVersion` is specified in the `android {}` block.
+const DEFAULT_COMPOSE_BOM_VERSION: &str = "1.7.0";
+
+/// When `android.compose = true` in the module model, returns the
+/// Compose BOM and standard runtime/UI deps that should be injected
+/// into the resolution. The BOM is declared with an explicit version;
+/// the standard artifacts are version-less (resolved from the BOM's
+/// `dependencyManagement`).
+fn compose_deps(model: &Value) -> Option<Vec<maven::DeclaredDep>> {
+    let android = match model {
+        Value::Block(entries) => entries.get("android")?,
+        _ => return None,
+    };
+    let compose = match android {
+        Value::Block(entries) => entries.get("compose")?,
+        _ => return None,
+    };
+    if !matches!(compose, Value::Bool(true)) {
+        return None;
+    }
+    let compose_version = match android {
+        Value::Block(entries) => match entries.get("composeVersion") {
+            Some(Value::Str(v)) => v.clone(),
+            _ => DEFAULT_COMPOSE_BOM_VERSION.to_owned(),
+        },
+        _ => DEFAULT_COMPOSE_BOM_VERSION.to_owned(),
+    };
+    let scope = maven::MavenScope::Implementation;
+    let bom = maven::DeclaredDep {
+        scope,
+        dependency: maven::Dependency::parse(&format!(
+            "androidx.compose:compose-bom:{compose_version}"
+        ))
+        .expect("valid BOM coordinate"),
+    };
+    let managed = ["runtime", "ui", "material3"]
+        .into_iter()
+        .map(|artifact| maven::DeclaredDep {
+            scope,
+            dependency: maven::Dependency::parse(&format!(
+                "androidx.compose.{artifact}:{artifact}"
+            ))
+            .expect("valid coordinate"),
+        })
+        .collect::<Vec<_>>();
+    let mut deps = vec![bom];
+    deps.extend(managed);
+    Some(deps)
+}
+
 fn resolve_model_deps(
     model: &Value,
     repos: &[MavenRepo],
     cache_dir: Option<PathBuf>,
 ) -> Result<maven::Resolution, String> {
     let deps_block = match model {
-        Value::Block(entries) => entries
-            .get("deps")
-            .ok_or_else(|| "the model does not declare a deps {} block".to_owned())?,
-        other => {
-            return Err(format!(
-                "the module model is not a block (found {})",
-                value_kind(other)
-            ));
-        }
+        Value::Block(entries) => entries.get("deps"),
+        _ => None,
     };
-    let declared = maven::parse_deps_block(deps_block)?;
+    let mut declared = match deps_block {
+        Some(block) => maven::parse_deps_block(block)?,
+        None => Vec::new(),
+    };
+    if let Some(compose) = compose_deps(model) {
+        declared.extend(compose);
+    }
+    if declared.is_empty() {
+        return Err("the model does not declare a deps {} block".to_owned());
+    }
     let resolver = maven::Resolver::new(repos.to_vec(), cache_dir);
     resolver
         .resolve(&declared)
@@ -1211,6 +1268,31 @@ fn resolve_project_classpath(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn json_to_value(json: &serde_json::Value) -> Value {
+        match json {
+            serde_json::Value::Null => Value::Invalid("null".to_owned()),
+            serde_json::Value::Bool(b) => Value::Bool(*b),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Value::Number(Number::Int(i))
+                } else if let Some(f) = n.as_f64() {
+                    Value::Number(Number::Float(f))
+                } else {
+                    Value::Invalid("invalid number".to_owned())
+                }
+            }
+            serde_json::Value::String(s) => Value::Str(s.clone()),
+            serde_json::Value::Array(arr) => Value::List(arr.iter().map(json_to_value).collect()),
+            serde_json::Value::Object(map) => {
+                let entries: std::collections::BTreeMap<String, Value> = map
+                    .iter()
+                    .map(|(k, v)| (k.clone(), json_to_value(v)))
+                    .collect();
+                Value::Block(entries)
+            }
+        }
+    }
 
     #[test]
     fn project_dir_is_canonicalized_to_an_absolute_path() {
@@ -1557,5 +1639,62 @@ mod tests {
         assert_eq!(cp.runtime.len(), 0);
         assert_eq!(cp.test_compile.len(), 1);
         assert_eq!(cp.test_runtime.len(), 1);
+    }
+
+    #[test]
+    fn compose_deps_returns_bom_and_standard_artifacts() {
+        let model = serde_json::json!({
+            "android": {
+                "compose": true,
+                "composeVersion": "3.1.0"
+            }
+        });
+        let value = json_to_value(&model);
+        let deps = compose_deps(&value).expect("compose is true");
+        assert_eq!(deps.len(), 4);
+        assert_eq!(deps[0].dependency.group, "androidx.compose");
+        assert_eq!(deps[0].dependency.artifact, "compose-bom");
+        assert_eq!(deps[0].dependency.version, "3.1.0");
+        assert_eq!(deps[1].dependency.group, "androidx.compose.runtime");
+        assert_eq!(deps[1].dependency.artifact, "runtime");
+        assert!(deps[1].dependency.is_version_managed());
+        assert_eq!(deps[2].dependency.group, "androidx.compose.ui");
+        assert_eq!(deps[2].dependency.artifact, "ui");
+        assert!(deps[2].dependency.is_version_managed());
+        assert_eq!(deps[3].dependency.group, "androidx.compose.material3");
+        assert_eq!(deps[3].dependency.artifact, "material3");
+        assert!(deps[3].dependency.is_version_managed());
+    }
+
+    #[test]
+    fn compose_deps_uses_default_version_when_no_compose_version() {
+        let model = serde_json::json!({
+            "android": {
+                "compose": true
+            }
+        });
+        let value = json_to_value(&model);
+        let deps = compose_deps(&value).expect("compose is true");
+        assert_eq!(deps[0].dependency.version, DEFAULT_COMPOSE_BOM_VERSION);
+    }
+
+    #[test]
+    fn compose_deps_returns_none_when_compose_false() {
+        let model = serde_json::json!({
+            "android": {
+                "compose": false
+            }
+        });
+        let value = json_to_value(&model);
+        assert!(compose_deps(&value).is_none());
+    }
+
+    #[test]
+    fn compose_deps_returns_none_when_no_android_block() {
+        let model = serde_json::json!({
+            "jvm": {}
+        });
+        let value = json_to_value(&model);
+        assert!(compose_deps(&value).is_none());
     }
 }

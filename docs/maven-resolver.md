@@ -27,7 +27,8 @@ POMs are parsed with `quick-xml`. What is captured:
 - `packaging`,
 - groupId / artifactId / version,
 - scope, `optional`,
-- each child `dependency`.
+- each child `dependency`,
+- `dependencyManagement` entries (version constraints from BOMs).
 
 Scope mapping:
 
@@ -37,9 +38,25 @@ Scope mapping:
 | `test`, `provided`, `system` | dependency is dropped (`Skip`) |
 | anything else (default `compile`) | `Compile` |
 
-Parent POMs and `dependencyManagement` are **not** consulted yet. A child
-whose version is a `${property}` (i.e. unresolvable without the parent) is
-skipped with an info note rather than guessed at.
+## BOM / `dependencyManagement` support
+
+POMs with `packaging = "pom"` are treated as BOMs (Bills of Materials).
+Their `dependencyManagement` section is parsed and recorded as version
+constraints. When a child dependency has no version (declared as
+`"group:artifact"` in `deps {}`), or its version contains a `${property}`
+that cannot be resolved from the POM alone, the resolver looks up the
+managed version from active BOMs.
+
+Resolution order:
+
+1. Declared deps with explicit versions are expanded first.
+2. BOMs encountered during expansion populate the managed-version map.
+3. Version-less declared deps are expanded in a second pass, using the
+   now-populated managed versions.
+4. The first BOM to declare a constraint for a given `group:artifact`
+   wins (nearest definition wins, matching Maven semantics).
+
+Parent POM inheritance is **not** consulted yet.
 
 ## Transitive expansion and conflict resolution
 
@@ -82,5 +99,5 @@ reused only when the recorded SHA-256 still matches the file on disk.
 ## Not yet implemented (tracked in architecture.md §12)
 
 - parent POM inheritance,
-- `dependencyManagement` / BOM handling,
-- property-versioned children (currently skipped with a note).
+- property-versioned children without a BOM (currently skipped with a
+  note).
