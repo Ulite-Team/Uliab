@@ -13,12 +13,13 @@ architectural decision in the project so far — §3 explains why and how.
 **Implementation status:** `ulb-lang`, the `uliab` CLI (plugin host,
 task engine, Maven resolver, registry client), the tree-sitter grammar,
 the LSP, the `ulite/jvm` plugin (Java + Kotlin/JVM incl. KSP + JUnit),
-the `ulite/android` plugin (compile + full APK packaging chain), the
-`ulite/kmp` plugin (JVM + Android targets: commonMain + jvmMain → jar,
-commonMain + androidMain → per-variant merged dex into APK), and
-multi-module `settings.ulb` support are implemented and building. The
-plugin registry is live on GitHub. Remaining roadmap item:
-`uliab init`.
+the `ulite/android` plugin (compile + full APK packaging chain + Kotlin
+support), the `ulite/kmp` plugin (JVM + Android targets: commonMain +
+jvmMain → jar, commonMain + androidMain → per-variant merged dex into
+APK), `uliab init` project scaffolding, and multi-module `settings.ulb`
+support are implemented and building. The plugin registry is live on
+GitHub. Remaining roadmap items: Compose compiler plugin, product
+flavors, BuildConfig generation.
 
 ---
 
