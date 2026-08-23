@@ -156,8 +156,13 @@ impl Dependency {
         let mut parts = coordinate.split(':');
         let group = parts.next().unwrap_or_default();
         let artifact = parts.next().unwrap_or_default();
-        let version = parts.next().unwrap_or_default();
-        if parts.next().is_some() || group.is_empty() || artifact.is_empty() {
+        let version_part = parts.next();
+        let version = version_part.unwrap_or_default();
+        if parts.next().is_some()
+            || group.is_empty()
+            || artifact.is_empty()
+            || version_part.is_some_and(str::is_empty)
+        {
             return Err(format!(
                 "invalid coordinate '{coordinate}': expected 'group:artifact' or \
                  'group:artifact:version'"
@@ -1206,9 +1211,9 @@ impl<'a> Session<'a> {
             Some(PomScope::Compile),
         );
         for (group, artifact) in &compile_only {
-            let version = winners
-                .get(&(group.clone(), artifact.clone()))
-                .expect("a declared dependency was expanded");
+            let Some(version) = winners.get(&(group.clone(), artifact.clone())) else {
+                continue;
+            };
             let packaging = self
                 .winner_node(winners, group, artifact)
                 .map(|node| node.packaging.clone())
@@ -1489,6 +1494,10 @@ mod tests {
 
         assert!(Dependency::parse("com.example:app:1:extra").is_err());
         assert!(Dependency::parse("::").is_err());
+        assert!(
+            Dependency::parse("com.example:app:").is_err(),
+            "empty version in three-part coord must be rejected"
+        );
     }
 
     #[test]
@@ -2375,5 +2384,29 @@ mod tests {
             jar_names(&resolution.classpath.compile),
             vec!["lib-parent-1.0.jar", "runtime-lib-4.0.jar"]
         );
+    }
+
+    #[test]
+    fn compile_only_version_managed_dep_without_bom_is_skipped() {
+        let repo = LocalRepo::new();
+        write_artifact(
+            &repo.root,
+            "com.example",
+            "compile-only",
+            "1.0",
+            &repo_pom("com.example", "compile-only", "1.0", &[]),
+        );
+        let resolution = repo
+            .resolver()
+            .resolve(&[declared(
+                MavenScope::CompileOnly,
+                "com.example:compile-only",
+            )])
+            .expect("resolves");
+        assert!(
+            resolution.classpath.compile.is_empty(),
+            "compileOnly dep with no BOM version must be skipped, not panic"
+        );
+        assert!(resolution.notes.iter().any(|n| n.contains("skipped")));
     }
 }

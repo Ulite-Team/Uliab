@@ -1008,13 +1008,18 @@ fn evaluate_project_dir(dir: &Path) -> Result<ulb_lang::eval::EvalOutcome, Strin
 /// the model declares none.
 /// Default Compose BOM version injected when `compose = true` but no
 /// `composeVersion` is specified in the `android {}` block.
-const DEFAULT_COMPOSE_BOM_VERSION: &str = "1.7.0";
+const DEFAULT_COMPOSE_BOM_VERSION: &str = "2026.08.00";
 
 /// When `android.compose = true` in the module model, returns the
 /// Compose BOM and standard runtime/UI deps that should be injected
 /// into the resolution. The BOM is declared with an explicit version;
 /// the standard artifacts are version-less (resolved from the BOM's
 /// `dependencyManagement`).
+///
+/// The `composeVersion` key in the `android {}` block specifies the
+/// Compose BOM version (e.g. `"2026.08.00"` or `ver("2026.08.00")`).
+/// When omitted the latest stable BOM at the time of implementation is
+/// used.
 fn compose_deps(model: &Value) -> Option<Vec<maven::DeclaredDep>> {
     let android = match model {
         Value::Block(entries) => entries.get("android")?,
@@ -1030,7 +1035,11 @@ fn compose_deps(model: &Value) -> Option<Vec<maven::DeclaredDep>> {
     let compose_version = match android {
         Value::Block(entries) => match entries.get("composeVersion") {
             Some(Value::Str(v)) => v.clone(),
-            _ => DEFAULT_COMPOSE_BOM_VERSION.to_owned(),
+            Some(v) => match v.as_display_string() {
+                Some(text) => text,
+                None => DEFAULT_COMPOSE_BOM_VERSION.to_owned(),
+            },
+            None => DEFAULT_COMPOSE_BOM_VERSION.to_owned(),
         },
         _ => DEFAULT_COMPOSE_BOM_VERSION.to_owned(),
     };
