@@ -25,9 +25,11 @@
 //! Version comparison follows Maven's ordering: dot/hyphen-separated
 //! numeric segments compare by value and the common qualifiers rank
 //! `alpha < beta < milestone < rc < snapshot < release < sp`. A POM child
-//! whose version is absent or a `${property}` is skipped with an
-//! informational note — parent POMs and `dependencyManagement` are not yet
-//! consulted (§7's resolver is resolved against a flat POM set for now).
+//! whose version is absent is resolved from `dependencyManagement` entries
+//! provided by BOMs (POMs with `packaging = "pom"`) in the dependency
+//! graph. A child whose version is a `${property}` is resolved from the
+//! same managed versions when available; parent POM inheritance is not yet
+//! consulted.
 //!
 //! Artifacts are cached content-addressed under the resolver's cache
 //! directory (default `~/.cache/uliab/modules`): a jar/POM is only reused
@@ -123,32 +125,47 @@ impl MavenScope {
     }
 }
 
-/// A resolved `group:artifact:version` coordinate.
+/// A resolved Maven coordinate. The version may be empty when the
+/// coordinate was declared without one (e.g. `"group:artifact"`) and is
+/// expected to be filled in from a BOM's `dependencyManagement` during
+/// resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dependency {
     /// The Maven group.
     pub group: String,
     /// The Maven artifact.
     pub artifact: String,
-    /// The version.
+    /// The version. Empty when the coordinate was declared without one
+    /// and should be resolved from a BOM during dependency resolution.
     pub version: String,
 }
 
 impl Dependency {
-    /// Parses a `"group:artifact:version"` coordinate string.
+    /// Parses a `"group:artifact:version"` or `"group:artifact"` coordinate
+    /// string.
+    ///
+    /// Two-part coordinates (`"group:artifact"`) produce a [`Dependency`]
+    /// with an empty version, intended to be resolved from a BOM's
+    /// `dependencyManagement` during expansion.
     ///
     /// # Errors
     ///
-    /// Returns a description when the string is not three `:`-separated
-    /// non-empty parts.
+    /// Returns a description when the string is not two or three
+    /// `:`-separated non-empty parts, or when it has more than three parts.
     pub fn parse(coordinate: &str) -> Result<Dependency, String> {
         let mut parts = coordinate.split(':');
         let group = parts.next().unwrap_or_default();
         let artifact = parts.next().unwrap_or_default();
-        let version = parts.next().unwrap_or_default();
-        if parts.next().is_some() || group.is_empty() || artifact.is_empty() || version.is_empty() {
+        let version_part = parts.next();
+        let version = version_part.unwrap_or_default();
+        if parts.next().is_some()
+            || group.is_empty()
+            || artifact.is_empty()
+            || version_part.is_some_and(str::is_empty)
+        {
             return Err(format!(
-                "invalid coordinate '{coordinate}': expected 'group:artifact:version'"
+                "invalid coordinate '{coordinate}': expected 'group:artifact' or \
+                 'group:artifact:version'"
             ));
         }
         Ok(Dependency {
@@ -156,6 +173,13 @@ impl Dependency {
             artifact: artifact.to_owned(),
             version: version.to_owned(),
         })
+    }
+
+    /// Returns `true` when the coordinate was declared without a version
+    /// and needs resolution from a BOM during dependency expansion.
+    #[must_use]
+    pub fn is_version_managed(&self) -> bool {
+        self.version.is_empty()
     }
 }
 
@@ -171,8 +195,9 @@ pub struct DeclaredDep {
 /// Parses the evaluated `deps {}` block of a module model.
 ///
 /// The block is keyed by scope (Appendix B); each value is a coordinate
-/// string (`"group:artifact:version"`), a resolved [`Value::Coordinate`],
-/// or a list of them (repeated keys accumulate into lists upstream).
+/// string (`"group:artifact:version"` or `"group:artifact"` for
+/// BOM-managed deps), a resolved [`Value::Coordinate`], or a list of them
+/// (repeated keys accumulate into lists upstream).
 ///
 /// # Errors
 ///
@@ -464,12 +489,47 @@ impl Resolver {
     ///     .collect();
     /// assert_eq!(jars, vec!["one-1.0.jar", "two-1.0.jar"]);
     /// ```
+    /// Resolves `declared` into a classpath, downloading POMs and jars
+    /// into the cache on a miss.
+    ///
+    /// The graph of all reachable versions is expanded first and then
+    /// partitioned into compile/runtime buckets (ARCHITECTURE.md §6, §7).
+    /// Declared dependencies whose version is empty (version-managed from
+    /// a BOM) are resolved in a second pass after BOMs have been expanded.
     pub fn resolve(&self, declared: &[DeclaredDep]) -> Result<Resolution, ResolveError> {
         let mut session = Session::new(self);
+
+        // Pass 1: expand every declared dep that already carries a version.
+        // BOMs (packaging = "pom") discovered here populate
+        // `managed_versions` so pass 2 can fill in version-less deps.
         for dep in declared {
-            let dependency = &dep.dependency;
-            session.expand(&dependency.group, &dependency.artifact, &dependency.version)?;
+            if !dep.dependency.is_version_managed() {
+                session.expand(
+                    &dep.dependency.group,
+                    &dep.dependency.artifact,
+                    &dep.dependency.version,
+                )?;
+            }
         }
+
+        // Pass 2: expand version-managed deps using BOM constraints.
+        for dep in declared {
+            if dep.dependency.is_version_managed() {
+                if let Some(version) = session.managed_versions.get(&(
+                    dep.dependency.group.clone(),
+                    dep.dependency.artifact.clone(),
+                )) {
+                    let version = version.clone();
+                    session.expand(&dep.dependency.group, &dep.dependency.artifact, &version)?;
+                } else {
+                    session.notes.push(format!(
+                        "{}:{} has no version and no BOM provides one; it is skipped",
+                        dep.dependency.group, dep.dependency.artifact
+                    ));
+                }
+            }
+        }
+
         let winners = session.winners();
         let classpath = session.classpath(declared, &winners)?;
         Ok(Resolution {
@@ -807,11 +867,16 @@ enum PomScope {
 struct PomProject {
     packaging: String,
     deps: Vec<PomDependency>,
+    managed_deps: Vec<PomDependency>,
 }
 
-/// Parses a POM's packaging and its direct `compile`/`runtime`-scoped
-/// dependencies. `test`/`provided`/`system` and `optional` dependencies are
-/// dropped, as are dependencies that are not part of a consumer's graph.
+/// Parses a POM's packaging, its direct `compile`/`runtime`-scoped
+/// dependencies, and its `dependencyManagement` entries.
+///
+/// `test`/`provided`/`system` and `optional` dependencies are dropped from
+/// the direct dependencies list, as are dependencies that are not part of a
+/// consumer's graph. Managed dependencies are preserved regardless of scope
+/// since they supply version constraints to consumers.
 fn parse_pom(bytes: &[u8]) -> Result<PomProject, String> {
     let mut reader = quick_xml::Reader::from_reader(bytes);
     reader.config_mut().trim_text(true);
@@ -820,10 +885,12 @@ fn parse_pom(bytes: &[u8]) -> Result<PomProject, String> {
     let mut stack: Vec<String> = Vec::new();
     let mut packaging = "jar".to_owned();
     let mut in_management = false;
+    let mut in_management_deps = false;
     let mut in_dependencies = false;
     let mut current: Option<PomDependency> = None;
     let mut field: Option<String> = None;
     let mut deps = Vec::new();
+    let mut managed_deps = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buffer) {
@@ -836,11 +903,16 @@ fn parse_pom(bytes: &[u8]) -> Result<PomProject, String> {
                 match name.as_str() {
                     "packaging" if parent.as_deref() == Some("project") => field = Some(name),
                     "dependencyManagement" => in_management = true,
+                    "dependencies"
+                        if in_management && parent.as_deref() == Some("dependencyManagement") =>
+                    {
+                        in_management_deps = true;
+                    }
                     "dependencies" if !in_management && parent.as_deref() == Some("project") => {
                         in_dependencies = true;
                     }
                     "dependency"
-                        if in_dependencies
+                        if (in_dependencies || in_management_deps)
                             && parent.as_deref() == Some("dependencies")
                             && current.is_none() =>
                     {
@@ -902,15 +974,23 @@ fn parse_pom(bytes: &[u8]) -> Result<PomProject, String> {
                 match name.as_str() {
                     "dependency" => {
                         if let Some(dependency) = current.take()
-                            && !dependency.optional
-                            && dependency.scope != PomScope::Skip
                             && !dependency.group.is_empty()
                             && !dependency.artifact.is_empty()
                         {
-                            deps.push(dependency);
+                            if in_management_deps {
+                                managed_deps.push(dependency);
+                            } else if !dependency.optional && dependency.scope != PomScope::Skip {
+                                deps.push(dependency);
+                            }
                         }
                     }
-                    "dependencies" => in_dependencies = false,
+                    "dependencies" => {
+                        if in_management_deps {
+                            in_management_deps = false;
+                        } else {
+                            in_dependencies = false;
+                        }
+                    }
                     "dependencyManagement" => in_management = false,
                     _ => {}
                 }
@@ -920,7 +1000,11 @@ fn parse_pom(bytes: &[u8]) -> Result<PomProject, String> {
             Err(error) => return Err(format!("reading XML: {error}")),
         }
     }
-    Ok(PomProject { packaging, deps })
+    Ok(PomProject {
+        packaging,
+        deps,
+        managed_deps,
+    })
 }
 
 /// A node in the expanded dependency graph: one concrete version of one
@@ -945,6 +1029,7 @@ struct Session<'a> {
     order: Vec<(String, String, String)>,
     seen: BTreeSet<(String, String, String)>,
     notes: Vec<String>,
+    managed_versions: BTreeMap<(String, String), String>,
 }
 
 impl<'a> Session<'a> {
@@ -955,11 +1040,16 @@ impl<'a> Session<'a> {
             order: Vec::new(),
             seen: BTreeSet::new(),
             notes: Vec::new(),
+            managed_versions: BTreeMap::new(),
         }
     }
 
     /// Fetches the POM for `group:artifact:version`, parses it, and records
     /// its node plus the POM of every resolvable child, recursively.
+    ///
+    /// When the POM's packaging is `pom` (a BOM), its `dependencyManagement`
+    /// entries are recorded as version constraints. Version-less child
+    /// dependencies are resolved against these constraints.
     fn expand(&mut self, group: &str, artifact: &str, version: &str) -> Result<(), ResolveError> {
         let key = (group.to_owned(), artifact.to_owned(), version.to_owned());
         if self.seen.contains(&key) {
@@ -979,6 +1069,20 @@ impl<'a> Session<'a> {
             message,
         })?;
 
+        // BOMs (packaging = "pom") contribute version constraints from
+        // their `dependencyManagement` section. The first BOM to declare
+        // a constraint for a given `group:artifact` wins (nearest
+        // definition wins, matching Maven semantics).
+        if pom.packaging == "pom" {
+            for managed in &pom.managed_deps {
+                if let Some(ref ver) = managed.version {
+                    self.managed_versions
+                        .entry((managed.group.clone(), managed.artifact.clone()))
+                        .or_insert_with(|| ver.clone());
+                }
+            }
+        }
+
         let mut node = GraphNode {
             packaging: pom.packaging,
             edges: Vec::new(),
@@ -986,21 +1090,38 @@ impl<'a> Session<'a> {
         for dependency in pom.deps {
             let version = match dependency.version {
                 None => {
-                    self.notes.push(format!(
-                        "{}:{} declares no version; its dependencies are not followed",
-                        dependency.group, dependency.artifact
-                    ));
-                    continue;
+                    // Version-less child: look up in BOM-managed versions.
+                    if let Some(managed) = self
+                        .managed_versions
+                        .get(&(dependency.group.clone(), dependency.artifact.clone()))
+                    {
+                        managed.clone()
+                    } else {
+                        self.notes.push(format!(
+                            "{}:{} declares no version and no BOM provides one; \
+                             its dependencies are not followed",
+                            dependency.group, dependency.artifact
+                        ));
+                        continue;
+                    }
                 }
-                Some(version) if version.contains("${") => {
-                    self.notes.push(format!(
-                        "{}:{}:{} uses a property version; parent POMs and \
-                         dependencyManagement are not consulted yet",
-                        dependency.group, dependency.artifact, version
-                    ));
-                    continue;
+                Some(ref v) if v.contains("${") => {
+                    // Property version: check managed versions before skipping.
+                    if let Some(managed) = self
+                        .managed_versions
+                        .get(&(dependency.group.clone(), dependency.artifact.clone()))
+                    {
+                        managed.clone()
+                    } else {
+                        self.notes.push(format!(
+                            "{}:{}:{} uses a property version; parent POMs are \
+                             not consulted yet",
+                            dependency.group, dependency.artifact, v
+                        ));
+                        continue;
+                    }
                 }
-                Some(version) => version,
+                Some(v) => v,
             };
             self.expand(&dependency.group, &dependency.artifact, &version)?;
             node.edges.push(PomEdge {
@@ -1090,9 +1211,9 @@ impl<'a> Session<'a> {
             Some(PomScope::Compile),
         );
         for (group, artifact) in &compile_only {
-            let version = winners
-                .get(&(group.clone(), artifact.clone()))
-                .expect("a declared dependency was expanded");
+            let Some(version) = winners.get(&(group.clone(), artifact.clone())) else {
+                continue;
+            };
             let packaging = self
                 .winner_node(winners, group, artifact)
                 .map(|node| node.packaging.clone())
@@ -1158,13 +1279,13 @@ impl<'a> Session<'a> {
         }
         reachable
             .into_iter()
-            .map(|(group, artifact)| {
-                let version = winners[&(group.clone(), artifact.clone())].clone();
+            .filter_map(|(group, artifact)| {
+                let version = winners.get(&(group.clone(), artifact.clone()))?.clone();
                 let packaging = self
                     .winner_node(winners, &group, &artifact)
                     .map(|node| node.packaging.clone())
                     .unwrap_or_else(|| "jar".to_owned());
-                ((group, artifact), (version, packaging))
+                Some(((group, artifact), (version, packaging)))
             })
             .collect()
     }
@@ -1365,9 +1486,18 @@ mod tests {
         assert_eq!(dependency.group, "com.example");
         assert_eq!(dependency.artifact, "app");
         assert_eq!(dependency.version, "1.2.3");
-        assert!(Dependency::parse("com.example:app").is_err());
+
+        let managed = Dependency::parse("com.example:app").expect("version-less parses");
+        assert_eq!(managed.group, "com.example");
+        assert_eq!(managed.artifact, "app");
+        assert!(managed.is_version_managed());
+
         assert!(Dependency::parse("com.example:app:1:extra").is_err());
         assert!(Dependency::parse("::").is_err());
+        assert!(
+            Dependency::parse("com.example:app:").is_err(),
+            "empty version in three-part coord must be rejected"
+        );
     }
 
     #[test]
@@ -1412,7 +1542,9 @@ mod tests {
 
         let mut entries = BTreeMap::new();
         entries.insert("implementation".to_owned(), Value::Str("a:b".to_owned()));
-        assert!(parse_deps_block(&Value::Block(entries)).is_err());
+        let deps = parse_deps_block(&Value::Block(entries)).expect("version-less parses");
+        assert_eq!(deps.len(), 1);
+        assert!(deps[0].dependency.is_version_managed());
     }
 
     #[test]
@@ -1487,13 +1619,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_pom_ignoring_dependency_management() {
+    fn parses_pom_extracts_dependency_management() {
         let pom = r#"<project>
           <groupId>com.example</groupId><artifactId>root</artifactId><version>1.0</version>
           <dependencyManagement>
             <dependencies>
               <dependency>
-                <groupId>com.example</groupId><artifactId>managed</artifactId><version>1.0</version>
+                <groupId>com.example</groupId><artifactId>managed</artifactId><version>2.0</version>
               </dependency>
             </dependencies>
           </dependencyManagement>
@@ -1506,6 +1638,9 @@ mod tests {
         let parsed = parse_pom(pom.as_bytes()).expect("parses");
         assert_eq!(parsed.deps.len(), 1);
         assert_eq!(parsed.deps[0].artifact, "real");
+        assert_eq!(parsed.managed_deps.len(), 1);
+        assert_eq!(parsed.managed_deps[0].artifact, "managed");
+        assert_eq!(parsed.managed_deps[0].version.as_deref(), Some("2.0"));
     }
 
     #[test]
@@ -2007,5 +2142,271 @@ mod tests {
             )])
             .expect_err("not found");
         assert!(matches!(error, ResolveError::NotFound { .. }), "{error}");
+    }
+
+    #[test]
+    fn bom_provides_version_for_versionless_dep() {
+        let repo = LocalRepo::new();
+        write_artifact(
+            &repo.root,
+            "com.example",
+            "bom",
+            "1.0",
+            r#"<?xml version="1.0"?><project>
+              <groupId>com.example</groupId><artifactId>bom</artifactId><version>1.0</version>
+              <packaging>pom</packaging>
+              <dependencyManagement>
+                <dependencies>
+                  <dependency>
+                    <groupId>com.example</groupId><artifactId>lib</artifactId><version>3.0</version>
+                  </dependency>
+                </dependencies>
+              </dependencyManagement>
+            </project>"#,
+        );
+        write_artifact(
+            &repo.root,
+            "com.example",
+            "lib",
+            "3.0",
+            &repo_pom("com.example", "lib", "3.0", &[]),
+        );
+        let resolution = repo
+            .resolver()
+            .resolve(&[
+                declared(MavenScope::Implementation, "com.example:bom:1.0"),
+                declared(MavenScope::Implementation, "com.example:lib"),
+            ])
+            .expect("resolves");
+        assert_eq!(
+            jar_names(&resolution.classpath.compile),
+            vec!["lib-3.0.jar"]
+        );
+    }
+
+    #[test]
+    fn bom_versionless_dep_without_bom_is_skipped() {
+        let repo = LocalRepo::new();
+        write_artifact(
+            &repo.root,
+            "com.example",
+            "lib",
+            "1.0",
+            &repo_pom("com.example", "lib", "1.0", &[]),
+        );
+        let resolution = repo
+            .resolver()
+            .resolve(&[declared(MavenScope::Implementation, "com.example:lib")])
+            .expect("resolves");
+        assert!(resolution.classpath.compile.is_empty());
+        assert!(
+            resolution
+                .notes
+                .iter()
+                .any(|n| n.contains("no version and no BOM"))
+        );
+    }
+
+    #[test]
+    fn first_bom_wins_on_overlapping_managed_versions() {
+        let repo = LocalRepo::new();
+        write_artifact(
+            &repo.root,
+            "com.example",
+            "bom-a",
+            "1.0",
+            r#"<?xml version="1.0"?><project>
+              <groupId>com.example</groupId><artifactId>bom-a</artifactId><version>1.0</version>
+              <packaging>pom</packaging>
+              <dependencyManagement>
+                <dependencies>
+                  <dependency>
+                    <groupId>com.example</groupId><artifactId>lib</artifactId><version>1.0</version>
+                  </dependency>
+                </dependencies>
+              </dependencyManagement>
+            </project>"#,
+        );
+        write_artifact(
+            &repo.root,
+            "com.example",
+            "bom-b",
+            "1.0",
+            r#"<?xml version="1.0"?><project>
+              <groupId>com.example</groupId><artifactId>bom-b</artifactId><version>1.0</version>
+              <packaging>pom</packaging>
+              <dependencyManagement>
+                <dependencies>
+                  <dependency>
+                    <groupId>com.example</groupId><artifactId>lib</artifactId><version>2.0</version>
+                  </dependency>
+                </dependencies>
+              </dependencyManagement>
+            </project>"#,
+        );
+        write_artifact(
+            &repo.root,
+            "com.example",
+            "lib",
+            "1.0",
+            &repo_pom("com.example", "lib", "1.0", &[]),
+        );
+        write_artifact(
+            &repo.root,
+            "com.example",
+            "lib",
+            "2.0",
+            &repo_pom("com.example", "lib", "2.0", &[]),
+        );
+        let resolution = repo
+            .resolver()
+            .resolve(&[
+                declared(MavenScope::Implementation, "com.example:bom-a:1.0"),
+                declared(MavenScope::Implementation, "com.example:bom-b:1.0"),
+                declared(MavenScope::Implementation, "com.example:lib"),
+            ])
+            .expect("resolves");
+        assert_eq!(
+            jar_names(&resolution.classpath.compile),
+            vec!["lib-1.0.jar"]
+        );
+    }
+
+    #[test]
+    fn bom_transitive_child_with_property_version_resolves_from_managed() {
+        let repo = LocalRepo::new();
+        write_artifact(
+            &repo.root,
+            "com.example",
+            "bom",
+            "1.0",
+            r#"<?xml version="1.0"?><project>
+              <groupId>com.example</groupId><artifactId>bom</artifactId><version>1.0</version>
+              <packaging>pom</packaging>
+              <dependencyManagement>
+                <dependencies>
+                  <dependency>
+                    <groupId>com.example</groupId><artifactId>transitive</artifactId><version>5.0</version>
+                  </dependency>
+                </dependencies>
+              </dependencyManagement>
+            </project>"#,
+        );
+        write_artifact(
+            &repo.root,
+            "com.example",
+            "parent",
+            "1.0",
+            r#"<?xml version="1.0"?><project>
+              <groupId>com.example</groupId><artifactId>parent</artifactId><version>1.0</version>
+              <dependencies>
+                <dependency>
+                  <groupId>com.example</groupId><artifactId>transitive</artifactId><version>${managed.version}</version>
+                </dependency>
+              </dependencies>
+            </project>"#,
+        );
+        write_artifact(
+            &repo.root,
+            "com.example",
+            "transitive",
+            "5.0",
+            &repo_pom("com.example", "transitive", "5.0", &[]),
+        );
+        let resolution = repo
+            .resolver()
+            .resolve(&[
+                declared(MavenScope::Implementation, "com.example:bom:1.0"),
+                declared(MavenScope::Implementation, "com.example:parent:1.0"),
+            ])
+            .expect("resolves");
+        assert_eq!(
+            jar_names(&resolution.classpath.compile),
+            vec!["parent-1.0.jar", "transitive-5.0.jar"]
+        );
+        assert!(
+            !resolution
+                .notes
+                .iter()
+                .any(|n| n.contains("property version"))
+        );
+    }
+
+    #[test]
+    fn bom_child_dep_with_no_version_resolves_from_managed() {
+        let repo = LocalRepo::new();
+        write_artifact(
+            &repo.root,
+            "com.example",
+            "bom",
+            "1.0",
+            r#"<?xml version="1.0"?><project>
+              <groupId>com.example</groupId><artifactId>bom</artifactId><version>1.0</version>
+              <packaging>pom</packaging>
+              <dependencyManagement>
+                <dependencies>
+                  <dependency>
+                    <groupId>com.example</groupId><artifactId>runtime-lib</artifactId><version>4.0</version>
+                  </dependency>
+                </dependencies>
+              </dependencyManagement>
+            </project>"#,
+        );
+        write_artifact(
+            &repo.root,
+            "com.example",
+            "lib-parent",
+            "1.0",
+            r#"<?xml version="1.0"?><project>
+              <groupId>com.example</groupId><artifactId>lib-parent</artifactId><version>1.0</version>
+              <dependencies>
+                <dependency>
+                  <groupId>com.example</groupId><artifactId>runtime-lib</artifactId>
+                </dependency>
+              </dependencies>
+            </project>"#,
+        );
+        write_artifact(
+            &repo.root,
+            "com.example",
+            "runtime-lib",
+            "4.0",
+            &repo_pom("com.example", "runtime-lib", "4.0", &[]),
+        );
+        let resolution = repo
+            .resolver()
+            .resolve(&[
+                declared(MavenScope::Implementation, "com.example:bom:1.0"),
+                declared(MavenScope::Implementation, "com.example:lib-parent:1.0"),
+            ])
+            .expect("resolves");
+        assert_eq!(
+            jar_names(&resolution.classpath.compile),
+            vec!["lib-parent-1.0.jar", "runtime-lib-4.0.jar"]
+        );
+    }
+
+    #[test]
+    fn compile_only_version_managed_dep_without_bom_is_skipped() {
+        let repo = LocalRepo::new();
+        write_artifact(
+            &repo.root,
+            "com.example",
+            "compile-only",
+            "1.0",
+            &repo_pom("com.example", "compile-only", "1.0", &[]),
+        );
+        let resolution = repo
+            .resolver()
+            .resolve(&[declared(
+                MavenScope::CompileOnly,
+                "com.example:compile-only",
+            )])
+            .expect("resolves");
+        assert!(
+            resolution.classpath.compile.is_empty(),
+            "compileOnly dep with no BOM version must be skipped, not panic"
+        );
+        assert!(resolution.notes.iter().any(|n| n.contains("skipped")));
     }
 }
