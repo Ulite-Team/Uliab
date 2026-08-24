@@ -54,8 +54,9 @@ pub struct BuildOptions {
     /// omitted and a plugin that needs it must be given the root another
     /// way (e.g. its own module block).
     pub android_sdk: Option<PathBuf>,
-    /// Restrict the build to the named variants (`"DebugFree"`, `"release"`;
-    /// matching is case-insensitive against the canonical PascalCase names).
+    /// Restrict the build to the named variants (`"DebugFree"` or
+    /// Gradle-style `"freeDebug"`; matching is case- and component-order-
+    /// insensitive against the canonical PascalCase names the plugins register).
     /// The host rewrites every module's model so only the
     /// selected variants' build types and flavors remain, which makes the
     /// plugins register exactly those variants' tasks — providers and
@@ -941,13 +942,13 @@ fn pascal_case(name: &str) -> String {
         .collect()
 }
 
-/// The PascalCase variant names a module model yields, mirroring the
-/// plugins' `compute_variants` naming exactly: `buildTypes {}` keys (or the
+/// Test-only mirror of the plugins' `compute_variants` naming rule: `buildTypes {}` keys (or the
 /// default `[debug, release]` pair when the block is absent) crossed with
 /// `productFlavors {}` keys in declaration-map order (`dimension` is not a
 /// flavor), one variant per build type × flavor pair. The host needs the
 /// same names the plugins will register so `--variant` selection can be
 /// validated before any plugin runs.
+#[cfg(test)]
 fn module_variant_names(model: &Value) -> Vec<String> {
     let Value::Block(entries) = model else {
         return Vec::new();
@@ -994,35 +995,11 @@ fn restrict_model_to_variants(model: &Value, selected: Option<&[String]>) -> Res
         return Ok(model.clone());
     };
 
-    // Matching is case-insensitive so `freeDebug` resolves to the
-    // canonical PascalCase `DebugFree` the plugins register.
-    let valid = module_variant_names(model);
-    let mut canonical_selected = Vec::with_capacity(selected.len());
-    for name in selected {
-        let lowered = name.to_lowercase();
-        match valid
-            .iter()
-            .find(|candidate| candidate.to_lowercase() == lowered)
-        {
-            Some(canonical) => {
-                if !canonical_selected.contains(canonical) {
-                    canonical_selected.push(canonical.clone());
-                }
-            }
-            None => {
-                let known = if valid.is_empty() {
-                    "none".to_owned()
-                } else {
-                    valid.join(", ")
-                };
-                return Err(format!(
-                    "unknown variant '{name}' (this module builds: {known})"
-                ));
-            }
-        }
-    }
-    let selected: &[String] = &canonical_selected;
-
+    // Enumerate this module's variants as (canonical name, build type,
+    // optional flavor). A selection may use either component order — the
+    // plugin-canonical `DebugFree` or the Gradle-style `freeDebug` — and
+    // case is normalized, so every reasonable spelling resolves to the
+    // canonical name the plugins register.
     let build_type_names: Vec<String> = match entries.get("buildTypes") {
         Some(Value::Block(bt)) => bt.keys().cloned().collect(),
         _ => vec!["debug".to_owned(), "release".to_owned()],
@@ -1035,30 +1012,66 @@ fn restrict_model_to_variants(model: &Value, selected: Option<&[String]>) -> Res
             .collect(),
         _ => Vec::new(),
     };
-
-    // Invert the selected variant names back to the entries that produce
-    // them, preserving each block's own key order.
-    let mut kept_build_types: Vec<String> = Vec::new();
-    let mut kept_flavors: Vec<String> = Vec::new();
+    struct Candidate<'a> {
+        canonical: String,
+        swapped_lower: Option<String>,
+        build_type: &'a str,
+        flavor: Option<&'a str>,
+    }
+    let mut candidates: Vec<Candidate<'_>> = Vec::new();
     if flavor_names.is_empty() {
         for bt in &build_type_names {
-            if selected.contains(&pascal_case(bt)) && !kept_build_types.contains(bt) {
-                kept_build_types.push(bt.clone());
-            }
+            candidates.push(Candidate {
+                canonical: pascal_case(bt),
+                swapped_lower: None,
+                build_type: bt.as_str(),
+                flavor: None,
+            });
         }
     } else {
         for bt in &build_type_names {
             for flavor in &flavor_names {
-                let name = format!("{}{}", pascal_case(bt), pascal_case(flavor));
-                if selected.contains(&name) {
-                    if !kept_build_types.contains(bt) {
-                        kept_build_types.push(bt.clone());
-                    }
-                    if !kept_flavors.contains(flavor) {
-                        kept_flavors.push(flavor.clone());
-                    }
-                }
+                let canonical = format!("{}{}", pascal_case(bt), pascal_case(flavor));
+                let swapped = format!("{}{}", pascal_case(flavor), pascal_case(bt));
+                candidates.push(Candidate {
+                    swapped_lower: Some(swapped.to_lowercase()),
+                    canonical,
+                    build_type: bt.as_str(),
+                    flavor: Some(flavor.as_str()),
+                });
             }
+        }
+    }
+
+    let mut kept_build_types: Vec<&str> = Vec::new();
+    let mut kept_flavors: Vec<&str> = Vec::new();
+    for name in selected {
+        let lowered = name.to_lowercase();
+        let matched = candidates.iter().find(|candidate| {
+            candidate.canonical.to_lowercase() == lowered
+                || candidate.swapped_lower.as_deref() == Some(lowered.as_str())
+        });
+        let Some(matched) = matched else {
+            let known = if candidates.is_empty() {
+                "none".to_owned()
+            } else {
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.canonical.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            return Err(format!(
+                "unknown variant '{name}' (this module builds: {known})"
+            ));
+        };
+        if !kept_build_types.contains(&matched.build_type) {
+            kept_build_types.push(matched.build_type);
+        }
+        if let Some(flavor) = matched.flavor
+            && !kept_flavors.contains(&flavor)
+        {
+            kept_flavors.push(flavor);
         }
     }
 
