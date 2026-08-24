@@ -1092,9 +1092,10 @@ fn resolve_model_deps(
 }
 
 /// Resolves every source-set `deps {}` block in the module model into its
-/// own classpath (see [`resolve_project_source_sets`]). The result is
-/// ordered by source-set path, matching the deterministic block iteration
-/// the evaluator produces.
+/// own classpath (see [`resolve_project_source_sets`]). When
+/// `android.compose = true`, compose BOM and runtime/UI/Material 3 deps
+/// are injected into every source-set classpath so the compose compiler
+/// plugin JAR is reachable from any target's compile classpath.
 fn resolve_source_set_classpaths(
     model: &Value,
     repos: &[MavenRepo],
@@ -1109,6 +1110,7 @@ fn resolve_source_set_classpaths(
             ));
         }
     };
+    let compose = compose_deps(model);
     let mut blocks = Vec::new();
     for (key, value) in top {
         let mut path = vec![key.clone()];
@@ -1116,7 +1118,10 @@ fn resolve_source_set_classpaths(
     }
     let mut resolved = Vec::new();
     for (path, deps) in blocks {
-        let declared = maven::parse_deps_block(deps)?;
+        let mut declared = maven::parse_deps_block(deps)?;
+        if let Some(ref compose) = compose {
+            declared.extend(compose.iter().cloned());
+        }
         let resolver = maven::Resolver::new(repos.to_vec(), cache_dir.clone());
         let classpath = resolver
             .resolve(&declared)
@@ -1705,5 +1710,131 @@ mod tests {
         });
         let value = json_to_value(&model);
         assert!(compose_deps(&value).is_none());
+    }
+
+    #[test]
+    fn source_set_classpath_injects_compose_deps_when_compose_true() {
+        let tmp = std::env::temp_dir().join(format!("uliab-compose-ss-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let repo_dir = tmp.join("repo");
+        let cache_dir = tmp.join("cache");
+        let pom_dir = repo_dir.join("com/example/lib/1.0");
+        std::fs::create_dir_all(&pom_dir).expect("create repo");
+        std::fs::write(
+            pom_dir.join("lib-1.0.pom"),
+            "<?xml version=\"1.0\"?><project>\
+             <modelVersion>4.0.0</modelVersion>\
+             <groupId>com.example</groupId><artifactId>lib</artifactId><version>1.0</version>\
+             </project>",
+        )
+        .expect("write pom");
+        std::fs::write(pom_dir.join("lib-1.0.jar"), b"jar").expect("write jar");
+
+        let model = Value::Block(
+            [
+                (
+                    "android".to_owned(),
+                    Value::Block(
+                        [("compose".to_owned(), Value::Bool(true))]
+                            .into_iter()
+                            .collect(),
+                    ),
+                ),
+                (
+                    "commonMain".to_owned(),
+                    Value::Block(
+                        [(
+                            "deps".to_owned(),
+                            Value::Block(
+                                [(
+                                    "implementation".to_owned(),
+                                    Value::Str("com.example:lib:1.0".to_owned()),
+                                )]
+                                .into_iter()
+                                .collect(),
+                            ),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    ),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let repos = vec![maven::MavenRepo::Custom(
+            repo_dir.to_string_lossy().into_owned(),
+        )];
+        let result = resolve_source_set_classpaths(&model, &repos, Some(cache_dir));
+        let error = result.expect_err("BOM resolution fails with local-only repo");
+        assert!(
+            error.contains("compose-bom"),
+            "error should mention the BOM: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn source_set_classpath_no_compose_injection_when_compose_false() {
+        let tmp =
+            std::env::temp_dir().join(format!("uliab-compose-ss-false-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let repo_dir = tmp.join("repo");
+        let cache_dir = tmp.join("cache");
+        let pom_dir = repo_dir.join("com/example/lib/1.0");
+        std::fs::create_dir_all(&pom_dir).expect("create repo");
+        std::fs::write(
+            pom_dir.join("lib-1.0.pom"),
+            "<?xml version=\"1.0\"?><project>\
+             <modelVersion>4.0.0</modelVersion>\
+             <groupId>com.example</groupId><artifactId>lib</artifactId><version>1.0</version>\
+             </project>",
+        )
+        .expect("write pom");
+        std::fs::write(pom_dir.join("lib-1.0.jar"), b"jar").expect("write jar");
+
+        let model = Value::Block(
+            [
+                (
+                    "android".to_owned(),
+                    Value::Block(
+                        [("compose".to_owned(), Value::Bool(false))]
+                            .into_iter()
+                            .collect(),
+                    ),
+                ),
+                (
+                    "commonMain".to_owned(),
+                    Value::Block(
+                        [(
+                            "deps".to_owned(),
+                            Value::Block(
+                                [(
+                                    "implementation".to_owned(),
+                                    Value::Str("com.example:lib:1.0".to_owned()),
+                                )]
+                                .into_iter()
+                                .collect(),
+                            ),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    ),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let repos = vec![maven::MavenRepo::Custom(
+            repo_dir.to_string_lossy().into_owned(),
+        )];
+        let resolved = resolve_source_set_classpaths(&model, &repos, Some(cache_dir))
+            .expect("resolves without compose");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].0, "commonMain");
+        assert_eq!(resolved[0].1.compile.len(), 1);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
