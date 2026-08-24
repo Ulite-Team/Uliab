@@ -999,7 +999,10 @@ fn restrict_model_to_variants(model: &Value, selected: Option<&[String]>) -> Res
     let mut canonical_selected = Vec::with_capacity(selected.len());
     for name in selected {
         let lowered = name.to_lowercase();
-        match valid.iter().find(|candidate| candidate.to_lowercase() == lowered) {
+        match valid
+            .iter()
+            .find(|candidate| candidate.to_lowercase() == lowered)
+        {
             Some(canonical) => {
                 if !canonical_selected.contains(canonical) {
                     canonical_selected.push(canonical.clone());
@@ -1877,8 +1880,7 @@ mod tests {
                 ])),
             ),
         ]));
-        let restricted =
-            restrict_model_to_variants(&model, Some(&["free_debug".to_owned()]));
+        let restricted = restrict_model_to_variants(&model, Some(&["free_debug".to_owned()]));
         assert!(
             restricted.is_err(),
             "underscores are not part of the name; only case is normalized"
