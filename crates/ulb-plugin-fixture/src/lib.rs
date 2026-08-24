@@ -205,6 +205,80 @@ impl exports::ulite::ulb::ulb_plugin::Guest for Fixture {
             })?;
         }
 
+        // A `variantProbe` config key (true) mirrors the plugin family's
+        // documented variant naming rule (buildTypes {} keys — or the
+        // default debug/release pair — crossed with productFlavors {}
+        // flavors, PascalCase-joined) and registers one no-op `probe<V>`
+        // echo task per computed variant. Host tests use it to prove
+        // variant selection restricts which tasks get registered at all.
+        if config.get("variantProbe").and_then(serde_json::Value::as_bool) == Some(true) {
+            let pascal = |name: &str| -> String {
+                name.split('_')
+                    .filter(|part| !part.is_empty())
+                    .map(|part| {
+                        let mut chars = part.chars();
+                        match chars.next() {
+                            None => String::new(),
+                            Some(first) => first.to_uppercase().collect::<String>()
+                                + &chars.collect::<String>(),
+                        }
+                    })
+                    .collect()
+            };
+            let build_types: Vec<String> = match config.get("buildTypes") {
+                Some(bt) => bt
+                    .as_object()
+                    .ok_or_else(|| "'buildTypes' must be a block".to_owned())?
+                    .keys()
+                    .cloned()
+                    .collect(),
+                None => vec!["debug".to_owned(), "release".to_owned()],
+            };
+            let flavors: Vec<String> = match config.get("productFlavors") {
+                Some(pf) => pf
+                    .as_object()
+                    .ok_or_else(|| "'productFlavors' must be a block".to_owned())?
+                    .keys()
+                    .filter(|key| key.as_str() != "dimension")
+                    .cloned()
+                    .collect(),
+                None => Vec::new(),
+            };
+            if flavors.is_empty() {
+                for bt in &build_types {
+                    let name = pascal(bt);
+                    task_registrar::register_task(&Task {
+                        name: format!("probe{name}"),
+                        inputs: Vec::new(),
+                        outputs: Vec::new(),
+                        depends_on: Vec::new(),
+                        action: Action::RunTool(RunToolArgs {
+                            tool: AllowlistedTool::Echo,
+                            args: vec!["probe".to_owned(), name],
+                            cwd: ".".to_owned(),
+                        }),
+                    })?;
+                }
+            } else {
+                for bt in &build_types {
+                    for flavor in &flavors {
+                        let name = format!("{}{}", pascal(bt), pascal(flavor));
+                        task_registrar::register_task(&Task {
+                            name: format!("probe{name}"),
+                            inputs: Vec::new(),
+                            outputs: Vec::new(),
+                            depends_on: Vec::new(),
+                            action: Action::RunTool(RunToolArgs {
+                                tool: AllowlistedTool::Echo,
+                                args: vec!["probe".to_owned(), name],
+                                cwd: ".".to_owned(),
+                            }),
+                        })?;
+                    }
+                }
+            }
+        }
+
         // A `mkdirProbe` config key (a directory name) registers a run-tool
         // task creating `<projectDir>/<name>`. The host injects `projectDir`
         // into every plugin configuration, so the created directory proves

@@ -97,6 +97,7 @@ impl TestProject {
             cache_dir: Some(self.dir.join(".cache")),
             repos: None,
             android_sdk: None,
+            variants: None,
         }
     }
 }
@@ -577,4 +578,60 @@ fn cross_plugin_task_refs_are_scheduled_through_the_driver() {
     assert_eq!((first.ran, first.up_to_date), (3, 0));
     let second = build_project(&project.dir, &options).expect("second build");
     assert_eq!((second.ran, second.up_to_date), (0, 3));
+}
+
+#[test]
+fn variant_selection_restricts_registered_tasks() {
+    let fixture = build_fixture("ulb-plugin-fixture");
+    let build_ulb = "source = \"in.txt\"\n\
+output = \"out.txt\"\n\
+variantProbe true\n\
+buildTypes {\n\
+  debug { minifyEnabled false }\n\
+  release { minifyEnabled true }\n\
+}\n\
+productFlavors {\n\
+  dimension \"tier\"\n\
+  free { applicationIdSuffix \".free\" }\n\
+  paid { applicationIdSuffix \".paid\" }\n\
+}\n";
+    let libs_ulb = "plugins {\n  fixture = \"ulite/fixture\" @ \"0.1.0\"\n}\n";
+
+    // Without selection, the full matrix is registered: stage + announce
+    // plus one probe per variant (debug/release × free/paid).
+    let full = TestProject::new("variant-full", &fixture);
+    full.write("build.ulb", build_ulb);
+    full.write("libs.ulb", libs_ulb);
+    let all = build_project(&full.dir, &full.options()).expect("full build");
+    assert_eq!((all.ran, all.up_to_date), (6, 0));
+
+    // Restricted to a single variant: only that probe joins the two
+    // always-registered fixture tasks.
+    let single = TestProject::new("variant-single", &fixture);
+    single.write("build.ulb", build_ulb);
+    single.write("libs.ulb", libs_ulb);
+    let options = BuildOptions {
+        variants: Some(vec!["freeDebug".to_owned()]),
+        ..single.options()
+    };
+    let selected = build_project(&single.dir, &options).expect("restricted build");
+    assert_eq!((selected.ran, selected.up_to_date), (3, 0));
+    let rerun = build_project(&single.dir, &options).expect("rebuild");
+    assert_eq!((rerun.ran, rerun.up_to_date), (0, 3));
+
+    // An unknown variant fails with the valid set named.
+    let bad = build_project(
+        &single.dir,
+        &BuildOptions {
+            variants: Some(vec!["turbo".to_owned()]),
+            ..single.options()
+        },
+    )
+    .expect_err("unknown variant must fail");
+    assert!(
+        bad.contains("unknown variant 'turbo'")
+            && bad.contains("DebugFree")
+            && bad.contains("ReleasePaid"),
+        "{bad}"
+    );
 }

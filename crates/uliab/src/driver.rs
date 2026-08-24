@@ -54,6 +54,15 @@ pub struct BuildOptions {
     /// omitted and a plugin that needs it must be given the root another
     /// way (e.g. its own module block).
     pub android_sdk: Option<PathBuf>,
+    /// Restrict the build to the named variants (e.g. `["freeDebug"]`,
+    /// `["release"]`). The host rewrites every module's model so only the
+    /// selected variants' build types and flavors remain, which makes the
+    /// plugins register exactly those variants' tasks — providers and
+    /// consumers see the same restricted matrix, so cross-module
+    /// `project(":…")` refs stay matched. `None` (or an empty list)
+    /// builds every variant. An unknown name is an error naming the
+    /// module's valid variants.
+    pub variants: Option<Vec<String>>,
 }
 
 /// Evaluates `dir` as a ulb project and runs the task graphs its plugins
@@ -152,6 +161,7 @@ pub struct BuildOptions {
 ///     cache_dir: Some(project.join(".cache")),
 ///     repos: None,
 ///     android_sdk: None,
+///     variants: None,
 /// };
 /// let first = build_project(&project, &options).expect("first build");
 /// assert_eq!((first.ran, first.up_to_date), (2, 0));
@@ -198,17 +208,24 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
         ));
     }
 
-    let model_json = module_model_to_json(&outcome.model)?;
-    reject_project_refs(&outcome.model)?;
+    // Variant selection happens on the evaluated model: restricting the
+    // build types and flavors here means every plugin sees (and registers
+    // tasks for) exactly the selected variants.
+    let model =
+        restrict_model_to_variants(&outcome.model, options.variants.as_deref())
+            .map_err(|error| format!("{}: {error}", dir.join("build.ulb").display()))?;
+
+    let model_json = module_model_to_json(&model)?;
+    reject_project_refs(&model)?;
     let repos = options
         .repos
         .clone()
         .unwrap_or_else(|| vec![maven::MavenRepo::Google, maven::MavenRepo::Central]);
-    let mut classpath = match &outcome.model {
+    let mut classpath = match &model {
         Value::Block(entries)
-            if entries.contains_key("deps") || compose_deps(&outcome.model)?.is_some() =>
+            if entries.contains_key("deps") || compose_deps(&model)?.is_some() =>
         {
-            let resolution = resolve_model_deps(&outcome.model, &repos, options.cache_dir.clone())?;
+            let resolution = resolve_model_deps(&model, &repos, options.cache_dir.clone())?;
             for note in &resolution.notes {
                 eprintln!("note: {note}");
             }
@@ -235,12 +252,12 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
         return Err(format!(
             "the module model of {} is not a block (found {})",
             dir.display(),
-            value_kind(&outcome.model)
+            value_kind(&model)
         ));
     };
 
     let source_sets =
-        resolve_source_set_classpaths(&outcome.model, &repos, options.cache_dir.clone())?;
+        resolve_source_set_classpaths(&model, &repos, options.cache_dir.clone())?;
     if !source_sets.is_empty() {
         let mut source_set_map = serde_json::Map::new();
         for (path, source_set_classpath) in &source_sets {
@@ -491,11 +508,17 @@ fn build_project_multi(
             ));
         }
 
-        let output = discover_module_output(&outcome.model, module_dir);
+        // Variant selection is applied per module so every module's
+        // plugins see the same restricted matrix — that is what keeps
+        // cross-module `project(":…")` refs matched across variants.
+        let model = restrict_model_to_variants(&outcome.model, options.variants.as_deref())
+            .map_err(|error| format!("module '{module_rel}': {error}"))?;
+
+        let output = discover_module_output(&model, module_dir);
         modules.push(EvaluatedModule {
             rel: module_rel.clone(),
             dir: module_dir.clone(),
-            model: outcome.model,
+            model,
             output,
         });
     }
@@ -900,6 +923,170 @@ fn read_source(dir: &Path, name: &str, required: bool) -> Result<String, String>
 /// arrays. Repeated scalar pair keys accumulate into a list upstream (see
 /// the merge rule in `ulb-lang`'s evaluator), so a key that appears twice
 /// in a block becomes an array rather than silently losing an entry.
+/// PascalCase conversion mirroring the plugin family's documented variant
+/// naming rule (`to_pascal_case` in the android/kmp plugins): split on `_`,
+/// drop empty parts, capitalize each remaining part's first character.
+fn pascal_case(name: &str) -> String {
+    name.split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => {
+                    let upper: String = first.to_uppercase().collect();
+                    upper + &chars.collect::<String>()
+                }
+            }
+        })
+        .collect()
+}
+
+/// The PascalCase variant names a module model yields, mirroring the
+/// plugins' `compute_variants` naming exactly: `buildTypes {}` keys (or the
+/// default `[debug, release]` pair when the block is absent) crossed with
+/// `productFlavors {}` keys in declaration-map order (`dimension` is not a
+/// flavor), one variant per build type × flavor pair. The host needs the
+/// same names the plugins will register so `--variant` selection can be
+/// validated before any plugin runs.
+fn module_variant_names(model: &Value) -> Vec<String> {
+    let Value::Block(entries) = model else {
+        return Vec::new();
+    };
+    let build_types: Vec<String> = match entries.get("buildTypes") {
+        Some(Value::Block(bt)) => bt.keys().cloned().collect(),
+        _ => vec!["debug".to_owned(), "release".to_owned()],
+    };
+    let flavors: Vec<String> = match entries.get("productFlavors") {
+        Some(Value::Block(pf)) => pf
+            .keys()
+            .filter(|key| key.as_str() != "dimension")
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    };
+    if flavors.is_empty() {
+        return build_types.iter().map(|bt| pascal_case(bt)).collect();
+    }
+    let mut names = Vec::new();
+    for bt in &build_types {
+        for flavor in &flavors {
+            names.push(format!("{}{}", pascal_case(bt), pascal_case(flavor)));
+        }
+    }
+    names
+}
+
+/// Restricts a module model to the selected variants by rewriting its
+/// `buildTypes` and `productFlavors` blocks so only the entries that
+/// produce a selected variant remain. Plugins then compute exactly those
+/// variants and register only their tasks. A module without either block,
+/// and an empty or absent selection, pass through unchanged.
+///
+/// An unknown variant name is an error listing the module's valid variants.
+fn restrict_model_to_variants(model: &Value, selected: Option<&[String]>) -> Result<Value, String> {
+    let Some(selected) = selected else {
+        return Ok(model.clone());
+    };
+    if selected.is_empty() {
+        return Ok(model.clone());
+    }
+    let Value::Block(entries) = model else {
+        return Ok(model.clone());
+    };
+
+    let valid = module_variant_names(model);
+    for name in selected {
+        if !valid.contains(name) {
+            let known = if valid.is_empty() {
+                "none".to_owned()
+            } else {
+                valid.join(", ")
+            };
+            return Err(format!("unknown variant '{name}' (this module builds: {known})"));
+        }
+    }
+
+    let build_type_names: Vec<String> = match entries.get("buildTypes") {
+        Some(Value::Block(bt)) => bt.keys().cloned().collect(),
+        _ => vec!["debug".to_owned(), "release".to_owned()],
+    };
+    let flavor_names: Vec<String> = match entries.get("productFlavors") {
+        Some(Value::Block(pf)) => pf
+            .keys()
+            .filter(|key| key.as_str() != "dimension")
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    // Invert the selected variant names back to the entries that produce
+    // them, preserving each block's own key order.
+    let mut kept_build_types: Vec<String> = Vec::new();
+    let mut kept_flavors: Vec<String> = Vec::new();
+    if flavor_names.is_empty() {
+        for bt in &build_type_names {
+            if selected.contains(&pascal_case(bt)) && !kept_build_types.contains(bt) {
+                kept_build_types.push(bt.clone());
+            }
+        }
+    } else {
+        for bt in &build_type_names {
+            for flavor in &flavor_names {
+                let name = format!("{}{}", pascal_case(bt), pascal_case(flavor));
+                if selected.contains(&name) {
+                    if !kept_build_types.contains(bt) {
+                        kept_build_types.push(bt.clone());
+                    }
+                    if !kept_flavors.contains(flavor) {
+                        kept_flavors.push(flavor.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut restricted = entries.clone();
+
+    // When the model had no explicit `buildTypes`, an explicit filtered
+    // block is inserted anyway — otherwise plugins would fall back to
+    // computing both default variants.
+    let kept_bt_block: BTreeMap<String, Value> = build_type_names
+        .iter()
+        .filter(|bt| kept_build_types.contains(bt))
+        .map(|bt| (bt.clone(), Value::Block(BTreeMap::new())))
+        .collect();
+    restricted.insert(
+        "buildTypes".to_owned(),
+        Value::Block(match entries.get("buildTypes") {
+            Some(Value::Block(bt)) => bt
+                .iter()
+                .filter(|(key, _)| kept_build_types.contains(key))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            _ => kept_bt_block.clone(),
+        }),
+    );
+    // But when the original block was present and empty it must not grow:
+    // an explicitly empty `buildTypes {}` means zero variants.
+    if matches!(entries.get("buildTypes"), Some(Value::Block(bt)) if bt.is_empty()) {
+        restricted.insert("buildTypes".to_owned(), Value::Block(BTreeMap::new()));
+    }
+
+    if let Some(Value::Block(pf)) = entries.get("productFlavors") {
+        let filtered: BTreeMap<String, Value> = pf
+            .iter()
+            .filter(|(key, _)| {
+                key.as_str() == "dimension" || kept_flavors.iter().any(|kept| kept == key)
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        restricted.insert("productFlavors".to_owned(), Value::Block(filtered));
+    }
+
+    Ok(Value::Block(restricted))
+}
+
 fn module_model_to_json(model: &Value) -> Result<serde_json::Value, String> {
     match model {
         Value::Str(value) => Ok(serde_json::Value::String(value.clone())),
@@ -1503,6 +1690,150 @@ fn resolve_project_classpath(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pascal_case_mirrors_the_plugin_rule() {
+        assert_eq!(pascal_case("debug"), "Debug");
+        assert_eq!(pascal_case("free"), "Free");
+        assert_eq!(pascal_case("paid_tier"), "PaidTier");
+        assert_eq!(pascal_case("_leading"), "Leading");
+        assert_eq!(pascal_case(""), "");
+    }
+
+    #[test]
+    fn module_variant_names_default_pair_and_matrix() {
+        let plain = Value::Block(BTreeMap::from([(
+            "android".to_owned(),
+            Value::Block(BTreeMap::new()),
+        )]));
+        assert_eq!(module_variant_names(&plain), ["Debug", "Release"]);
+
+        let matrix = Value::Block(BTreeMap::from([
+            (
+                "buildTypes".to_owned(),
+                Value::Block(BTreeMap::from([
+                    ("debug".to_owned(), Value::Block(BTreeMap::new())),
+                    ("release".to_owned(), Value::Block(BTreeMap::new())),
+                ])),
+            ),
+            (
+                "productFlavors".to_owned(),
+                Value::Block(BTreeMap::from([
+                    ("dimension".to_owned(), Value::Str("tier".to_owned())),
+                    ("free".to_owned(), Value::Block(BTreeMap::new())),
+                    ("paid".to_owned(), Value::Block(BTreeMap::new())),
+                ])),
+            ),
+        ]));
+        assert_eq!(
+            module_variant_names(&matrix),
+            [
+                "DebugFree",
+                "DebugPaid",
+                "ReleaseFree",
+                "ReleasePaid",
+            ]
+        );
+    }
+
+    #[test]
+    fn restrict_keeps_only_selected_components() {
+        let bt = || {
+            Value::Block(BTreeMap::from([
+                (
+                    "debug".to_owned(),
+                    Value::Block(BTreeMap::from([(
+                        "minifyEnabled".to_owned(),
+                        Value::Bool(false),
+                    )])),
+                ),
+                (
+                    "release".to_owned(),
+                    Value::Block(BTreeMap::from([(
+                        "minifyEnabled".to_owned(),
+                        Value::Bool(true),
+                    )])),
+                ),
+            ]))
+        };
+        let model = Value::Block(BTreeMap::from([
+            ("buildTypes".to_owned(), bt()),
+            (
+                "productFlavors".to_owned(),
+                Value::Block(BTreeMap::from([
+                    ("dimension".to_owned(), Value::Str("tier".to_owned())),
+                    ("free".to_owned(), Value::Block(BTreeMap::new())),
+                    ("paid".to_owned(), Value::Block(BTreeMap::new())),
+                ])),
+            ),
+        ]));
+
+        let restricted =
+            restrict_model_to_variants(&model, Some(&["freeDebug".to_owned()])).expect("restricts");
+
+        let Value::Block(entries) = &restricted else {
+            panic!("expected a block");
+        };
+        let Some(Value::Block(build_types)) = entries.get("buildTypes") else {
+            panic!("expected buildTypes");
+        };
+        assert_eq!(build_types.len(), 1);
+        assert!(build_types.contains_key("debug"));
+        let Some(Value::Block(flavors)) = entries.get("productFlavors") else {
+            panic!("expected productFlavors");
+        };
+        // The dimension declaration survives; only the selected flavor does.
+        assert_eq!(flavors.get("dimension"), Some(&Value::Str("tier".to_owned())));
+        assert!(flavors.contains_key("free"));
+        assert!(!flavors.contains_key("paid"));
+    }
+
+    #[test]
+    fn restrict_injects_explicit_build_types_when_absent() {
+        let model = Value::Block(BTreeMap::from([(
+            "android".to_owned(),
+            Value::Block(BTreeMap::new()),
+        )]));
+        let restricted =
+            restrict_model_to_variants(&model, Some(&["Release".to_owned()])).expect("restricts");
+        let Value::Block(entries) = &restricted else {
+            panic!("expected a block");
+        };
+        let Some(Value::Block(build_types)) = entries.get("buildTypes") else {
+            panic!("expected an explicit buildTypes block");
+        };
+        assert_eq!(build_types.len(), 1);
+        assert!(build_types.contains_key("release"));
+        assert!(!entries.contains_key("productFlavors"));
+    }
+
+    #[test]
+    fn restrict_unknown_variant_lists_valid_ones() {
+        let model = Value::Block(BTreeMap::from([(
+            "android".to_owned(),
+            Value::Block(BTreeMap::new()),
+        )]));
+        let error = restrict_model_to_variants(&model, Some(&["turbo".to_owned()]))
+            .expect_err("unknown variant");
+        assert!(
+            error.contains("unknown variant 'turbo'") && error.contains("Debug, Release"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn restrict_passes_plain_modules_through() {
+        let model = Value::Block(BTreeMap::from([(
+            "jvm".to_owned(),
+            Value::Block(BTreeMap::from([(
+                "jarFile".to_owned(),
+                Value::Str("build/app.jar".to_owned()),
+            )])),
+        )]));
+        let restricted =
+            restrict_model_to_variants(&model, Some(&["Debug".to_owned()])).expect("restricts");
+        assert_eq!(restricted, model);
+    }
 
     fn json_to_value(json: &serde_json::Value) -> Value {
         match json {

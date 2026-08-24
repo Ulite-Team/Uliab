@@ -11,7 +11,7 @@
 //!   into the cache on a miss (ARCHITECTURE.md §9, steps 5–6), and prints
 //!   the resulting local artifact paths. `SOURCE` is a registry index URL
 //!   (`https://…`) or a local `index.json` path.
-//! - `uliab build [--project DIR] [--registry SOURCE] [--cache-dir DIR] [--repo REPO] [--android-sdk DIR]`
+//! - `uliab build [--project DIR] [--registry SOURCE] [--cache-dir DIR] [--repo REPO] [--android-sdk DIR] [--variant NAME]`
 //!   — evaluates the project, configures each declared plugin with the
 //!   module model, and executes the registered task graphs incrementally
 //!   (ARCHITECTURE.md §9), printing how many tasks ran versus were skipped
@@ -20,6 +20,9 @@
 //!   directory — an explicit path that does not exist fails the build rather
 //!   than falling back to the environment conventions. Without it, `ulite`
 //!   probes `ANDROID_HOME`, then `ANDROID_SDK_ROOT`, then `~/Android/Sdk`.
+//!   `--variant NAME` (repeatable, comma-separated) restricts the build to
+//!   those variants — the host rewrites every module's build types and
+//!   flavors so plugins register only the selected variants' tasks.
 //! - `uliab deps resolve [--project DIR] [--cache-dir DIR] [--repo REPO]`
 //!   — resolves the project's `deps {}` block into a classpath
 //!   (ARCHITECTURE.md §6, §7) against the default repositories, and prints
@@ -57,7 +60,7 @@ fn main() -> ExitCode {
                 "  uliab plugins resolve [--project DIR] [--registry SOURCE] [--cache-dir DIR]"
             );
             eprintln!(
-                "  uliab build [--project DIR] [--registry SOURCE] [--cache-dir DIR] [--repo REPO] [--android-sdk DIR]"
+                "  uliab build [--project DIR] [--registry SOURCE] [--cache-dir DIR] [--repo REPO] [--android-sdk DIR] [--variant NAME]"
             );
             eprintln!("  uliab deps resolve [--project DIR] [--cache-dir DIR] [--repo REPO]");
             ExitCode::from(2)
@@ -276,6 +279,7 @@ fn cmd_build(args: &[String]) -> ExitCode {
         cache_dir: options.cache_dir.clone(),
         repos: (!options.repos.is_empty()).then_some(repos),
         android_sdk: options.android_sdk.clone(),
+        variants: (!options.variants.is_empty()).then_some(options.variants.clone()),
     };
     match build_project(project_dir, &build_options) {
         Ok(result) => {
@@ -395,6 +399,7 @@ struct Options {
     cache_dir: Option<PathBuf>,
     repos: Vec<MavenRepo>,
     android_sdk: Option<PathBuf>,
+    variants: Vec<String>,
 }
 
 fn parse_options(args: &[String]) -> Options {
@@ -404,6 +409,7 @@ fn parse_options(args: &[String]) -> Options {
         cache_dir: None,
         repos: Vec::new(),
         android_sdk: None,
+        variants: Vec::new(),
     };
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
@@ -431,6 +437,16 @@ fn parse_options(args: &[String]) -> Options {
             "--android-sdk" => {
                 if let Some(value) = iter.next() {
                     options.android_sdk = Some(PathBuf::from(value));
+                }
+            }
+            "--variant" => {
+                if let Some(value) = iter.next() {
+                    for name in value.split(',') {
+                        let name = name.trim();
+                        if !name.is_empty() && !options.variants.iter().any(|v| v == name) {
+                            options.variants.push(name.to_owned());
+                        }
+                    }
                 }
             }
             other => eprintln!("warning: ignoring unknown option '{other}'"),
