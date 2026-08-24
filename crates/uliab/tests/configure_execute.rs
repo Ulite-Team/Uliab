@@ -374,24 +374,18 @@ fn cross_plugin_dep_resolves_and_orders_tasks() {
             .expect("register consumer task");
     }
 
-    // Build the plugin→task index and resolve cross-plugin deps.
-    let mut plugin_tasks = std::collections::HashMap::new();
-    plugin_tasks.insert(
-        "ulite/fixture".to_owned(),
-        provider.graph.tasks().map(|t| t.name.clone()).collect(),
-    );
-    plugin_tasks.insert(
-        "ulite/cross-dep-fixture".to_owned(),
-        consumer.graph.tasks().map(|t| t.name.clone()).collect(),
-    );
+    // Both plugins were configured under the same module label "app", so
+    // every cross-plugin reference resolves inside that module.
     graph
-        .resolve_cross_plugin_deps(&plugin_tasks)
+        .resolve_cross_plugin_deps(&|consumer_module, _plugin, task| {
+            Some(format!("{consumer_module}::{task}"))
+        })
         .expect("resolves cross-plugin deps");
 
-    // The consumer task now depends on "stage" (resolved from the
-    // cross-plugin ref "ulite/fixture:stage").
+    // The consumer task now depends on the provider's absolute key
+    // "app::stage" (resolved from the cross-plugin ref "ulite/fixture:stage").
     let consume = graph.get("app", "consume").expect("consume task");
-    assert_eq!(consume.depends_on, vec!["stage".to_owned()]);
+    assert_eq!(consume.depends_on, vec!["app::stage".to_owned()]);
 
     // Validate the merged graph is schedulable.
     let waves = graph.waves().expect("valid graph");
@@ -465,13 +459,8 @@ fn cross_plugin_dep_undeclared_ref_is_graph_error() {
 
     // The cross-plugin dep references a plugin that wasn't configured,
     // so resolution must fail.
-    let mut plugin_tasks = std::collections::HashMap::new();
-    plugin_tasks.insert(
-        "ulite/cross-dep-fixture".to_owned(),
-        consumer.graph.tasks().map(|t| t.name.clone()).collect(),
-    );
     let error = graph
-        .resolve_cross_plugin_deps(&plugin_tasks)
+        .resolve_cross_plugin_deps(&|_, _, _| None)
         .expect_err("missing provider");
     assert!(
         error.to_string().contains("ulite/fixture:stage"),
@@ -515,26 +504,18 @@ fn undeclared_cross_plugin_ref_is_caught_by_driver_validation() {
         graph.register(task.clone()).unwrap();
     }
 
-    // Build the plugin→task index with a mismatched provider name.
-    let mut plugin_tasks = std::collections::HashMap::new();
-    plugin_tasks.insert(
-        "ulite/fixture".to_owned(),
-        provider.graph.tasks().map(|t| t.name.clone()).collect(),
-    );
-    plugin_tasks.insert(
-        "ulite/cross-dep-fixture".to_owned(),
-        consumer.graph.tasks().map(|t| t.name.clone()).collect(),
-    );
-
     // Simulate the driver's declared-deps validation: consumer declares
     // ulite/fixture, which IS present — so declared-deps pass.
     let deps_set: std::collections::HashSet<&str> =
         consumer.dependencies.iter().map(|s| s.as_str()).collect();
     assert!(deps_set.contains("ulite/fixture"));
     // Now resolve: the cross-ref "ulite/fixture:stage" resolves because
-    // the provider IS in the index. This is the correct case.
+    // the provider was configured into the same module. This is the
+    // correct case.
     graph
-        .resolve_cross_plugin_deps(&plugin_tasks)
+        .resolve_cross_plugin_deps(&|consumer_module, _plugin, task| {
+            Some(format!("{consumer_module}::{task}"))
+        })
         .expect("resolves correctly");
 
     // Now test the UNDECLARED case: register a task referencing a plugin

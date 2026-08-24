@@ -9,6 +9,8 @@
 //! `main.rs`; this library exposes the host, registry, and task sides so
 //! the CLI and the integration tests share them.
 
+#![warn(missing_docs)]
+
 pub mod driver;
 pub mod host;
 pub mod init;

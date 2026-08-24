@@ -141,7 +141,9 @@ impl Parser {
     }
 
     /// `IDENT` in identifier position. A reserved word here is the
-    /// "reserved word used as identifier" diagnostic case (GRAMMAR.md §11).
+    /// "reserved word used as identifier" diagnostic case (GRAMMAR.md §11);
+    /// any other token is reported as a missing identifier so recovery
+    /// never produces an `Invalid` node without an attached diagnostic.
     fn expect_ident(&mut self) -> Option<Ident> {
         match self.peek().clone() {
             TokenKind::Ident(text) => {
@@ -158,7 +160,21 @@ impl Parser {
                 self.advance();
                 None
             }
-            _ => None,
+            other => {
+                let span = self.peek_span();
+                let found = match &other {
+                    TokenKind::Number(_) => "a number",
+                    TokenKind::Str(_) => "a string literal",
+                    TokenKind::Bool(_) => "a boolean literal",
+                    TokenKind::Symbol(sym) => sym.as_str(),
+                    TokenKind::Eof => "end of input",
+                    TokenKind::Keyword(kw) => kw.as_str(),
+                    TokenKind::Ident(_) => "an identifier",
+                    TokenKind::Comment => "a comment",
+                };
+                self.error(span, format!("expected an identifier, found '{found}'"));
+                None
+            }
         }
     }
 
@@ -984,9 +1000,8 @@ mod tests {
     fn parses_convention_def() {
         // Uses a non-hyphenated name deliberately: GRAMMAR.md §3's IDENT
         // rule (`letter { letter | digit }`) does not include `-`, so a
-        // bare `convention android-app { }` (as GRAMMAR.md §6.3's own
-        // example writes it) cannot lex as a single identifier — see the
-        // "GRAMMAR.md vs worked examples" note in PROGRESS.md.
+        // hyphenated convention name cannot lex as a single identifier.
+        // GRAMMAR.md §6.3's example should be read with this rule in mind.
         let file = parse_ok("convention androidApp { compileSdk 37 }");
         let StatementKind::ConventionDef { name, block } = &file.statements[0].kind else {
             panic!("expected ConventionDef");
@@ -1574,6 +1589,42 @@ plugins {
             parsed.file.statements[0].kind,
             StatementKind::Invalid { .. }
         ));
+    }
+
+    #[test]
+    fn a_non_identifier_after_a_definition_name_is_diagnosed() {
+        // A number where the convention's name belongs used to recover as
+        // an Invalid statement with no diagnostic at all.
+        for src in ["convention 37 { }", "fn { x 1 }"] {
+            let parsed = parse(src);
+            assert!(
+                parsed
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("expected an identifier")),
+                "source {src:?} produced: {:?}",
+                parsed.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn a_dangling_dot_in_a_path_or_member_chain_is_diagnosed() {
+        for src in [
+            "android { implementation foo. }",
+            "android { x = props(\"p\"). }",
+            "a.b. { x 1 }",
+        ] {
+            let parsed = parse(src);
+            assert!(
+                parsed
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("expected an identifier")),
+                "source {src:?} produced: {:?}",
+                parsed.diagnostics
+            );
+        }
     }
 
     #[test]

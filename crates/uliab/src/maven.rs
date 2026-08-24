@@ -28,8 +28,8 @@
 //! whose version is absent is resolved from `dependencyManagement` entries
 //! provided by BOMs (POMs with `packaging = "pom"`) in the dependency
 //! graph. A child whose version is a `${property}` is resolved from the
-//! same managed versions when available; parent POM inheritance is not yet
-//! consulted.
+//! same managed versions when available; parent POM inheritance lies
+//! outside the resolver's scope.
 //!
 //! Artifacts are cached content-addressed under the resolver's cache
 //! directory (default `~/.cache/uliab/modules`): a jar/POM is only reused
@@ -389,11 +389,24 @@ pub struct Resolution {
 #[derive(Debug, Clone)]
 pub enum ResolveError {
     /// An artifact could not be found in any configured repository.
-    NotFound { artifact: String },
+    NotFound {
+        /// The `group:artifact:version` coordinate that was not found.
+        artifact: String,
+    },
     /// Fetching or reading an artifact failed for a non-404 reason.
-    Fetch { artifact: String, message: String },
+    Fetch {
+        /// The coordinate being fetched when the failure occurred.
+        artifact: String,
+        /// What went wrong.
+        message: String,
+    },
     /// A POM could not be parsed.
-    Parser { artifact: String, message: String },
+    Parser {
+        /// The coordinate whose POM was malformed.
+        artifact: String,
+        /// What about the POM could not be parsed.
+        message: String,
+    },
 }
 
 impl std::fmt::Display for ResolveError {
@@ -496,13 +509,6 @@ impl Resolver {
     ///     .collect();
     /// assert_eq!(jars, vec!["one-1.0.jar", "two-1.0.jar"]);
     /// ```
-    /// Resolves `declared` into a classpath, downloading POMs and jars
-    /// into the cache on a miss.
-    ///
-    /// The graph of all reachable versions is expanded first and then
-    /// partitioned into compile/runtime buckets (ARCHITECTURE.md §6, §7).
-    /// Declared dependencies whose version is empty (version-managed from
-    /// a BOM) are resolved in a second pass after BOMs have been expanded.
     pub fn resolve(&self, declared: &[DeclaredDep]) -> Result<Resolution, ResolveError> {
         let mut session = Session::new(self);
 
@@ -769,7 +775,7 @@ fn split_tokens(version: &str) -> Vec<VersionToken> {
             let is_numeric = character.is_ascii_digit();
             match (numeric, is_numeric) {
                 (Some(true), false) => {
-                    tokens.push(VersionToken::Num(number.parse().unwrap_or(0)));
+                    tokens.push(VersionToken::Num(number.parse().unwrap_or(i64::MAX)));
                     number.clear();
                 }
                 (Some(false), true) => {
@@ -785,7 +791,7 @@ fn split_tokens(version: &str) -> Vec<VersionToken> {
             numeric = Some(is_numeric);
         }
         if !number.is_empty() {
-            tokens.push(VersionToken::Num(number.parse().unwrap_or(0)));
+            tokens.push(VersionToken::Num(number.parse().unwrap_or(i64::MAX)));
         }
         if !alpha.is_empty() {
             tokens.push(VersionToken::Str(alpha));
@@ -817,8 +823,13 @@ fn compare_token(left: &VersionToken, right: &VersionToken) -> Ordering {
         (VersionToken::Str(_), VersionToken::Num(_)) => Ordering::Less,
         (VersionToken::Str(a), VersionToken::Str(b)) => {
             match (qualifier_rank(a), qualifier_rank(b)) {
-                (Some(rank_a), Some(rank_b)) if rank_a != rank_b => rank_a.cmp(&rank_b),
-                _ => a.cmp(b),
+                (Some(rank_a), Some(rank_b)) => rank_a.cmp(&rank_b).then_with(|| a.cmp(b)),
+                // An unknown qualifier sorts above every known one — the
+                // same rule a qualifier compares by against the implicit
+                // release padding.
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => a.cmp(b),
             }
         }
     }
@@ -1122,7 +1133,7 @@ impl<'a> Session<'a> {
                     } else {
                         self.notes.push(format!(
                             "{}:{}:{} uses a property version; parent POMs are \
-                             not consulted yet",
+                             outside the resolver's scope",
                             dependency.group, dependency.artifact, v
                         ));
                         continue;
@@ -1334,7 +1345,7 @@ impl<'a> Session<'a> {
             if packaging != "pom" && packaging != "jar" {
                 self.notes.push(format!(
                     "{group}:{artifact}:{version} uses packaging '{packaging}'; only jar \
-                     artifacts are materialized for now"
+                     artifacts are materialized"
                 ));
             }
         }
@@ -1357,14 +1368,20 @@ impl<'a> Session<'a> {
                         if failed.load(std::sync::atomic::Ordering::Relaxed) {
                             break;
                         }
-                        let index = queue.lock().unwrap().pop_front();
+                        let index = queue
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .pop_front();
                         let Some(index) = index else { break };
                         let ((group, artifact), version) = &jars[index];
                         let outcome = resolver.fetch_cached(group, artifact, version, "jar");
                         if outcome.is_err() {
                             failed.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
-                        results.lock().unwrap()[index] = Some(outcome);
+                        results
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())[index] =
+                            Some(outcome);
                     }
                 });
             }
@@ -1606,6 +1623,20 @@ mod tests {
             Ordering::Greater
         );
         assert_eq!(compare_maven_versions("1.0.0", "1.0.0-1"), Ordering::Less);
+        // Unknown qualifiers sort above every known qualifier and then
+        // lexicographically among themselves.
+        assert_eq!(
+            compare_maven_versions("1.0.0-android", "1.0.0-final"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_maven_versions("1.0.0-beta", "1.0.0-custom"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_maven_versions("1.0.0-zeta", "1.0.0-alpha"),
+            Ordering::Greater
+        );
     }
 
     #[test]

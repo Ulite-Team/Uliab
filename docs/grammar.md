@@ -634,6 +634,17 @@ inject into both compile and runtime, `runtimeOnly` into runtime only,
 `compileOnly` into compile only, and `testImplementation` into test
 compile and test runtime.
 
+The same value forms are valid inside nested source-set `deps {}` blocks
+(`commonMain.deps { ... }`, `kmp.androidMain.deps { ... }`, …), which the
+host resolves independently per source set. A project ref in a source-set
+deps block follows the scope rules above for that source set's classpath:
+an `api` ref contributes the target module's output plus its api-scoped
+jars, an `implementation` ref contributes only the output. Cross-module
+resolution happens after every module's own dependencies are resolved, so
+declaration order in `settings.ulb` does not matter. Project refs require
+a multi-module build: a project without `settings.ulb` rejects them with
+an error naming where they were declared.
+
 A dependency may also be specified as a two-part coordinate
 `"group:artifact"` with no version. The resolver resolves the version from
 the active BOM (Bill of Materials) via `dependencyManagement` — see
