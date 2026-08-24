@@ -1,4 +1,5 @@
-plugin "android-application"
+plugin "android"
+plugin "kmp"
 
 apply "androidApp"
 apply "envSigning"
