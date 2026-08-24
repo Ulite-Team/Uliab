@@ -107,6 +107,22 @@ jobs:
           tar -czf "uliab-${VERSION}-x86_64-linux.tar.gz" -C stage uliab
           sha256sum "uliab-${VERSION}-x86_64-linux.tar.gz" > checksums.txt
 
+      - name: Write release notes header
+        env:
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+          SHA: ${{ steps.rev.outputs.sha }}
+        run: |
+          {
+            if [ "$PRERELEASE" = "true" ]; then
+              printf '%s\n' \
+                '> [!WARNING]' \
+                '> **Unusable release — never use it.**' \
+                '> This version is not fit for real use; it is published strictly for **testing and debugging** purposes.' \
+                ''
+            fi
+            printf 'CLI built from main %s (x86_64-linux).\n' "$SHA"
+          } > release_notes.md
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
@@ -115,8 +131,7 @@ jobs:
           target_commitish: main
           prerelease: ${{ steps.version.outputs.prerelease }}
           generate_release_notes: true
-          body: |
-            Pre-release CLI built at main ${{ steps.rev.outputs.sha }} (x86_64-linux).
+          body_path: release_notes.md
           fail_on_unmatched_files: true
           files: |
             uliab-${{ steps.version.outputs.version }}-x86_64-linux.tar.gz
