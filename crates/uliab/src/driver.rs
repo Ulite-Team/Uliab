@@ -211,9 +211,9 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
     // Variant selection happens on the evaluated model: restricting the
     // build types and flavors here means every plugin sees (and registers
     // tasks for) exactly the selected variants.
-    let model =
-        restrict_model_to_variants(&outcome.model, options.variants.as_deref())
-            .map_err(|error| format!("{}: {error}", dir.join("build.ulb").display()))?;
+    let model = restrict_model_to_variants(&outcome.model, options.variants.as_deref()).map_err(
+        |error| format!("{}: {error}", dir.join("build.ulb").display()),
+    )?;
 
     let model_json = module_model_to_json(&model)?;
     reject_project_refs(&model)?;
