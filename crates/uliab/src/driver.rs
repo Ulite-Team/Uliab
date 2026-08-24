@@ -30,7 +30,7 @@ use crate::task::{
     split_cross_plugin_ref,
 };
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// The registry index consulted when [`BuildOptions`] does not name one.
 pub const DEFAULT_REGISTRY: &str =
@@ -1077,7 +1077,8 @@ fn restrict_model_to_variants(model: &Value, selected: Option<&[String]>) -> Res
         let filtered: BTreeMap<String, Value> = pf
             .iter()
             .filter(|(key, _)| {
-                key.as_str() == "dimension" || kept_flavors.iter().any(|kept| kept == key)
+                key.as_str() == "dimension"
+                    || kept_flavors.iter().any(|kept| kept.as_str() == key.as_str())
             })
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
