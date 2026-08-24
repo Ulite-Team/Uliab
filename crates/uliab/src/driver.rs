@@ -1571,7 +1571,6 @@ fn provider_module_label(
     let rel = &consumer_module[..consumer_module.len() - matched.len() - 1];
     Some(format!("{rel}/{provider_plugin}"))
 }
-
 /// Collects every `deps` block nested at or below `value`, recording each
 /// under its key path joined with `.` (`commonMain`, `kmp.commonMain`). A
 /// block's own `deps` key is recorded but never descended into, so nested
