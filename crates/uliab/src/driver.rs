@@ -1855,7 +1855,10 @@ mod tests {
         let Value::Block(entries) = &restricted else {
             panic!("expected a block");
         };
-        assert_eq!(entries.get("jvm"), model.get("jvm"));
+        let Value::Block(original_entries) = &model else {
+            panic!("expected a block");
+        };
+        assert_eq!(entries.get("jvm"), original_entries.get("jvm"));
         let Some(Value::Block(build_types)) = entries.get("buildTypes") else {
             panic!("expected an explicit buildTypes block");
         };
