@@ -145,9 +145,11 @@ impl exports::ulite::ulb::ulb_plugin::Guest for Fixture {
         }
 
         // A `sourceSetClasspath` config key (an object with `name` and
-        // `output`) registers a task that copies the first compile jar of
-        // that source set's classpath, proving the host-resolved
-        // `classpathSourceSets` map reaches the plugin.
+        // `output`, plus an optional zero-based `index`) registers a task
+        // that copies one compile jar of that source set's classpath,
+        // proving the host-resolved `classpathSourceSets` map reaches the
+        // plugin. The default index 0 covers the common case; tests use a
+        // deeper index to observe jars beyond the first entry.
         if let Some(spec) = config.get("sourceSetClasspath") {
             let name = spec
                 .get("name")
@@ -158,14 +160,18 @@ impl exports::ulite::ulb::ulb_plugin::Guest for Fixture {
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| "sourceSetClasspath is missing 'output'".to_owned())?
                 .to_owned();
+            let index = spec
+                .get("index")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
             let compile_jar = config
                 .get("classpathSourceSets")
                 .and_then(|sets| sets.get(name))
                 .and_then(|classpath| classpath.get("compile"))
                 .and_then(serde_json::Value::as_array)
-                .and_then(|jars| jars.first())
+                .and_then(|jars| jars.get(index))
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| format!("no compile jar for source set '{name}'"))?
+                .ok_or_else(|| format!("no compile jar at index {index} for source set '{name}'"))?
                 .to_owned();
             task_registrar::register_task(&Task {
                 name: "copy-source-set-classpath".to_owned(),

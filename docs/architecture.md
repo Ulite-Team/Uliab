@@ -497,16 +497,22 @@ Unchanged and still core, because every plugin needs it:
 ### 6.1 Graph model
 
 `settings.ulb` declares the module list; each `build.ulb`'s `deps {}`
-block declares project-module dependencies. The driver evaluates all
-modules in a first pass, discovers each module's output artifact
-(`jvm.jarFile` or `android.apk`), then resolves `project(":mod")` refs
-in a second pass before configuring plugins. The resolver skips
-`ProjectRef` entries during Maven resolution; `extract_project_deps`
-collects them for the host, and `resolve_project_classpath` maps them to
-jar paths on the classpath. The `api`/`implementation` distinction
-carries through: both inject the referenced module's jar into compile and
-runtime classpaths, `runtimeOnly` injects into runtime only, and
-`testImplementation` injects into the test compile and runtime classpaths.
+block declares project-module dependencies — at the top level or inside a
+nested source-set `deps {}` block. The driver evaluates all modules in a
+first pass, discovers each module's output artifact (`jvm.jarFile` or
+`android.apk`), then resolves Maven dependencies for every module (each
+module's api classpath recorded) before resolving `project(":mod")` refs
+in a second pass and configuring plugins. Because refs resolve only after
+every module's api classpath is known, declaration order in `settings.ulb`
+plays no role. The resolver skips `ProjectRef` entries during Maven
+resolution; `extract_project_deps` collects them for the host, and
+`resolve_project_classpath` maps them to jar paths on the classpath. The
+`api`/`implementation` distinction carries through: both inject the
+referenced module's jar into compile and runtime classpaths, an `api` ref
+additionally carries the referenced module's api-scoped jars,
+`runtimeOnly` injects into runtime only, and `testImplementation` injects
+into the test compile and runtime classpaths. Source-set-level refs merge
+into that source set's own classpath under the same rules.
 
 ### 6.2 `api` vs `implementation` classpath rules (core resolver, jvm-family-wide)
 
@@ -610,9 +616,13 @@ one repo produces a `PROGRESS.md` entry in the others; the
    `deps {}` block — `commonMain.deps`, `androidMain.deps`, or deeper such
    as `kmp.commonMain.deps` — resolves independently and is injected as
    `classpathSourceSets`, mapping each source-set path to its own classpath
-   (§5.3). Both are part of the configuration hash (§10)
-8. Resolve `project(":mod")` refs against discovered outputs; merge the
-   referenced module's jar into the depending module's classpath (multi only)
+   (§5.3). Both are part of the configuration hash (§10). This pass also
+   records every module's api classpath before any cross-module ref is
+   resolved
+8. Resolve `project(":mod")` refs against discovered outputs — top-level
+   and per source set; merge the referenced module's jar (plus its
+   api-scoped jars on an `api` ref) into the depending module's classpath
+   or the referencing source set's classpath (multi only)
 9. Each plugin's configure() validates its owned keys in the module model
    (with resolved classpath) and registers tasks into the core task engine
    (§3.2, §4)

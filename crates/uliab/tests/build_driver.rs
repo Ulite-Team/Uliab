@@ -372,3 +372,153 @@ fn an_explicit_sdk_override_that_does_not_exist_fails_the_build() {
     assert!(error.contains(&missing.display().to_string()), "{error}");
     assert!(error.contains("must name an existing directory"), "{error}");
 }
+
+/// Writes a one-artifact Maven repository layout under `repo/` and returns
+/// the artifact directory.
+fn write_artifact(project: &TestProject, group: &str, name: &str, jar_bytes: &[u8]) -> PathBuf {
+    let artifact_dir = project.dir.join("repo").join(group).join(name).join("1.0");
+    std::fs::create_dir_all(&artifact_dir).expect("repo dir");
+    std::fs::write(
+        artifact_dir.join(format!("{name}-1.0.pom")),
+        format!(
+            "<?xml version=\"1.0\"?><project><modelVersion>4.0.0</modelVersion>\
+             <groupId>{group}</groupId><artifactId>{name}</artifactId><version>1.0</version>\
+             </project>"
+        ),
+    )
+    .expect("write pom");
+    std::fs::write(artifact_dir.join(format!("{name}-1.0.jar")), jar_bytes).expect("write jar");
+    artifact_dir
+}
+
+/// A consumer module listed *before* its dependency in settings.ulb gets
+/// the dependency's output and api-scoped jars on its source-set compile
+/// classpath: `commonMain.deps { api project(":lib") }` resolves even
+/// though `app` is evaluated first, proving declaration order plays no
+/// role in cross-module resolution.
+#[test]
+fn source_set_project_refs_propagate_api_classpaths_regardless_of_declaration_order() {
+    let fixture = build_fixture("ulb-plugin-fixture");
+    let project = TestProject::new("source-set-project-refs", &fixture);
+
+    let bridge = write_artifact(&project, "com/example", "bridge", b"bridge jar");
+    write_artifact(&project, "com/example", "shared", b"shared jar");
+
+    project.write(
+        "settings.ulb",
+        "project \"RefOrder\"\nmodule \"app\"\nmodule \"lib\"\n",
+    );
+
+    // The dependency's declared output points at a real file so the copy
+    // task that proves propagation has something to read.
+    let lib_input = project.dir.join("lib/in.txt");
+    std::fs::create_dir_all(project.dir.join("lib")).expect("lib dir");
+    std::fs::write(&lib_input, "lib").expect("lib input");
+    project.write(
+        "lib/build.ulb",
+        &format!(
+            "jvm {{ jarFile = {:?} }}\n\
+             deps {{\n  api \"com.example:shared:1.0\"\n}}\n\
+             source = {:?}\noutput = {:?}\n",
+            bridge.join("bridge-1.0.jar").display().to_string(),
+            lib_input.display().to_string(),
+            project.dir.join("lib/out.txt").display().to_string(),
+        ),
+    );
+
+    let app_input = project.dir.join("app/in.txt");
+    std::fs::create_dir_all(project.dir.join("app")).expect("app dir");
+    std::fs::write(&app_input, "app").expect("app input");
+    let copied = project.dir.join("app/copied-shared.jar");
+    project.write(
+        "app/build.ulb",
+        &format!(
+            "commonMain.deps {{\n  api project(\":lib\")\n}}\n\
+             sourceSetClasspath {{\n  name = \"commonMain\"\n  index = 1\n  output = {:?}\n}}\n\
+             source = {:?}\noutput = {:?}\n",
+            copied.display().to_string(),
+            app_input.display().to_string(),
+            project.dir.join("app/out.txt").display().to_string(),
+        ),
+    );
+    project.write(
+        "libs.ulb",
+        "plugins {\n  fixture = \"ulite/fixture\" @ \"0.1.0\"\n}\n",
+    );
+
+    let mut options = project.options();
+    options.repos = Some(vec![MavenRepo::Custom(
+        project.dir.join("repo").display().to_string(),
+    )]);
+    let first = build_project(&project.dir, &options).expect("first build");
+    // app: stage, announce, source-set classpath copy; lib: stage, announce.
+    assert_eq!((first.ran, first.up_to_date), (5, 0));
+    // Index 1 of app's commonMain compile bucket is lib's api-scoped
+    // `shared` jar — index 0 is lib's own output.
+    assert_eq!(project.read("app/copied-shared.jar"), b"shared jar");
+
+    let second = build_project(&project.dir, &options).expect("second build");
+    assert_eq!((second.ran, second.up_to_date), (0, 5));
+}
+
+/// An `implementation`-scoped project reference carries only the depended
+/// module's output — its api-scoped jars must not leak into the consuming
+/// source set, so a probe asking for index 1 finds nothing at configure
+/// time.
+#[test]
+fn source_set_project_refs_implementation_does_not_propagate_api_jars() {
+    let fixture = build_fixture("ulb-plugin-fixture");
+    let project = TestProject::new("source-set-impl-refs", &fixture);
+
+    let bridge = write_artifact(&project, "com/example", "bridge", b"bridge jar");
+    write_artifact(&project, "com/example", "shared", b"shared jar");
+
+    project.write(
+        "settings.ulb",
+        "project \"ImplRefs\"\nmodule \"app\"\nmodule \"lib\"\n",
+    );
+
+    let lib_input = project.dir.join("lib/in.txt");
+    std::fs::create_dir_all(project.dir.join("lib")).expect("lib dir");
+    std::fs::write(&lib_input, "lib").expect("lib input");
+    project.write(
+        "lib/build.ulb",
+        &format!(
+            "jvm {{ jarFile = {:?} }}\n\
+             deps {{\n  api \"com.example:shared:1.0\"\n}}\n\
+             source = {:?}\noutput = {:?}\n",
+            bridge.join("bridge-1.0.jar").display().to_string(),
+            lib_input.display().to_string(),
+            project.dir.join("lib/out.txt").display().to_string(),
+        ),
+    );
+
+    let app_input = project.dir.join("app/in.txt");
+    std::fs::create_dir_all(project.dir.join("app")).expect("app dir");
+    std::fs::write(&app_input, "app").expect("app input");
+    project.write(
+        "app/build.ulb",
+        &format!(
+            "commonMain.deps {{\n  implementation project(\":lib\")\n}}\n\
+             sourceSetClasspath {{\n  name = \"commonMain\"\n  index = 1\n  output = {:?}\n}}\n\
+             source = {:?}\noutput = {:?}\n",
+            project.dir.join("app/copied.jar").display().to_string(),
+            app_input.display().to_string(),
+            project.dir.join("app/out.txt").display().to_string(),
+        ),
+    );
+    project.write(
+        "libs.ulb",
+        "plugins {\n  fixture = \"ulite/fixture\" @ \"0.1.0\"\n}\n",
+    );
+
+    let mut options = project.options();
+    options.repos = Some(vec![MavenRepo::Custom(
+        project.dir.join("repo").display().to_string(),
+    )]);
+    let error = build_project(&project.dir, &options).expect_err("api jars leaked");
+    assert!(
+        error.contains("no compile jar at index 1 for source set 'commonMain'"),
+        "{error}"
+    );
+}

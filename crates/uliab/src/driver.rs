@@ -199,6 +199,7 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
     }
 
     let model_json = module_model_to_json(&outcome.model)?;
+    reject_project_refs(&outcome.model)?;
     let repos = options
         .repos
         .clone()
@@ -495,15 +496,23 @@ fn build_project_multi(
         .filter_map(|m| Some((m.rel.clone(), m.output.clone()?)))
         .collect();
 
-    // ── Pass 2: resolve deps (Maven + project) and configure plugins. ──
-    let mut graph = TaskGraph::new();
-    let mut plugin_versions = Vec::new();
-    let mut config_hashes = Vec::new();
-    let mut all_plugin_tasks: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut all_declared_deps: Vec<(String, Vec<String>, HashSet<String>)> = Vec::new();
+    // ── Pass 2a: resolve every module's Maven dependencies — top-level and
+    // per-source-set — and record each module's api classpath. Cross-module
+    // `project(":…")` references are only resolved afterwards (Pass 2b), so
+    // declaration order in settings.ulb never matters: a consumer listed
+    // before its dependency still sees the dependency's api jars.
+    struct PreparedModule {
+        rel: String,
+        dir: PathBuf,
+        model_json: serde_json::Value,
+        classpath: maven::Classpath,
+        source_sets: Vec<(String, maven::Classpath)>,
+        top_level_refs: ProjectRefs,
+        source_set_refs: Vec<(String, ProjectRefs)>,
+    }
     let mut module_api_classpaths: std::collections::HashMap<String, Vec<PathBuf>> =
         std::collections::HashMap::new();
-
+    let mut prepared: Vec<PreparedModule> = Vec::with_capacity(modules.len());
     for m in &modules {
         let model_json = module_model_to_json(&m.model)?;
 
@@ -528,21 +537,99 @@ fn build_project_multi(
             }
         };
 
+        let source_sets =
+            resolve_source_set_classpaths(&m.model, &repos, options.cache_dir.clone())?;
+        for (_, source_set_classpath) in &source_sets {
+            for jar in &source_set_classpath.api {
+                if !classpath.api.contains(jar) {
+                    classpath.api.push(jar.clone());
+                }
+            }
+        }
+        module_api_classpaths.insert(m.rel.clone(), classpath.api.clone());
+
+        // Extracting the references is order-independent; only resolving
+        // them waits for the complete api-classpath map.
+        let top_level_refs = match &m.model {
+            Value::Block(entries) => entries
+                .get("deps")
+                .map(maven::extract_project_deps)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let source_set_refs = collect_source_set_project_refs(&m.model)?;
+
+        prepared.push(PreparedModule {
+            rel: m.rel.clone(),
+            dir: m.dir.clone(),
+            model_json,
+            classpath,
+            source_sets,
+            top_level_refs,
+            source_set_refs,
+        });
+    }
+
+    // ── Pass 2b: resolve cross-module project references against the
+    // complete api-classpath map, then configure every plugin.
+    let mut graph = TaskGraph::new();
+    let mut plugin_versions = Vec::new();
+    let mut config_hashes = Vec::new();
+    let mut all_plugin_tasks: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut all_declared_deps: Vec<(String, Vec<String>, HashSet<String>)> = Vec::new();
+
+    for PreparedModule {
+        rel,
+        dir,
+        model_json,
+        mut classpath,
+        mut source_sets,
+        top_level_refs,
+        source_set_refs,
+    } in prepared
+    {
+        if !top_level_refs.is_empty() {
+            let project_cp = resolve_project_classpath(
+                &top_level_refs,
+                &module_outputs,
+                &module_api_classpaths,
+                &settings.model.modules,
+            )?;
+            classpath.compile.extend(project_cp.compile);
+            classpath.runtime.extend(project_cp.runtime);
+            classpath.test_compile.extend(project_cp.test_compile);
+            classpath.test_runtime.extend(project_cp.test_runtime);
+        }
+        for (path, refs) in &source_set_refs {
+            let fragment = resolve_project_classpath(
+                refs,
+                &module_outputs,
+                &module_api_classpaths,
+                &settings.model.modules,
+            )
+            .map_err(|error| format!("{path}: {error}"))?;
+            if let Some((_, source_set_classpath)) =
+                source_sets.iter_mut().find(|(sp, _)| sp == path)
+            {
+                source_set_classpath.compile.extend(fragment.compile);
+                source_set_classpath.runtime.extend(fragment.runtime);
+                source_set_classpath
+                    .test_compile
+                    .extend(fragment.test_compile);
+                source_set_classpath
+                    .test_runtime
+                    .extend(fragment.test_runtime);
+            }
+        }
+
         let mut plugin_config = model_json;
         let plugin_config_object = plugin_config
             .as_object_mut()
             .expect("the module model serialized to an object");
 
-        let source_sets =
-            resolve_source_set_classpaths(&m.model, &repos, options.cache_dir.clone())?;
         if !source_sets.is_empty() {
             let mut source_set_map = serde_json::Map::new();
             for (path, source_set_classpath) in &source_sets {
-                for jar in &source_set_classpath.api {
-                    if !classpath.api.contains(jar) {
-                        classpath.api.push(jar.clone());
-                    }
-                }
                 source_set_map.insert(path.clone(), source_set_classpath.to_json());
             }
             plugin_config_object.insert(
@@ -550,34 +637,14 @@ fn build_project_multi(
                 serde_json::Value::Object(source_set_map),
             );
         }
-        module_api_classpaths.insert(m.rel.clone(), classpath.api.clone());
-
-        // Resolve cross-module project deps and merge into classpath.
-        if let Value::Block(deps_entries) = &m.model
-            && let Some(deps_block) = deps_entries.get("deps")
-        {
-            let project_refs = maven::extract_project_deps(deps_block);
-            if !project_refs.is_empty() {
-                let project_cp = resolve_project_classpath(
-                    &project_refs,
-                    &module_outputs,
-                    &module_api_classpaths,
-                    &settings.model.modules,
-                )?;
-                classpath.compile.extend(project_cp.compile);
-                classpath.runtime.extend(project_cp.runtime);
-                classpath.test_compile.extend(project_cp.test_compile);
-                classpath.test_runtime.extend(project_cp.test_runtime);
-            }
-        }
 
         plugin_config_object.insert("classpath".to_owned(), classpath.to_json());
 
         plugin_config_object.insert(
             "projectDir".to_owned(),
-            serde_json::json!(m.dir.display().to_string()),
+            serde_json::json!(dir.display().to_string()),
         );
-        plugin_config_object.insert("modulePath".to_owned(), serde_json::json!(m.rel));
+        plugin_config_object.insert("modulePath".to_owned(), serde_json::json!(rel));
 
         if let Some(sdk_root) = &sdk_root {
             plugin_config_object.insert(
@@ -585,7 +652,7 @@ fn build_project_multi(
                 serde_json::json!(sdk_root.display().to_string()),
             );
         }
-        let module_sdk_root = module_android_sdk_dir(&plugin_config, &m.dir);
+        let module_sdk_root = module_android_sdk_dir(&plugin_config, &dir);
         let mut sdk_roots_extra = Vec::new();
         if let Some(root) = &sdk_root {
             sdk_roots_extra.push(root.clone());
@@ -606,7 +673,7 @@ fn build_project_multi(
         config_hashes.push(hex(&Sha256::digest(config_text.as_bytes())));
 
         for spec in &libs_project.plugins {
-            let label = format!("{}/{}", m.rel, project::spec_label(spec));
+            let label = format!("{}/{}", rel, project::spec_label(spec));
             let resolved = registry
                 .resolve(spec)
                 .map_err(|error| format!("{label}: {error}"))?;
@@ -614,10 +681,10 @@ fn build_project_multi(
                 eprintln!("warning: {label}: {warning}");
             }
 
-            let module_prefixed_name = format!("{}/{}", m.rel, resolved.name);
+            let module_prefixed_name = format!("{}/{}", rel, resolved.name);
 
             let result = module_host
-                .configure(&resolved.path, &module_prefixed_name, &config_text, &m.dir)
+                .configure(&resolved.path, &module_prefixed_name, &config_text, &dir)
                 .map_err(|error| format!("configuring {label}: {error}"))?;
             let task_names: HashSet<String> =
                 result.graph.tasks().map(|t| t.name.clone()).collect();
@@ -651,7 +718,7 @@ fn build_project_multi(
                     .register(t)
                     .map_err(|error| format!("merging tasks from {label}: {error}"))?;
             }
-            plugin_versions.push(format!("{}/{}@{}", m.rel, resolved.name, resolved.version));
+            plugin_versions.push(format!("{}/{}@{}", rel, resolved.name, resolved.version));
         }
     }
 
@@ -1140,6 +1207,66 @@ fn resolve_source_set_classpaths(
     Ok(resolved)
 }
 
+/// A scope paired with the module path it references (`":shared"`), as
+/// extracted from a `deps {}` block by [`maven::extract_project_deps`].
+type ProjectRefs = Vec<(maven::MavenScope, String)>;
+
+/// Collects the `project(":module")` references declared inside every
+/// source-set `deps {}` block of the module model, keyed by the same dotted
+/// paths [`resolve_source_set_classpaths`] uses. Extraction is separated
+/// from resolution so a multi-module build can gather every module's
+/// references first and resolve them only once each module's api classpath
+/// is known — declaration order in settings.ulb then plays no role.
+fn collect_source_set_project_refs(model: &Value) -> Result<Vec<(String, ProjectRefs)>, String> {
+    let top = match model {
+        Value::Block(entries) => entries,
+        other => {
+            return Err(format!(
+                "the module model is not a block (found {})",
+                value_kind(other)
+            ));
+        }
+    };
+    let mut blocks = Vec::new();
+    for (key, value) in top {
+        let mut path = vec![key.clone()];
+        collect_source_set_deps(&mut blocks, &mut path, value)?;
+    }
+    let mut refs = Vec::new();
+    for (path, deps) in blocks {
+        let project_deps = maven::extract_project_deps(deps);
+        if !project_deps.is_empty() {
+            refs.push((path, project_deps));
+        }
+    }
+    Ok(refs)
+}
+
+/// Errors when the module model declares any `project(":…")` dependency,
+/// at the top level or inside a nested source set. Only a multi-module
+/// build can satisfy such references; a single-module build has no other
+/// modules to resolve them against.
+fn reject_project_refs(model: &Value) -> Result<(), String> {
+    let mut locations = Vec::new();
+    if let Value::Block(entries) = model
+        && let Some(deps) = entries.get("deps")
+        && !maven::extract_project_deps(deps).is_empty()
+    {
+        locations.push("deps".to_owned());
+    }
+    for path in collect_source_set_project_refs(model)? {
+        locations.push(format!("{}.deps", path.0));
+    }
+    if locations.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "project() dependencies are only valid in a multi-module build with a settings.ulb \
+         declaring more than one module (found at {})",
+        locations.join(", ")
+    ))
+}
+
 /// Collects every `deps` block nested at or below `value`, recording each
 /// under its key path joined with `.` (`commonMain`, `kmp.commonMain`). A
 /// block's own `deps` key is recorded but never descended into, so nested
@@ -1557,6 +1684,114 @@ mod tests {
         );
         let error = resolve_source_set_classpaths(&model, &[], None).expect_err("malformed deps");
         assert!(error.contains("deps at 'commonMain'"), "{error}");
+    }
+
+    #[test]
+    fn source_set_project_refs_are_collected_by_key_path_and_scope() {
+        let block = |entries: &[(&str, Value)]| -> Value {
+            Value::Block(
+                entries
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), value.clone()))
+                    .collect(),
+            )
+        };
+        let model = block(&[
+            (
+                "deps",
+                block(&[("implementation", Value::ProjectRef(":top".to_owned()))]),
+            ),
+            (
+                "commonMain",
+                block(&[(
+                    "deps",
+                    block(&[
+                        ("api", Value::ProjectRef(":lib".to_owned())),
+                        (
+                            "implementation",
+                            Value::Str("com.example:one:1.0".to_owned()),
+                        ),
+                    ]),
+                )]),
+            ),
+            (
+                "jvmTest",
+                block(&[(
+                    "deps",
+                    block(&[(
+                        "testImplementation",
+                        Value::List(vec![Value::ProjectRef(":testing".to_owned())]),
+                    )]),
+                )]),
+            ),
+        ]);
+
+        let refs = collect_source_set_project_refs(&model).expect("collects");
+        assert_eq!(refs.len(), 2, "top-level deps are not source sets");
+        assert_eq!(
+            refs[0],
+            (
+                "commonMain".to_owned(),
+                vec![(maven::MavenScope::Api, ":lib".to_owned())]
+            )
+        );
+        assert_eq!(
+            refs[1],
+            (
+                "jvmTest".to_owned(),
+                vec![(maven::MavenScope::TestImplementation, ":testing".to_owned())]
+            )
+        );
+    }
+
+    #[test]
+    fn reject_project_refs_names_top_level_and_nested_locations() {
+        let block = |entries: &[(&str, Value)]| -> Value {
+            Value::Block(
+                entries
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), value.clone()))
+                    .collect(),
+            )
+        };
+        let clean = block(&[
+            (
+                "jvm",
+                block(&[("jarFile", Value::Str("build/app.jar".to_owned()))]),
+            ),
+            (
+                "commonMain",
+                block(&[(
+                    "deps",
+                    block(&[(
+                        "implementation",
+                        Value::Str("com.example:one:1.0".to_owned()),
+                    )]),
+                )]),
+            ),
+        ]);
+        assert!(reject_project_refs(&clean).is_ok());
+
+        let offending = block(&[
+            (
+                "deps",
+                block(&[("api", Value::ProjectRef(":lib".to_owned()))]),
+            ),
+            (
+                "kmp",
+                block(&[(
+                    "commonMain",
+                    block(&[(
+                        "deps",
+                        block(&[("api", Value::ProjectRef(":lib".to_owned()))]),
+                    )]),
+                )]),
+            ),
+        ]);
+        let error = reject_project_refs(&offending).expect_err("project refs rejected");
+        assert!(error.contains("settings.ulb"), "{error}");
+        assert!(error.contains("deps"), "{error}");
+        assert!(error.contains("kmp.commonMain.deps"), "{error}");
     }
 
     #[test]
