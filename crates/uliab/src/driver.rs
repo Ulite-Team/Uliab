@@ -996,6 +996,7 @@ fn restrict_model_to_variants(model: &Value, selected: Option<&[String]>) -> Res
 
     // Matching is case-insensitive so `freeDebug` resolves to the
     // canonical PascalCase `DebugFree` the plugins register.
+    let valid = module_variant_names(model);
     let mut canonical_selected = Vec::with_capacity(selected.len());
     for name in selected {
         let lowered = name.to_lowercase();
