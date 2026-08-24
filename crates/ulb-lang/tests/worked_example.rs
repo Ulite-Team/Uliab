@@ -1,12 +1,12 @@
 //! End-to-end evaluation of the `examples/sample-kmp/` worked example.
 //!
-//! Reads the three source files plus `signing.properties` from the example
-//! directory, injects the environment and properties the `signing` block
-//! needs (see [`ulb_lang::eval::EvalEnvironment`]), and asserts the
-//! resolved module model reflects GRAMMAR.md §6–§10 semantics: convention
-//! `apply` merging into block targets, catalog aliases resolving to
-//! coordinates, repeated scalar pairs accumulating, and task `run` actions
-//! captured as data.
+//! Reads the four `.ulb` source files plus `signing.properties` from the
+//! example directory, injects the environment and properties the `signing`
+//! block needs (see [`ulb_lang::eval::EvalEnvironment`]), evaluates
+//! settings.ulb, and asserts the resolved module model reflects GRAMMAR.md
+//! §6–§10 semantics: convention `apply` merging into block targets, catalog
+//! aliases resolving to coordinates, repeated scalar pairs accumulating,
+//! and task `run` actions captured as data.
 
 use std::collections::BTreeMap;
 
@@ -57,8 +57,8 @@ fn sample_kmp_evaluates_to_expected_model() {
     };
 
     // Repeated `plugin "..."` scalar pairs accumulate into a List (see the
-    // module-level merge rule in eval.rs), one entry per applied plugin
-    // alias from libs.ulb's plugins {} table.
+    // module-level merge rule in eval.rs), one entry per plugin statement;
+    // here they name the aliases declared in libs.ulb's plugins {} table.
     assert_eq!(
         coordinate_list(top, "plugin"),
         vec![
