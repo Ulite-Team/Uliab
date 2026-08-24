@@ -211,9 +211,8 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
     // Variant selection happens on the evaluated model: restricting the
     // build types and flavors here means every plugin sees (and registers
     // tasks for) exactly the selected variants.
-    let model = restrict_model_to_variants(&outcome.model, options.variants.as_deref()).map_err(
-        |error| format!("{}: {error}", dir.join("build.ulb").display()),
-    )?;
+    let model = restrict_model_to_variants(&outcome.model, options.variants.as_deref())
+        .map_err(|error| format!("{}: {error}", dir.join("build.ulb").display()))?;
 
     let model_json = module_model_to_json(&model)?;
     reject_project_refs(&model)?;
@@ -256,8 +255,7 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
         ));
     };
 
-    let source_sets =
-        resolve_source_set_classpaths(&model, &repos, options.cache_dir.clone())?;
+    let source_sets = resolve_source_set_classpaths(&model, &repos, options.cache_dir.clone())?;
     if !source_sets.is_empty() {
         let mut source_set_map = serde_json::Map::new();
         for (path, source_set_classpath) in &source_sets {
@@ -1003,7 +1001,9 @@ fn restrict_model_to_variants(model: &Value, selected: Option<&[String]>) -> Res
             } else {
                 valid.join(", ")
             };
-            return Err(format!("unknown variant '{name}' (this module builds: {known})"));
+            return Err(format!(
+                "unknown variant '{name}' (this module builds: {known})"
+            ));
         }
     }
 
@@ -1727,12 +1727,7 @@ mod tests {
         ]));
         assert_eq!(
             module_variant_names(&matrix),
-            [
-                "DebugFree",
-                "DebugPaid",
-                "ReleaseFree",
-                "ReleasePaid",
-            ]
+            ["DebugFree", "DebugPaid", "ReleaseFree", "ReleasePaid",]
         );
     }
 
@@ -1783,7 +1778,10 @@ mod tests {
             panic!("expected productFlavors");
         };
         // The dimension declaration survives; only the selected flavor does.
-        assert_eq!(flavors.get("dimension"), Some(&Value::Str("tier".to_owned())));
+        assert_eq!(
+            flavors.get("dimension"),
+            Some(&Value::Str("tier".to_owned()))
+        );
         assert!(flavors.contains_key("free"));
         assert!(!flavors.contains_key("paid"));
     }

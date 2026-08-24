@@ -211,7 +211,11 @@ impl exports::ulite::ulb::ulb_plugin::Guest for Fixture {
         // flavors, PascalCase-joined) and registers one no-op `probe<V>`
         // echo task per computed variant. Host tests use it to prove
         // variant selection restricts which tasks get registered at all.
-        if config.get("variantProbe").and_then(serde_json::Value::as_bool) == Some(true) {
+        if config
+            .get("variantProbe")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
             let pascal = |name: &str| -> String {
                 name.split('_')
                     .filter(|part| !part.is_empty())
@@ -219,8 +223,10 @@ impl exports::ulite::ulb::ulb_plugin::Guest for Fixture {
                         let mut chars = part.chars();
                         match chars.next() {
                             None => String::new(),
-                            Some(first) => first.to_uppercase().collect::<String>()
-                                + &chars.collect::<String>(),
+                            Some(first) => {
+                                first.to_uppercase().collect::<String>()
+                                    + &chars.collect::<String>()
+                            }
                         }
                     })
                     .collect()
