@@ -14,7 +14,7 @@
 //! is target-agnostic — it schedules and runs actions but never inspects a
 //! module model, so the same executor drives every toolchain plugin.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -172,15 +172,21 @@ impl Task {
 /// Splits a dependency string into `(plugin_name, task_name)` when it
 /// uses the cross-plugin format `"plugin_name:task_name"` (single colon).
 ///
-/// Task names and plugin names are not allowed to contain colons; this
-/// ensures unambiguous parsing. Returns `None` for bare same-module
-/// dependency references.
+/// Task names and plugin names are not allowed to contain colons; a part
+/// that still carries one means the string is not a well-formed
+/// cross-plugin reference, and `None` is returned so it surfaces later as
+/// a resolution error instead of being split at the wrong colon. Returns
+/// `None` for bare same-module dependency references.
 #[must_use]
 pub fn split_cross_plugin_ref(dep: &str) -> Option<(&str, &str)> {
     let colon_pos = dep.find(':')?;
     let plugin_name = &dep[..colon_pos];
     let task_name = &dep[colon_pos + 1..];
-    if plugin_name.is_empty() || task_name.is_empty() {
+    if plugin_name.is_empty()
+        || task_name.is_empty()
+        || plugin_name.contains(':')
+        || task_name.contains(':')
+    {
         return None;
     }
     Some((plugin_name, task_name))
@@ -346,7 +352,15 @@ impl TaskGraph {
         stack.push(key.to_owned());
         let mut max_dep = 0;
         for dep in &task.depends_on {
-            let dep_key = format!("{}::{}", task.module, dep);
+            // A dependency containing the `::` separator is an
+            // already-resolved absolute key — cross-plugin resolution
+            // rewrote it to point at the provider's own module. Anything
+            // else names a task in the same module.
+            let dep_key = if dep.contains("::") {
+                dep.clone()
+            } else {
+                format!("{}::{}", task.module, dep)
+            };
             max_dep = max_dep.max(self.explore(&dep_key, depths, state, stack)?);
         }
         stack.pop();
@@ -363,35 +377,36 @@ impl TaskGraph {
     /// Resolves cross-plugin dependency references in `depends_on` entries.
     ///
     /// A cross-plugin dep uses the format `"plugin_name:task_name"` (single
-    /// colon). The `plugin_task_names` mapping tells which task names each
-    /// plugin registered. After resolution, every `"plugin:task"` entry is
-    /// replaced with the bare `task_name` — since all tasks in the graph
-    /// share the same module, `waves()` resolves the bare name correctly.
+    /// colon). The `locate_provider` closure decides where the provider
+    /// task actually lives: tasks are registered under module labels that
+    /// embed both the project module and the plugin name, so only the
+    /// caller knows how to map `(consumer module, provider plugin,
+    /// task name)` onto a concrete graph key such as `"app/ulite/kmp"`.
+    /// Returning `None` reports an unknown dependency.
+    ///
+    /// After resolution every cross-plugin entry is replaced with the
+    /// provider's absolute `module::task` key; [`Self::waves`] treats keys
+    /// containing `::` as absolute and everything else as same-module.
     ///
     /// # Errors
     ///
-    /// Returns an error when a cross-plugin dep references a plugin or
-    /// task name that has no matching entry in the graph.
+    /// Returns [`GraphError::UnknownDependency`] when `locate_provider`
+    /// finds no registration for a referenced plugin task.
     pub fn resolve_cross_plugin_deps(
         &mut self,
-        plugin_task_names: &HashMap<String, HashSet<String>>,
+        locate_provider: &dyn Fn(&str, &str, &str) -> Option<String>,
     ) -> Result<(), GraphError> {
         let keys: Vec<String> = self.order.to_vec();
         for key in &keys {
             if let Some(task) = self.tasks.get_mut(key) {
                 for dep in &mut task.depends_on {
                     if let Some((plugin_name, task_name)) = split_cross_plugin_ref(dep) {
-                        match plugin_task_names.get(plugin_name) {
-                            Some(tasks) if tasks.contains(task_name) => {
-                                *dep = task_name.to_owned();
-                            }
-                            _ => {
-                                return Err(GraphError::UnknownDependency {
-                                    task: key.clone(),
-                                    dep: dep.clone(),
-                                });
-                            }
-                        }
+                        let resolved = locate_provider(&task.module, plugin_name, task_name)
+                            .ok_or_else(|| GraphError::UnknownDependency {
+                                task: key.clone(),
+                                dep: dep.clone(),
+                            })?;
+                        *dep = resolved;
                     }
                 }
             }
@@ -444,7 +459,9 @@ impl FingerprintStore {
     ///
     /// # Errors
     ///
-    /// Returns an error when the file exists but is not valid JSON state.
+    /// Returns an error when the file exists but cannot be read (e.g. a
+    /// permission problem — silently rebuilding and overwriting it would
+    /// hide the cause) or is not valid JSON state.
     pub fn load(state_path: impl Into<PathBuf>) -> Result<Self, String> {
         let state_path = state_path.into();
         let fingerprints = match std::fs::read_to_string(&state_path) {
@@ -458,7 +475,10 @@ impl FingerprintStore {
                     BTreeMap::new()
                 }
             }
-            Err(_) => BTreeMap::new(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(error) => {
+                return Err(format!("{}: {error}", state_path.display()));
+            }
         };
         Ok(Self {
             state_path,
@@ -645,10 +665,16 @@ impl Executor {
             let mut up_to_date: Vec<String> = Vec::new();
             for task in wave {
                 let key = format!("{}::{}", task.module, task.name);
-                let deps_up_to_date = task
-                    .depends_on
-                    .iter()
-                    .all(|dep| up_to_date_keys.contains(&format!("{}::{dep}", task.module)));
+                let deps_up_to_date = task.depends_on.iter().all(|dep| {
+                    // Absolute keys (rewritten cross-plugin refs) are used
+                    // verbatim; bare names belong to the same module.
+                    let dep_key = if dep.contains("::") {
+                        dep.clone()
+                    } else {
+                        format!("{}::{dep}", task.module)
+                    };
+                    up_to_date_keys.contains(&dep_key)
+                });
                 let fingerprint = fingerprint(task, ctx);
                 if deps_up_to_date && store.is_up_to_date(&key, &fingerprint) {
                     up_to_date_keys.insert(key.clone());
@@ -703,10 +729,19 @@ impl Executor {
             for _ in 0..workers {
                 scope.spawn(|| {
                     loop {
-                        let index = queue.lock().unwrap().pop_front();
+                        // A panicking sibling poisons the mutexes; the
+                        // guards are recovered so remaining workers keep
+                        // draining the queue instead of deadlocking.
+                        let index = queue
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .pop_front();
                         let Some(index) = index else { break };
                         let outcome = self.run_caught(tasks[index].0);
-                        results.lock().unwrap()[index] = Some(outcome);
+                        results
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())[index] =
+                            Some(outcome);
                     }
                 });
             }
@@ -920,12 +955,26 @@ fn streamed_digest(file: &Path) -> Option<[u8; 32]> {
 }
 
 /// Collects every file (not directory) under `dir`, recursively.
+///
+/// Symlinked directories are not followed: an input tree is hashed by its
+/// own contents, and a symlink pointing at an ancestor would otherwise
+/// recurse forever.
 fn collect_dir_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
             collect_dir_files(&path, out)?;
+        } else if file_type.is_symlink() {
+            // A symlinked file contributes its target's bytes; a symlinked
+            // directory is skipped rather than descended into. Resolve the
+            // link once and classify the target.
+            let target_type = std::fs::metadata(&path).map(|m| m.is_dir());
+            match target_type {
+                Ok(false) | Err(_) => out.push(path),
+                Ok(true) => {}
+            }
         } else {
             out.push(path);
         }
@@ -1714,15 +1763,15 @@ mod tests {
             .unwrap();
         graph.register(copy_task("stage", "a", "b")).unwrap();
 
-        let mut plugin_tasks = HashMap::new();
-        plugin_tasks.insert(
-            "ulite/fixture".to_owned(),
-            HashSet::from(["stage".to_owned()]),
-        );
-        graph.resolve_cross_plugin_deps(&plugin_tasks).unwrap();
+        // Both tasks live under the same module label here, mirroring a
+        // single-plugin-per-module world: the provider of any plugin's
+        // reference is that module itself.
+        graph
+            .resolve_cross_plugin_deps(&|_consumer, _plugin, task| Some(format!("app::{task}")))
+            .unwrap();
 
         let consume = graph.get("app", "consume").unwrap();
-        assert_eq!(consume.depends_on, vec!["stage".to_owned()]);
+        assert_eq!(consume.depends_on, vec!["app::stage".to_owned()]);
 
         let waves = graph.waves().unwrap();
         assert_eq!(waves.len(), 2, "stage in wave 0, consume in wave 1");
@@ -1737,9 +1786,8 @@ mod tests {
                 ..copy_task("a", "x", "y")
             })
             .unwrap();
-        let plugin_tasks = HashMap::new();
         let error = graph
-            .resolve_cross_plugin_deps(&plugin_tasks)
+            .resolve_cross_plugin_deps(&|_, _, _| None)
             .expect_err("unknown plugin");
         assert!(error.to_string().contains("ulite/unknown:task"));
     }
@@ -1753,13 +1801,15 @@ mod tests {
                 ..copy_task("a", "x", "y")
             })
             .unwrap();
-        let mut plugin_tasks = HashMap::new();
-        plugin_tasks.insert(
-            "ulite/fixture".to_owned(),
-            HashSet::from(["stage".to_owned()]),
-        );
         let error = graph
-            .resolve_cross_plugin_deps(&plugin_tasks)
+            .resolve_cross_plugin_deps(&|consumer_module, _plugin, task| {
+                // The plugin is known but only registers other tasks.
+                if task == "stage" {
+                    Some(format!("{consumer_module}::stage"))
+                } else {
+                    None
+                }
+            })
             .expect_err("unknown task");
         assert!(error.to_string().contains("ulite/fixture:ghost"));
     }

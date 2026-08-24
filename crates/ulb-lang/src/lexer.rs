@@ -28,6 +28,11 @@ pub struct Lexed {
 
 impl Lexed {
     /// `Ok(tokens)` when lexing was clean, `Err(diagnostics)` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns the collected diagnostics when any were produced; the
+    /// tokens are then discarded.
     pub fn ok(self) -> Result<Vec<Token>, Vec<Diagnostic>> {
         if self.diagnostics.is_empty() {
             Ok(self.tokens)

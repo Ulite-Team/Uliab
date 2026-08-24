@@ -16,8 +16,8 @@ use crate::registry::PluginSpec;
 pub struct ProjectPlugins {
     /// Path of the `libs.ulb` the entries came from.
     pub libs_path: PathBuf,
-    /// One spec per `plugins {}` entry, in declaration order as stored in
-    /// the evaluator's [`Definitions`] (sorted by alias name).
+    /// One spec per `plugins {}` entry, sorted by alias name as stored in
+    /// the evaluator's [`Definitions`].
     pub plugins: Vec<PluginSpec>,
 }
 
@@ -110,7 +110,8 @@ pub fn read_libs_plugins(dir: &Path) -> Result<ProjectPlugins, String> {
     Ok(ProjectPlugins { libs_path, plugins })
 }
 
-/// Renders a spec for CLI output, e.g. `ulite/hello (unversioned)`.
+/// Renders a spec for CLI output, e.g. `ulite/hello@1.0.0` or, when the
+/// spec pins no version, `ulite/hello (newest compatible)`.
 #[must_use]
 pub fn spec_label(spec: &PluginSpec) -> String {
     match &spec.version {
@@ -208,7 +209,7 @@ pub fn read_settings(dir: &Path) -> Result<Option<ProjectSettings>, String> {
             ));
         }
         if path.contains("..") {
-            return Err(format!("module '{path}' must not contain '..' segments"));
+            return Err(format!("module '{path}' must not contain '..'"));
         }
         module_dirs.push(dir.join(path));
     }

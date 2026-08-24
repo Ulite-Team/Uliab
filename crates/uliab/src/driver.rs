@@ -206,7 +206,7 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
         .unwrap_or_else(|| vec![maven::MavenRepo::Google, maven::MavenRepo::Central]);
     let mut classpath = match &outcome.model {
         Value::Block(entries)
-            if entries.contains_key("deps") || compose_deps(&outcome.model).is_some() =>
+            if entries.contains_key("deps") || compose_deps(&outcome.model)?.is_some() =>
         {
             let resolution = resolve_model_deps(&outcome.model, &repos, options.cache_dir.clone())?;
             for note in &resolution.notes {
@@ -231,9 +231,13 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
     // too, so a jar that changes without its version changing (a SNAPSHOT,
     // say) still reruns affected tasks.
     let mut plugin_config = model_json;
-    let plugin_config_object = plugin_config
-        .as_object_mut()
-        .expect("the module model serialized to an object");
+    let Some(plugin_config_object) = plugin_config.as_object_mut() else {
+        return Err(format!(
+            "the module model of {} is not a block (found {})",
+            dir.display(),
+            value_kind(&outcome.model)
+        ));
+    };
 
     let source_sets =
         resolve_source_set_classpaths(&outcome.model, &repos, options.cache_dir.clone())?;
@@ -368,7 +372,13 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
         }
     }
     graph
-        .resolve_cross_plugin_deps(&plugin_tasks)
+        .resolve_cross_plugin_deps(&|_consumer_module, plugin, task| {
+            // Single-module builds label every plugin's tasks with the
+            // plugin name alone, so the provider of any reference is
+            // `<plugin>::<task>`. Unknown providers surface from the wave
+            // computation as unknown dependencies naming that key.
+            Some(format!("{plugin}::{task}"))
+        })
         .map_err(|error| format!("resolving cross-plugin dependencies: {error}"))?;
 
     let ctx = FingerprintContext {
@@ -519,7 +529,7 @@ fn build_project_multi(
         // Resolve Maven deps (project refs are skipped by parse_deps_block).
         let mut classpath = match &m.model {
             Value::Block(entries)
-                if entries.contains_key("deps") || compose_deps(&m.model).is_some() =>
+                if entries.contains_key("deps") || compose_deps(&m.model)?.is_some() =>
             {
                 let resolution = resolve_model_deps(&m.model, &repos, options.cache_dir.clone())?;
                 for note in &resolution.notes {
@@ -576,6 +586,7 @@ fn build_project_multi(
     let mut plugin_versions = Vec::new();
     let mut config_hashes = Vec::new();
     let mut all_plugin_tasks: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut all_plugin_names: HashSet<String> = HashSet::new();
     let mut all_declared_deps: Vec<(String, Vec<String>, HashSet<String>)> = Vec::new();
 
     for PreparedModule {
@@ -623,9 +634,12 @@ fn build_project_multi(
         }
 
         let mut plugin_config = model_json;
-        let plugin_config_object = plugin_config
-            .as_object_mut()
-            .expect("the module model serialized to an object");
+        let Some(plugin_config_object) = plugin_config.as_object_mut() else {
+            return Err(format!(
+                "the module model of {}/build.ulb is not a block",
+                dir.display()
+            ));
+        };
 
         if !source_sets.is_empty() {
             let mut source_set_map = serde_json::Map::new();
@@ -694,6 +708,7 @@ fn build_project_multi(
                 .entry(resolved.name.clone())
                 .or_default()
                 .extend(task_names);
+            all_plugin_names.insert(resolved.name.clone());
             // Validate that every cross-plugin reference in this plugin's
             // tasks names a plugin listed in its declared `dependencies`.
             let deps_set: HashSet<&str> = result.dependencies.iter().map(|s| s.as_str()).collect();
@@ -734,7 +749,10 @@ fn build_project_multi(
         }
     }
     graph
-        .resolve_cross_plugin_deps(&all_plugin_tasks)
+        .resolve_cross_plugin_deps(&|consumer_module, plugin, task| {
+            let label = provider_module_label(&all_plugin_names, consumer_module, plugin)?;
+            Some(format!("{label}::{task}"))
+        })
         .map_err(|error| format!("resolving cross-plugin dependencies: {error}"))?;
 
     let ctx = FingerprintContext {
@@ -1078,8 +1096,6 @@ fn evaluate_project_dir(dir: &Path) -> Result<ulb_lang::eval::EvalOutcome, Strin
     Ok(outcome)
 }
 
-/// Resolves the `deps {}` block of an evaluated module model, erroring when
-/// the model declares none.
 /// Default Compose BOM version injected when `compose = true` but no
 /// `composeVersion` is specified in the `android {}` block.
 const DEFAULT_COMPOSE_BOM_VERSION: &str = "2026.08.00";
@@ -1091,28 +1107,37 @@ const DEFAULT_COMPOSE_BOM_VERSION: &str = "2026.08.00";
 /// `dependencyManagement`).
 ///
 /// The `composeVersion` key in the `android {}` block specifies the
-/// Compose BOM version (e.g. `"2026.08.00"` or `ver("2026.08.00")`).
-/// When omitted the latest stable BOM at the time of implementation is
-/// used.
-fn compose_deps(model: &Value) -> Option<Vec<maven::DeclaredDep>> {
+/// Compose BOM version (e.g. `"2026.08.00"` or `ver("2026.08.00")`);
+/// when omitted the default above is injected.
+///
+/// # Errors
+///
+/// Returns an error when `composeVersion` is present but not displayable
+/// as a coordinate version segment.
+fn compose_deps(model: &Value) -> Result<Option<Vec<maven::DeclaredDep>>, String> {
     let android = match model {
-        Value::Block(entries) => entries.get("android")?,
-        _ => return None,
+        Value::Block(entries) => entries.get("android"),
+        _ => return Ok(None),
+    };
+    let Some(android) = android else {
+        return Ok(None);
     };
     let compose = match android {
-        Value::Block(entries) => entries.get("compose")?,
-        _ => return None,
+        Value::Block(entries) => entries.get("compose"),
+        _ => return Ok(None),
+    };
+    let Some(compose) = compose else {
+        return Ok(None);
     };
     if !matches!(compose, Value::Bool(true)) {
-        return None;
+        return Ok(None);
     }
     let compose_version = match android {
         Value::Block(entries) => match entries.get("composeVersion") {
             Some(Value::Str(v)) => v.clone(),
-            Some(v) => match v.as_display_string() {
-                Some(text) => text,
-                None => DEFAULT_COMPOSE_BOM_VERSION.to_owned(),
-            },
+            Some(v) => v.as_display_string().ok_or_else(|| {
+                "android.composeVersion must be a string or version value".to_owned()
+            })?,
             None => DEFAULT_COMPOSE_BOM_VERSION.to_owned(),
         },
         _ => DEFAULT_COMPOSE_BOM_VERSION.to_owned(),
@@ -1123,7 +1148,7 @@ fn compose_deps(model: &Value) -> Option<Vec<maven::DeclaredDep>> {
         dependency: maven::Dependency::parse(&format!(
             "androidx.compose:compose-bom:{compose_version}"
         ))
-        .expect("valid BOM coordinate"),
+        .map_err(|error| format!("invalid android.composeVersion '{compose_version}': {error}"))?,
     };
     let managed = ["runtime", "ui", "material3"]
         .into_iter()
@@ -1137,9 +1162,11 @@ fn compose_deps(model: &Value) -> Option<Vec<maven::DeclaredDep>> {
         .collect::<Vec<_>>();
     let mut deps = vec![bom];
     deps.extend(managed);
-    Some(deps)
+    Ok(Some(deps))
 }
 
+/// Resolves the `deps {}` block of an evaluated module model, erroring when
+/// the model declares none.
 fn resolve_model_deps(
     model: &Value,
     repos: &[MavenRepo],
@@ -1153,7 +1180,7 @@ fn resolve_model_deps(
         Some(block) => maven::parse_deps_block(block)?,
         None => Vec::new(),
     };
-    if let Some(compose) = compose_deps(model) {
+    if let Some(compose) = compose_deps(model)? {
         declared.extend(compose);
     }
     if declared.is_empty() {
@@ -1185,7 +1212,7 @@ fn resolve_source_set_classpaths(
             ));
         }
     };
-    let compose = compose_deps(model);
+    let compose = compose_deps(model)?;
     let mut blocks = Vec::new();
     for (key, value) in top {
         let mut path = vec![key.clone()];
@@ -1267,6 +1294,36 @@ fn reject_project_refs(model: &Value) -> Result<(), String> {
     ))
 }
 
+/// Maps a cross-plugin reference onto the module label the provider's
+/// tasks are registered under.
+///
+/// Multi-module builds label tasks `<module>/<plugin>`, so the consumer's
+/// own label yields the project-module prefix by stripping the longest
+/// known plugin name it ends with; single-module builds label tasks with
+/// the bare plugin name, detected by an exact match. Returns `None` when
+/// no layout fits, which surfaces as an unknown-dependency error naming
+/// the reference.
+fn provider_module_label(
+    plugin_names: &HashSet<String>,
+    consumer_module: &str,
+    provider_plugin: &str,
+) -> Option<String> {
+    if plugin_names.contains(consumer_module) {
+        return Some(provider_plugin.to_owned());
+    }
+    let mut best: Option<&str> = None;
+    for name in plugin_names {
+        let sep = format!("/{name}");
+        if consumer_module.ends_with(&sep) && best.is_none_or(|longest| name.len() > longest.len())
+        {
+            best = Some(name);
+        }
+    }
+    let matched = best?;
+    let rel = &consumer_module[..consumer_module.len() - matched.len() - 1];
+    Some(format!("{rel}/{provider_plugin}"))
+}
+
 /// Collects every `deps` block nested at or below `value`, recording each
 /// under its key path joined with `.` (`commonMain`, `kmp.commonMain`). A
 /// block's own `deps` key is recorded but never descended into, so nested
@@ -1334,7 +1391,7 @@ fn resolve_path(base: &Path, relative: &str) -> PathBuf {
 /// `android.apk`) and resolves them against the module directory. Returns
 /// `None` when no recognized output key is present — the module either
 /// produces no file artifact (a library consumed only via classpath) or
-/// its plugin type is not yet supported for cross-module deps.
+/// its plugin family defines no output key this scan recognizes.
 fn discover_module_output(model: &Value, module_dir: &Path) -> Option<PathBuf> {
     let block = match model {
         Value::Block(entries) => entries,
@@ -1365,7 +1422,15 @@ fn discover_module_output(model: &Value, module_dir: &Path) -> Option<PathBuf> {
 /// compile and runtime.  `api` refs additionally propagate the depended
 /// module's `api` classpath (direct `api`-scoped jars) so that consumers
 /// see transitive `api` deps.  `runtimeOnly` injects into runtime only;
-/// `compileOnly` injects into compile only.
+/// `compileOnly` injects into compile only; `testImplementation` injects
+/// into test compile and test runtime.
+///
+/// `ksp` and `androidTestImplementation` have no cross-module meaning for
+/// project references; a ref using either scope is reported on stderr as
+/// a warning and skipped, degrading to a smaller classpath rather than
+/// failing the build.
+///
+/// # Errors
 ///
 /// Returns an error when a referenced module path does not appear in
 /// `settings_modules` or has no discoverable output.
@@ -1420,13 +1485,14 @@ fn resolve_project_classpath(
                 classpath.test_runtime.push(output.clone());
             }
             maven::MavenScope::Ksp | maven::MavenScope::AndroidTestImplementation => {
+                // Only these two scopes reach this arm.
+                let scope_name = match scope {
+                    maven::MavenScope::Ksp => "ksp",
+                    _ => "androidTestImplementation",
+                };
                 eprintln!(
-                    "warning: project(\"{module_path}\"): {} scope is not supported for project dependencies; skipping",
-                    match scope {
-                        maven::MavenScope::Ksp => "ksp",
-                        maven::MavenScope::AndroidTestImplementation => "androidTestImplementation",
-                        _ => unreachable!(),
-                    }
+                    "warning: project(\"{module_path}\"): {scope_name} scope is not supported \
+                     for project dependencies; skipping"
                 );
             }
         }
@@ -1987,7 +2053,9 @@ mod tests {
             }
         });
         let value = json_to_value(&model);
-        let deps = compose_deps(&value).expect("compose is true");
+        let deps = compose_deps(&value)
+            .expect("resolves")
+            .expect("compose is true");
         assert_eq!(deps.len(), 4);
         assert_eq!(deps[0].dependency.group, "androidx.compose");
         assert_eq!(deps[0].dependency.artifact, "compose-bom");
@@ -2011,7 +2079,9 @@ mod tests {
             }
         });
         let value = json_to_value(&model);
-        let deps = compose_deps(&value).expect("compose is true");
+        let deps = compose_deps(&value)
+            .expect("resolves")
+            .expect("compose is true");
         assert_eq!(deps[0].dependency.version, DEFAULT_COMPOSE_BOM_VERSION);
     }
 
@@ -2023,7 +2093,7 @@ mod tests {
             }
         });
         let value = json_to_value(&model);
-        assert!(compose_deps(&value).is_none());
+        assert!(compose_deps(&value).expect("resolves").is_none());
     }
 
     #[test]
@@ -2032,7 +2102,7 @@ mod tests {
             "jvm": {}
         });
         let value = json_to_value(&model);
-        assert!(compose_deps(&value).is_none());
+        assert!(compose_deps(&value).expect("resolves").is_none());
     }
 
     #[test]

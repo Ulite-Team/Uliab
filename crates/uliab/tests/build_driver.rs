@@ -522,3 +522,59 @@ fn source_set_project_refs_implementation_does_not_propagate_api_jars() {
         "{error}"
     );
 }
+
+/// Two plugins with a declared cross-plugin dependency, configured by the
+/// real driver: the consumer's task references `ulite/fixture:stage`, and
+/// the provider's tasks live under a different module label
+/// (`ulite/fixture`) than the consumer's (`ulite/cross-dep-fixture`).
+/// Scheduling must resolve the reference across those labels.
+#[test]
+fn cross_plugin_task_refs_are_scheduled_through_the_driver() {
+    let fixture = build_fixture("ulb-plugin-fixture");
+    let consumer = build_fixture("ulb-plugin-cross-dep-fixture");
+    let project = TestProject::new("cross-driver", &fixture);
+
+    // Extend the one-entry index with the consumer plugin.
+    let index = serde_json::json!({
+        "schema_version": 1,
+        "plugins": {
+            "ulite/fixture": {
+                "versions": {
+                    "0.1.0": {
+                        "abi": { "min": "0.4", "max": "0.7" },
+                        "artifact_url": fixture.display().to_string(),
+                    }
+                }
+            },
+            "ulite/cross-dep-fixture": {
+                "versions": {
+                    "0.1.0": {
+                        "abi": { "min": "0.4", "max": "0.7" },
+                        "artifact_url": consumer.display().to_string(),
+                    }
+                }
+            }
+        }
+    });
+    std::fs::write(project.dir.join("index.json"), index.to_string()).expect("rewrite index");
+
+    project.write(
+        "build.ulb",
+        &format!(
+            "source = {:?}\noutput = {:?}\nconsumeFrom = \"ulite/fixture:stage\"\n",
+            project.dir.join("in.txt").display().to_string(),
+            project.dir.join("out.txt").display().to_string(),
+        ),
+    );
+    project.write(
+        "libs.ulb",
+        "plugins {\n  fixture = \"ulite/fixture\" @ \"0.1.0\"\n  consumer = \"ulite/cross-dep-fixture\" @ \"0.1.0\"\n}\n",
+    );
+
+    let options = project.options();
+    let first = build_project(&project.dir, &options).expect("first build");
+    // stage, announce (provider) and consume (consumer) all ran.
+    assert_eq!((first.ran, first.up_to_date), (3, 0));
+    let second = build_project(&project.dir, &options).expect("second build");
+    assert_eq!((second.ran, second.up_to_date), (0, 3));
+}

@@ -246,8 +246,6 @@ pub fn collect_definitions_with(
     collect_definitions_impl(file, defs, diagnostics, environment, false);
 }
 
-/// Shared implementation of definition collection; `lint` selects whether
-/// unresolvable `env`/`props` lookups are reported (see [`EvalEnvironment`]).
 /// Returns whether `s` has the shape of a full Maven coordinate
 /// (`group:artifact:version`): exactly two colons with every segment
 /// non-empty. This is the same shape [`Evaluator::eval_versioned`]
@@ -273,6 +271,12 @@ fn classify_libs_alias(value: Value) -> Value {
     value
 }
 
+/// Shared implementation of definition collection; `lint` selects whether
+/// unresolvable `env`/`props` lookups are reported (see [`EvalEnvironment`]).
+/// When the same name is collected twice (across files or within one), the
+/// later definition wins by overwrite — declaration order across
+/// `conventions.ulb` and `libs.ulb` therefore decides which definition a
+/// build sees.
 fn collect_definitions_impl(
     file: &File,
     defs: &mut Definitions,
@@ -682,6 +686,10 @@ impl<'a> Evaluator<'a> {
                     self.error(stmt.span, "'tasks' key is already a non-block value");
                     return;
                 };
+                if tasks_map.contains_key(name.as_str()) {
+                    self.error(stmt.span, format!("duplicate 'task' definition '{name}'"));
+                    return;
+                }
                 tasks_map.insert(name.clone(), Value::Block(nested));
             }
             StatementKind::Apply { name, .. } => {
@@ -868,7 +876,7 @@ impl<'a> Evaluator<'a> {
 
     fn eval_expr(&mut self, expr: &Expr) -> Value {
         match &expr.kind {
-            ExprKind::Str(str_expr) => Value::Str(self.eval_str(str_expr, expr.span)),
+            ExprKind::Str(str_expr) => Value::Str(self.eval_str(str_expr)),
             ExprKind::Number(n) => Value::Number(n.clone()),
             ExprKind::Bool(b) => Value::Bool(*b),
             ExprKind::Ref(path) => self.eval_ref(path, expr.span),
@@ -901,7 +909,7 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn eval_str(&mut self, str_expr: &crate::ast::StrExpr, span: Span) -> String {
+    fn eval_str(&mut self, str_expr: &crate::ast::StrExpr) -> String {
         let mut out = String::new();
         for part in &str_expr.parts {
             match part {
@@ -925,7 +933,6 @@ impl<'a> Evaluator<'a> {
                 }
             }
         }
-        let _ = span; // reserved for future span-attached string diagnostics
         out
     }
 
@@ -1429,6 +1436,9 @@ pub fn evaluate_settings(source: &str) -> SettingsOutcome {
                                 span: stmt.span,
                                 severity: Severity::Error,
                             });
+                            // The duplicate is rejected outright — its
+                            // entries must not leak into the repo list.
+                            continue;
                         }
                         seen_repositories_block = true;
                         for repo_stmt in &block.statements {
@@ -2343,6 +2353,26 @@ deps {
                 .diagnostics
                 .iter()
                 .any(|d| d.message.contains("duplicate 'repositories'"))
+        );
+        // The rejected block's entries must not leak into the repo list.
+        assert_eq!(outcome.model.extra_repos, vec!["https://a.com"]);
+    }
+
+    #[test]
+    fn a_duplicate_task_definition_is_an_error() {
+        let src = r#"
+            task "assemble" { output "a.jar" }
+            task "assemble" { output "b.jar" }
+        "#;
+        let parsed = parse(src);
+        let outcome = evaluate_build(&parsed.file, &Definitions::default());
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("duplicate 'task' definition 'assemble'")),
+            "{:?}",
+            outcome.diagnostics
         );
     }
 

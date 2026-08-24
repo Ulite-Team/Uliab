@@ -16,7 +16,7 @@ pub enum Severity {
     Error,
     /// A valid-but-suspicious construct (e.g. a deprecated reference).
     Warning,
-    /// Informational note (not yet used by the lexer/parser).
+    /// An informational note that does not affect validity.
     Info,
 }
 

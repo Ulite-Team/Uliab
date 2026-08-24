@@ -36,7 +36,9 @@ use ulite::ulb::task_registrar::{
 struct Fixture;
 
 /// Maps a tool name from the module configuration onto the WIT
-/// allowlisted-tool enum.
+/// allowlisted-tool enum. Covers the tools a fixture task plausibly runs;
+/// the build-tool binaries (`aapt2`, `apksigner`) are outside what these
+/// tests exercise and are rejected like any unknown name.
 fn parse_tool(name: &str) -> Result<AllowlistedTool, String> {
     Ok(match name {
         "echo" => AllowlistedTool::Echo,

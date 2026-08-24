@@ -14,6 +14,8 @@
 //! bump with the compatibility/fallback behavior from ARCHITECTURE.md
 //! §3.6.
 
+#![warn(missing_docs)]
+
 /// The WIT document defining the `ulb-plugin` world. Both the host and
 /// plugin sides generate their bindings from this exact text.
 pub const WIT: &str = include_str!("../plugin.wit");

@@ -17,12 +17,17 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::host::{PluginHost, PluginManifest};
+
+/// Upper bound on a single registry response (index document or plugin
+/// artifact), matching the Maven resolver's artifact cap.
+const MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// A contiguous range of plugin-ABI versions a plugin version declares it
 /// targets (ARCHITECTURE.md §3.7). The host picks a version whose range
@@ -298,6 +303,8 @@ pub struct Registry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedResolution {
     name: String,
+    /// Recorded for provenance in the on-disk metadata; resolution reads
+    /// `name` and `abi` only.
     version: String,
     abi: AbiRange,
 }
@@ -417,13 +424,25 @@ impl Registry {
                 RegistryError::Index(format!("failed to fetch '{url}': {error}"))
             })?,
         };
-        serde_json::from_slice(&bytes).map_err(|error| RegistryError::Index(error.to_string()))
+        let index: RegistryIndex = serde_json::from_slice(&bytes)
+            .map_err(|error| RegistryError::Index(error.to_string()))?;
+        if index.schema_version != 1 {
+            return Err(RegistryError::Index(format!(
+                "unsupported index schema_version {} (this tool understands version 1); \
+                 upgrade the tool or pin an older registry",
+                index.schema_version
+            )));
+        }
+        Ok(index)
     }
 
     fn read_cached(&self, wasm_path: &Path, meta_path: &Path) -> Option<CachedResolution> {
         if !wasm_path.exists() {
             return None;
         }
+        // An unreadable or corrupt metadata file degrades to a refetch:
+        // the artifact itself is re-verified against the index either way,
+        // so treating metadata loss as a cache miss is safe.
         let bytes = std::fs::read(meta_path).ok()?;
         serde_json::from_slice(&bytes).ok()
     }
@@ -486,10 +505,13 @@ impl Registry {
             ureq::Error::StatusCode(code) => format!("HTTP {code}"),
             other => other.to_string(),
         })?;
-        response
-            .into_body()
-            .read_to_vec()
-            .map_err(|error| format!("reading response body: {error}"))
+        // Capped like the Maven resolver's artifact downloads so a
+        // misbehaving registry cannot exhaust memory with a huge body.
+        let mut body = response.into_body().into_reader().take(MAX_RESPONSE_BYTES);
+        let mut bytes = Vec::new();
+        body.read_to_end(&mut bytes)
+            .map_err(|error| format!("reading response body: {error}"))?;
+        Ok(bytes)
     }
 }
 
