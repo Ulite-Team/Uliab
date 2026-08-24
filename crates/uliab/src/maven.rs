@@ -329,6 +329,12 @@ pub struct Classpath {
     pub runtime: Vec<PathBuf>,
     /// Jars needed to run annotation processing.
     pub processor: Vec<PathBuf>,
+    /// Direct `api`-scoped jars: needed for compilation and visible to
+    /// consumers of this module.  Unlike [`compile`](Self::compile), this
+    /// contains **only** the direct `api` roots (not their transitive
+    /// dependencies), so consumers can build a compile classpath without
+    /// pulling in `implementation`-only deps.
+    pub api: Vec<PathBuf>,
     /// Jars needed to compile unit tests.
     pub test_compile: Vec<PathBuf>,
     /// Jars needed to run unit tests.
@@ -343,9 +349,9 @@ impl Classpath {
     /// Serializes the classpath to the JSON object handed to plugins as the
     /// `classpath` key of their configuration: one array of jar paths per
     /// bucket, named as the buckets are in GRAMMAR.md Appendix B
-    /// (`compile`, `runtime`, `processor`, `testCompile`, `testRuntime`,
-    /// `androidTestCompile`, `androidTestRuntime`). The output is
-    /// deterministic: each bucket is already sorted by
+    /// (`compile`, `runtime`, `processor`, `api`, `testCompile`,
+    /// `testRuntime`, `androidTestCompile`, `androidTestRuntime`). The
+    /// output is deterministic: each bucket is already sorted by
     /// (`group`, `artifact`) when built by [`Resolver`].
     #[must_use]
     pub fn to_json(&self) -> serde_json::Value {
@@ -359,6 +365,7 @@ impl Classpath {
             "compile": path_list(&self.compile),
             "runtime": path_list(&self.runtime),
             "processor": path_list(&self.processor),
+            "api": path_list(&self.api),
             "testCompile": path_list(&self.test_compile),
             "testRuntime": path_list(&self.test_runtime),
             "androidTestCompile": path_list(&self.android_test_compile),
@@ -1204,6 +1211,19 @@ impl<'a> Session<'a> {
                 .collect()
         };
 
+        let api_roots = roots(&[MavenScope::Api]);
+        let api_direct: BTreeMap<(String, String), (String, String)> = api_roots
+            .iter()
+            .filter_map(|(group, artifact)| {
+                let version = winners.get(&(group.clone(), artifact.clone()))?.clone();
+                let packaging = self
+                    .winner_node(winners, group, artifact)
+                    .map(|node| node.packaging.clone())
+                    .unwrap_or_else(|| "jar".to_owned());
+                Some(((group.clone(), artifact.clone()), (version, packaging)))
+            })
+            .collect();
+
         let compile_only = roots(&[MavenScope::CompileOnly]);
         let mut compile = self.bucket(
             winners,
@@ -1246,6 +1266,7 @@ impl<'a> Session<'a> {
             compile: self.materialize(&compile)?,
             runtime: self.materialize(&runtime)?,
             processor: self.materialize(&processor)?,
+            api: self.materialize(&api_direct)?,
             test_compile: self.materialize(&merge(compile.clone(), test_compile))?,
             test_runtime: self.materialize(&merge(runtime.clone(), test_runtime))?,
             android_test_compile: self.materialize(&merge(compile, android_test_compile))?,
@@ -1711,6 +1732,45 @@ mod tests {
     }
 
     #[test]
+    fn api_bucket_contains_only_direct_api_roots() {
+        let repo = LocalRepo::new();
+        repo.add(
+            "com.example",
+            "api-lib",
+            "1.0",
+            &[("com.example:transitive", "1.0", "")],
+        );
+        repo.add("com.example", "transitive", "1.0", &[]);
+        repo.add("com.example", "impl-lib", "2.0", &[]);
+        let resolution = repo
+            .resolver()
+            .resolve(&[
+                declared(MavenScope::Api, "com.example:api-lib:1.0"),
+                declared(MavenScope::Implementation, "com.example:impl-lib:2.0"),
+            ])
+            .expect("resolves");
+        assert_eq!(
+            jar_names(&resolution.classpath.compile),
+            vec!["api-lib-1.0.jar", "impl-lib-2.0.jar", "transitive-1.0.jar"]
+        );
+        assert_eq!(
+            jar_names(&resolution.classpath.api),
+            vec!["api-lib-1.0.jar"]
+        );
+    }
+
+    #[test]
+    fn api_bucket_empty_when_no_api_deps() {
+        let repo = LocalRepo::new();
+        repo.add("com.example", "lib", "1.0", &[]);
+        let resolution = repo
+            .resolver()
+            .resolve(&[declared(MavenScope::Implementation, "com.example:lib:1.0")])
+            .expect("resolves");
+        assert!(resolution.classpath.api.is_empty());
+    }
+
+    #[test]
     fn runtime_closure_includes_runtime_scope_edges() {
         let repo = LocalRepo::new();
         repo.add(
@@ -2095,6 +2155,7 @@ mod tests {
             compile: vec![PathBuf::from("/c/a.jar"), PathBuf::from("/c/b.jar")],
             runtime: vec![PathBuf::from("/c/a.jar")],
             processor: vec![],
+            api: vec![PathBuf::from("/c/a.jar")],
             test_compile: vec![PathBuf::from("/c/t.jar")],
             test_runtime: vec![PathBuf::from("/c/t.jar")],
             android_test_compile: vec![],
@@ -2107,6 +2168,7 @@ mod tests {
                 "compile": ["/c/a.jar", "/c/b.jar"],
                 "runtime": ["/c/a.jar"],
                 "processor": [],
+                "api": ["/c/a.jar"],
                 "testCompile": ["/c/t.jar"],
                 "testRuntime": ["/c/t.jar"],
                 "androidTestCompile": [],
@@ -2122,6 +2184,7 @@ mod tests {
             "compile",
             "runtime",
             "processor",
+            "api",
             "testCompile",
             "testRuntime",
             "androidTestCompile",

@@ -203,7 +203,7 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
         .repos
         .clone()
         .unwrap_or_else(|| vec![maven::MavenRepo::Google, maven::MavenRepo::Central]);
-    let classpath = match &outcome.model {
+    let mut classpath = match &outcome.model {
         Value::Block(entries)
             if entries.contains_key("deps") || compose_deps(&outcome.model).is_some() =>
         {
@@ -233,29 +233,26 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
     let plugin_config_object = plugin_config
         .as_object_mut()
         .expect("the module model serialized to an object");
-    plugin_config_object.insert("classpath".to_owned(), classpath.to_json());
-    // Source-set dependencies (`commonMain.deps { }`, `jvmMain.deps { }`,
-    // ...) resolve the same way, but each into its own classpath, handed to
-    // plugins as a `classpathSourceSets` object mapping a source-set path
-    // to that source set's classpath. A plugin that compiles per-target —
-    // a KMP-style module compiling shared sources against each target's
-    // classpath — scopes its compile classpaths from this instead of
-    // resolving anything itself. Resolution runs for every nested deps block
-    // whether or not the module also declares the top-level `deps {}` block
-    // above, and the injected map is part of the configuration hash below,
-    // so a source-set jar that changes still reruns affected tasks.
+
     let source_sets =
         resolve_source_set_classpaths(&outcome.model, &repos, options.cache_dir.clone())?;
     if !source_sets.is_empty() {
         let mut source_set_map = serde_json::Map::new();
-        for (path, source_set_classpath) in source_sets {
-            source_set_map.insert(path, source_set_classpath.to_json());
+        for (path, source_set_classpath) in &source_sets {
+            for jar in &source_set_classpath.api {
+                if !classpath.api.contains(jar) {
+                    classpath.api.push(jar.clone());
+                }
+            }
+            source_set_map.insert(path.clone(), source_set_classpath.to_json());
         }
         plugin_config_object.insert(
             "classpathSourceSets".to_owned(),
             serde_json::Value::Object(source_set_map),
         );
     }
+
+    plugin_config_object.insert("classpath".to_owned(), classpath.to_json());
     // The project directory is handed over the same channel, so a plugin
     // can resolve its block's relative paths against it regardless of the
     // directory the build tool was invoked from.
@@ -504,6 +501,8 @@ fn build_project_multi(
     let mut config_hashes = Vec::new();
     let mut all_plugin_tasks: HashMap<String, HashSet<String>> = HashMap::new();
     let mut all_declared_deps: Vec<(String, Vec<String>, HashSet<String>)> = Vec::new();
+    let mut module_api_classpaths: std::collections::HashMap<String, Vec<PathBuf>> =
+        std::collections::HashMap::new();
 
     for m in &modules {
         let model_json = module_model_to_json(&m.model)?;
@@ -529,6 +528,30 @@ fn build_project_multi(
             }
         };
 
+        let mut plugin_config = model_json;
+        let plugin_config_object = plugin_config
+            .as_object_mut()
+            .expect("the module model serialized to an object");
+
+        let source_sets =
+            resolve_source_set_classpaths(&m.model, &repos, options.cache_dir.clone())?;
+        if !source_sets.is_empty() {
+            let mut source_set_map = serde_json::Map::new();
+            for (path, source_set_classpath) in &source_sets {
+                for jar in &source_set_classpath.api {
+                    if !classpath.api.contains(jar) {
+                        classpath.api.push(jar.clone());
+                    }
+                }
+                source_set_map.insert(path.clone(), source_set_classpath.to_json());
+            }
+            plugin_config_object.insert(
+                "classpathSourceSets".to_owned(),
+                serde_json::Value::Object(source_set_map),
+            );
+        }
+        module_api_classpaths.insert(m.rel.clone(), classpath.api.clone());
+
         // Resolve cross-module project deps and merge into classpath.
         if let Value::Block(deps_entries) = &m.model
             && let Some(deps_block) = deps_entries.get("deps")
@@ -538,6 +561,7 @@ fn build_project_multi(
                 let project_cp = resolve_project_classpath(
                     &project_refs,
                     &module_outputs,
+                    &module_api_classpaths,
                     &settings.model.modules,
                 )?;
                 classpath.compile.extend(project_cp.compile);
@@ -547,24 +571,7 @@ fn build_project_multi(
             }
         }
 
-        let mut plugin_config = model_json;
-        let plugin_config_object = plugin_config
-            .as_object_mut()
-            .expect("the module model serialized to an object");
         plugin_config_object.insert("classpath".to_owned(), classpath.to_json());
-
-        let source_sets =
-            resolve_source_set_classpaths(&m.model, &repos, options.cache_dir.clone())?;
-        if !source_sets.is_empty() {
-            let mut source_set_map = serde_json::Map::new();
-            for (path, source_set_classpath) in source_sets {
-                source_set_map.insert(path, source_set_classpath.to_json());
-            }
-            plugin_config_object.insert(
-                "classpathSourceSets".to_owned(),
-                serde_json::Value::Object(source_set_map),
-            );
-        }
 
         plugin_config_object.insert(
             "projectDir".to_owned(),
@@ -1224,15 +1231,21 @@ fn discover_module_output(model: &Value, module_dir: &Path) -> Option<PathBuf> {
 /// Builds a [`maven::Classpath`] from project-module references.
 ///
 /// Each `(scope, module_path)` pair is resolved against `module_outputs`
-/// (a map from module relative path to output artifact). `implementation`
-/// and `api` refs inject into both compile and runtime; `runtimeOnly`
-/// injects into runtime only; `compileOnly` injects into compile only.
+/// (a map from module relative path to output artifact) and
+/// `module_api_classpaths` (direct `api`-scoped jars per module).
+///
+/// `implementation` and `api` refs inject the module output into both
+/// compile and runtime.  `api` refs additionally propagate the depended
+/// module's `api` classpath (direct `api`-scoped jars) so that consumers
+/// see transitive `api` deps.  `runtimeOnly` injects into runtime only;
+/// `compileOnly` injects into compile only.
 ///
 /// Returns an error when a referenced module path does not appear in
 /// `settings_modules` or has no discoverable output.
 fn resolve_project_classpath(
     project_refs: &[(maven::MavenScope, String)],
     module_outputs: &std::collections::HashMap<String, PathBuf>,
+    module_api_classpaths: &std::collections::HashMap<String, Vec<PathBuf>>,
     settings_modules: &[String],
 ) -> Result<maven::Classpath, String> {
     let mut classpath = maven::Classpath::default();
@@ -1251,7 +1264,21 @@ fn resolve_project_classpath(
             )
         })?;
         match scope {
-            maven::MavenScope::Api | maven::MavenScope::Implementation => {
+            maven::MavenScope::Api => {
+                classpath.compile.push(output.clone());
+                classpath.runtime.push(output.clone());
+                if let Some(api_jars) = module_api_classpaths.get(module_name) {
+                    for jar in api_jars {
+                        if !classpath.compile.contains(jar) {
+                            classpath.compile.push(jar.clone());
+                        }
+                        if !classpath.runtime.contains(jar) {
+                            classpath.runtime.push(jar.clone());
+                        }
+                    }
+                }
+            }
+            maven::MavenScope::Implementation => {
                 classpath.compile.push(output.clone());
                 classpath.runtime.push(output.clone());
             }
@@ -1601,8 +1628,9 @@ mod tests {
             PathBuf::from("/project/shared/build/app.jar"),
         );
         let modules = vec!["shared".to_owned()];
+        let api_cp = std::collections::HashMap::new();
         let refs = vec![(maven::MavenScope::Implementation, ":shared".to_owned())];
-        let cp = resolve_project_classpath(&refs, &outputs, &modules).expect("resolves");
+        let cp = resolve_project_classpath(&refs, &outputs, &api_cp, &modules).expect("resolves");
         assert_eq!(cp.compile.len(), 1);
         assert_eq!(cp.runtime.len(), 1);
         assert_eq!(cp.test_compile.len(), 0);
@@ -1616,8 +1644,9 @@ mod tests {
             PathBuf::from("/project/lib/build/app.jar"),
         );
         let modules = vec!["lib".to_owned()];
+        let api_cp = std::collections::HashMap::new();
         let refs = vec![(maven::MavenScope::RuntimeOnly, ":lib".to_owned())];
-        let cp = resolve_project_classpath(&refs, &outputs, &modules).expect("resolves");
+        let cp = resolve_project_classpath(&refs, &outputs, &api_cp, &modules).expect("resolves");
         assert_eq!(cp.compile.len(), 0);
         assert_eq!(cp.runtime.len(), 1);
     }
@@ -1626,8 +1655,10 @@ mod tests {
     fn resolve_project_classpath_unknown_module_is_error() {
         let outputs = std::collections::HashMap::new();
         let modules = vec!["app".to_owned()];
+        let api_cp = std::collections::HashMap::new();
         let refs = vec![(maven::MavenScope::Implementation, ":missing".to_owned())];
-        let error = resolve_project_classpath(&refs, &outputs, &modules).expect_err("missing");
+        let error =
+            resolve_project_classpath(&refs, &outputs, &api_cp, &modules).expect_err("missing");
         assert!(error.contains("not declared in settings"), "{error}");
     }
 
@@ -1635,8 +1666,10 @@ mod tests {
     fn resolve_project_classpath_module_without_output_is_error() {
         let outputs = std::collections::HashMap::new();
         let modules = vec!["shared".to_owned()];
+        let api_cp = std::collections::HashMap::new();
         let refs = vec![(maven::MavenScope::Implementation, ":shared".to_owned())];
-        let error = resolve_project_classpath(&refs, &outputs, &modules).expect_err("no output");
+        let error =
+            resolve_project_classpath(&refs, &outputs, &api_cp, &modules).expect_err("no output");
         assert!(error.contains("no discoverable output"), "{error}");
     }
 
@@ -1648,12 +1681,66 @@ mod tests {
             PathBuf::from("/project/testlib/build/app.jar"),
         );
         let modules = vec!["testlib".to_owned()];
+        let api_cp = std::collections::HashMap::new();
         let refs = vec![(maven::MavenScope::TestImplementation, ":testlib".to_owned())];
-        let cp = resolve_project_classpath(&refs, &outputs, &modules).expect("resolves");
+        let cp = resolve_project_classpath(&refs, &outputs, &api_cp, &modules).expect("resolves");
         assert_eq!(cp.compile.len(), 0);
         assert_eq!(cp.runtime.len(), 0);
         assert_eq!(cp.test_compile.len(), 1);
         assert_eq!(cp.test_runtime.len(), 1);
+    }
+
+    #[test]
+    fn resolve_project_classpath_api_propagates_dep_api_classpath() {
+        let mut outputs = std::collections::HashMap::new();
+        outputs.insert(
+            "shared".to_owned(),
+            PathBuf::from("/project/shared/build/app.jar"),
+        );
+        let mut api_cp = std::collections::HashMap::new();
+        api_cp.insert(
+            "shared".to_owned(),
+            vec![
+                PathBuf::from("/repo/com/example/one/1.0/one-1.0.jar"),
+                PathBuf::from("/repo/com/example/two/2.0/two-2.0.jar"),
+            ],
+        );
+        let modules = vec!["shared".to_owned()];
+        let refs = vec![(maven::MavenScope::Api, ":shared".to_owned())];
+        let cp = resolve_project_classpath(&refs, &outputs, &api_cp, &modules).expect("resolves");
+        assert_eq!(cp.compile.len(), 3, "output + 2 api jars");
+        assert_eq!(cp.runtime.len(), 3, "output + 2 api jars");
+        assert!(
+            cp.compile
+                .contains(&PathBuf::from("/project/shared/build/app.jar"))
+        );
+        assert!(
+            cp.compile
+                .contains(&PathBuf::from("/repo/com/example/one/1.0/one-1.0.jar"))
+        );
+        assert!(
+            cp.compile
+                .contains(&PathBuf::from("/repo/com/example/two/2.0/two-2.0.jar"))
+        );
+    }
+
+    #[test]
+    fn resolve_project_classpath_implementation_does_not_propagate_api_classpath() {
+        let mut outputs = std::collections::HashMap::new();
+        outputs.insert(
+            "shared".to_owned(),
+            PathBuf::from("/project/shared/build/app.jar"),
+        );
+        let mut api_cp = std::collections::HashMap::new();
+        api_cp.insert(
+            "shared".to_owned(),
+            vec![PathBuf::from("/repo/com/example/one/1.0/one-1.0.jar")],
+        );
+        let modules = vec!["shared".to_owned()];
+        let refs = vec![(maven::MavenScope::Implementation, ":shared".to_owned())];
+        let cp = resolve_project_classpath(&refs, &outputs, &api_cp, &modules).expect("resolves");
+        assert_eq!(cp.compile.len(), 1, "only output, no api jars");
+        assert_eq!(cp.runtime.len(), 1, "only output, no api jars");
     }
 
     #[test]
