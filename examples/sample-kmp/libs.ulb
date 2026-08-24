@@ -13,6 +13,6 @@ bundle {
 }
 
 plugins {
-  androidApplication = "com.android.application" @ "8.7.0"
-  kotlinMultiplatform = "org.jetbrains.kotlin.multiplatform" @ "2.1.0"
+  android = "ulite/android" @ "0.3.0"
+  kmp     = "ulite/kmp"     @ "0.3.0"
 }

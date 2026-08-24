@@ -19,9 +19,12 @@ environment or filesystem).
 `crates/ulb-lang/tests/worked_example.rs` evaluates
 `examples/sample-kmp` end to end with an injected environment
 (`STORE_PASSWORD` / `KEY_PASSWORD`) and asserts the resolved module model:
-merged conventions, `@`-resolved catalog aliases, repeated deps pairs
-accumulating into lists, dotted source-set nesting, `ver(...)`, and a
+merged conventions, `@`-resolved catalog aliases, repeated pairs
+accumulating into lists (including the module's `plugin` statements),
+dotted source-set nesting, `ver(...)`, and a
 `task` whose `run {}` actions were captured as data rather than executed.
+A second test evaluates the example's `settings.ulb` into a clean
+`SettingsModel`.
 
 ## Level 3 — host integration tests
 

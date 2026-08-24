@@ -1,12 +1,12 @@
 //! End-to-end evaluation of the `examples/sample-kmp/` worked example.
 //!
-//! Reads the three source files plus `signing.properties` from the example
-//! directory, injects the environment and properties the `signing` block
-//! needs (see [`ulb_lang::eval::EvalEnvironment`]), and asserts the
-//! resolved module model reflects GRAMMAR.md §6–§10 semantics: convention
-//! `apply` merging into block targets, catalog aliases resolving to
-//! coordinates, repeated scalar pairs accumulating, and task `run` actions
-//! captured as data.
+//! Reads the four `.ulb` source files plus `signing.properties` from the
+//! example directory, injects the environment and properties the `signing`
+//! block needs (see [`ulb_lang::eval::EvalEnvironment`]), evaluates
+//! settings.ulb, and asserts the resolved module model reflects GRAMMAR.md
+//! §6–§10 semantics: convention `apply` merging into block targets, catalog
+//! aliases resolving to coordinates, repeated scalar pairs accumulating,
+//! and task `run` actions captured as data.
 
 use std::collections::BTreeMap;
 
@@ -16,6 +16,7 @@ use ulb_lang::token::Number;
 const CONVENTIONS: &str = include_str!("../../../examples/sample-kmp/conventions.ulb");
 const LIBS: &str = include_str!("../../../examples/sample-kmp/libs.ulb");
 const BUILD: &str = include_str!("../../../examples/sample-kmp/build.ulb");
+const SETTINGS: &str = include_str!("../../../examples/sample-kmp/settings.ulb");
 const SIGNING_PROPERTIES: &str = include_str!("../../../examples/sample-kmp/signing.properties");
 
 fn block<'a>(map: &'a BTreeMap<String, Value>, key: &str) -> &'a BTreeMap<String, Value> {
@@ -55,9 +56,16 @@ fn sample_kmp_evaluates_to_expected_model() {
         panic!("expected a Block module model");
     };
 
-    // A single `plugin "..."` stays a scalar; repeated scalar pairs would
-    // accumulate into a List (see the module-level merge rule in eval.rs).
-    assert_eq!(top["plugin"], Value::Str("android-application".to_owned()));
+    // Repeated `plugin "..."` scalar pairs accumulate into a List (see the
+    // module-level merge rule in eval.rs), one entry per plugin statement;
+    // here they name the aliases declared in libs.ulb's plugins {} table.
+    assert_eq!(
+        coordinate_list(top, "plugin"),
+        vec![
+            Value::Str("android".to_owned()),
+            Value::Str("kmp".to_owned()),
+        ]
+    );
 
     // android {} merges the androidApp convention's compileSdk/minSdk/
     // targetSdk with the module's own namespace/applicationId/versionCode/
@@ -194,4 +202,17 @@ fn sample_kmp_evaluates_to_expected_model() {
     assert_eq!(copy["action"], Value::Str("copy".to_owned()));
     assert_eq!(copy["from"], Value::Str("src/main/kotlin".to_owned()));
     assert_eq!(copy["to"], Value::Str("out/merged-kotlin".to_owned()));
+}
+
+#[test]
+fn sample_kmp_settings_evaluate_cleanly() {
+    let outcome = ulb_lang::eval::evaluate_settings(SETTINGS);
+    assert!(
+        outcome.diagnostics.is_empty(),
+        "unexpected diagnostics: {:?}",
+        outcome.diagnostics
+    );
+    assert_eq!(outcome.model.project_name.as_deref(), Some("SampleKmp"));
+    assert_eq!(outcome.model.modules, vec![".".to_owned()]);
+    assert!(!outcome.model.lsp_compat);
 }
