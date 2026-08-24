@@ -1,0 +1,123 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: "Release kind: rc (pre-release, auto-numbered) or stable (full release)"
+        required: true
+        default: "rc"
+        type: choice
+        options:
+          - rc
+          - stable
+      version:
+        description: "Optional explicit version, e.g. 0.1.0. rc: overrides auto-numbering. stable: overrides the promoted base."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & publish (${{ inputs.kind }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Compute next version from existing releases
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KIND: ${{ inputs.kind }}
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          # Existing release names shaped v<base>-rc.<n>, e.g. "0.1.0 2"
+          mapfile -t RCS < <(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --paginate \
+            --jq '.[] | select(.name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+-rc\\.[0-9]+$")) | .name' \
+            | sed -E 's/^v([0-9]+\.[0-9]+\.[0-9]+)-rc\.([0-9]+)$/\1 \2/')
+
+          latest_base="$(printf '%s\n' "${RCS[@]:-}" | awk 'NF {print $1}' | sort -uV | tail -n 1)"
+          max_n="$(printf '%s\n' "${RCS[@]:-}" | awk 'NF {print $2}' | sort -n | tail -n 1)"
+          [ -n "$max_n" ] || max_n=0
+
+          case "$KIND" in
+            rc)
+              if [ -n "$REQUESTED" ]; then
+                base="${REQUESTED#v}"
+                n=1
+              else
+                [ -n "$latest_base" ] || { echo "::error::No previous rc releases found; pass an explicit version."; exit 1; }
+                base="$latest_base"
+                n=$((max_n + 1))
+              fi
+              version="v${base}-rc.${n}"
+              ;;
+            stable)
+              if [ -n "$REQUESTED" ]; then
+                base="${REQUESTED#v}"
+              else
+                [ -n "$latest_base" ] || { echo "::error::No previous rc releases found; pass an explicit version."; exit 1; }
+                base="$latest_base"
+                echo "::notice::Promoting latest rc line ${base} to a stable release."
+              fi
+              version="v${base}"
+              ;;
+            *)
+              echo "::error::kind must be 'rc' or 'stable'"
+              exit 1
+              ;;
+          esac
+
+          git fetch --tags --quiet
+          if git rev-parse -q --verify "refs/tags/${version}" >/dev/null; then
+            echo "::error::Tag ${version} already exists."
+            exit 1
+          fi
+
+          {
+            echo "version=${version}"
+            echo "prerelease=$([ "$KIND" = rc ] && echo true || echo false)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Record built commit
+        id: rev
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binary
+        run: cargo build --release -p uliab
+        env:
+          RUSTFLAGS: -C strip=symbols
+
+      - name: Package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir stage
+          cp target/release/uliab stage/
+          tar -czf "uliab-${VERSION}-x86_64-linux.tar.gz" -C stage uliab
+          sha256sum "uliab-${VERSION}-x86_64-linux.tar.gz" > checksums.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          target_commitish: main
+          prerelease: ${{ steps.version.outputs.prerelease }}
+          generate_release_notes: true
+          body: |
+            Pre-release CLI built at main ${{ steps.rev.outputs.sha }} (x86_64-linux).
+          fail_on_unmatched_files: true
+          files: |
+            uliab-${{ steps.version.outputs.version }}-x86_64-linux.tar.gz
+            checksums.txt
