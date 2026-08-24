@@ -54,8 +54,9 @@ pub struct BuildOptions {
     /// omitted and a plugin that needs it must be given the root another
     /// way (e.g. its own module block).
     pub android_sdk: Option<PathBuf>,
-    /// Restrict the build to the named variants (e.g. `["freeDebug"]`,
-    /// `["release"]`). The host rewrites every module's model so only the
+    /// Restrict the build to the named variants (`"DebugFree"`, `"release"`;
+    /// matching is case-insensitive against the canonical PascalCase names).
+    /// The host rewrites every module's model so only the
     /// selected variants' build types and flavors remain, which makes the
     /// plugins register exactly those variants' tasks — providers and
     /// consumers see the same restricted matrix, so cross-module
@@ -993,19 +994,30 @@ fn restrict_model_to_variants(model: &Value, selected: Option<&[String]>) -> Res
         return Ok(model.clone());
     };
 
-    let valid = module_variant_names(model);
+    // Matching is case-insensitive so `freeDebug` resolves to the
+    // canonical PascalCase `DebugFree` the plugins register.
+    let mut canonical_selected = Vec::with_capacity(selected.len());
     for name in selected {
-        if !valid.contains(name) {
-            let known = if valid.is_empty() {
-                "none".to_owned()
-            } else {
-                valid.join(", ")
-            };
-            return Err(format!(
-                "unknown variant '{name}' (this module builds: {known})"
-            ));
+        let lowered = name.to_lowercase();
+        match valid.iter().find(|candidate| candidate.to_lowercase() == lowered) {
+            Some(canonical) => {
+                if !canonical_selected.contains(canonical) {
+                    canonical_selected.push(canonical.clone());
+                }
+            }
+            None => {
+                let known = if valid.is_empty() {
+                    "none".to_owned()
+                } else {
+                    valid.join(", ")
+                };
+                return Err(format!(
+                    "unknown variant '{name}' (this module builds: {known})"
+                ));
+            }
         }
     }
+    let selected: &[String] = &canonical_selected;
 
     let build_type_names: Vec<String> = match entries.get("buildTypes") {
         Some(Value::Block(bt)) => bt.keys().cloned().collect(),
@@ -1823,7 +1835,10 @@ mod tests {
     }
 
     #[test]
-    fn restrict_passes_plain_modules_through() {
+    fn restrict_injects_build_types_for_non_variant_modules() {
+        // A module without android blocks still defaults to [Debug,
+        // Release]; selecting one injects an explicit buildTypes block so
+        // plugin-side compute_variants sees exactly that subset.
         let model = Value::Block(BTreeMap::from([(
             "jvm".to_owned(),
             Value::Block(BTreeMap::from([(
@@ -1832,8 +1847,52 @@ mod tests {
             )])),
         )]));
         let restricted =
-            restrict_model_to_variants(&model, Some(&["Debug".to_owned()])).expect("restricts");
-        assert_eq!(restricted, model);
+            restrict_model_to_variants(&model, Some(&["debug".to_owned()])).expect("restricts");
+        let Value::Block(entries) = &restricted else {
+            panic!("expected a block");
+        };
+        assert_eq!(entries.get("jvm"), model.get("jvm"));
+        let Some(Value::Block(build_types)) = entries.get("buildTypes") else {
+            panic!("expected an explicit buildTypes block");
+        };
+        assert_eq!(build_types.len(), 1);
+        assert!(build_types.contains_key("debug"));
+    }
+
+    #[test]
+    fn restrict_matching_is_case_insensitive() {
+        let model = Value::Block(BTreeMap::from([
+            (
+                "buildTypes".to_owned(),
+                Value::Block(BTreeMap::from([(
+                    "debug".to_owned(),
+                    Value::Block(BTreeMap::new()),
+                )])),
+            ),
+            (
+                "productFlavors".to_owned(),
+                Value::Block(BTreeMap::from([
+                    ("dimension".to_owned(), Value::Str("tier".to_owned())),
+                    ("free".to_owned(), Value::Block(BTreeMap::new())),
+                ])),
+            ),
+        ]));
+        let restricted =
+            restrict_model_to_variants(&model, Some(&["free_debug".to_owned()]));
+        assert!(
+            restricted.is_err(),
+            "underscores are not part of the name; only case is normalized"
+        );
+        let restricted =
+            restrict_model_to_variants(&model, Some(&["freedebug".to_owned()])).expect("restricts");
+        let Value::Block(entries) = &restricted else {
+            panic!("expected a block");
+        };
+        let Some(Value::Block(flavors)) = entries.get("productFlavors") else {
+            panic!("expected productFlavors");
+        };
+        assert!(flavors.contains_key("free"));
+        assert_eq!(flavors.len(), 2, "dimension + free");
     }
 
     fn json_to_value(json: &serde_json::Value) -> Value {
