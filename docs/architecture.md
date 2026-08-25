@@ -18,8 +18,7 @@ support), the `ulite/kmp` plugin (JVM + Android targets: commonMain +
 jvmMain → jar, commonMain + androidMain → per-variant merged dex into
 APK), `uliab init` project scaffolding, and multi-module `settings.ulb`
 support are implemented and building. The plugin registry is live on
-GitHub. Remaining roadmap items: Compose compiler plugin, product
-flavors, BuildConfig generation.
+GitHub.
 
 ---
 

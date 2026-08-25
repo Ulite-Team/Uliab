@@ -395,13 +395,27 @@ impl exports::ulite::ulb::ulb_plugin::Guest for Fixture {
                 .and_then(serde_json::Value::as_array);
             let mut body = String::new();
             if let Some(arr) = fields {
-                for triple in arr {
-                    if let Some(elems) = triple.as_array().filter(|a| a.len() == 3) {
-                        let ty = elems[0].as_str().unwrap_or("?");
-                        let name = elems[1].as_str().unwrap_or("?");
-                        let init = elems[2].as_str().unwrap_or("?");
+                let mut i = 0;
+                while i < arr.len() {
+                    if let serde_json::Value::Array(sub) = &arr[i]
+                        && sub.len() == 3
+                    {
+                        let ty = sub[0].as_str().unwrap_or("?");
+                        let name = sub[1].as_str().unwrap_or("?");
+                        let init = sub[2].as_str().unwrap_or("?");
                         body.push_str(&format!("{ty} {name} = {init};\n"));
+                        i += 1;
+                        continue;
                     }
+                    if i + 2 < arr.len()
+                        && let (Some(a), Some(b), Some(c)) =
+                            (arr[i].as_str(), arr[i + 1].as_str(), arr[i + 2].as_str())
+                    {
+                        body.push_str(&format!("{a} {b} = {c};\n"));
+                        i += 3;
+                        continue;
+                    }
+                    i += 1;
                 }
             }
             task_registrar::register_task(&Task {

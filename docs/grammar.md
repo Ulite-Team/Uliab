@@ -568,7 +568,7 @@ Required diagnostic cases (each gets an assertion test in `ulb-lang`):
 | `versionCode` | number | integer version code |
 | `versionName` | `ver(...)` or string | display version |
 | `signing { ... }` | block | see below (also valid at top level of `build.ulb`) |
-| `buildConfigField` | list `[type, name, initializer]`, repeatable | custom field in the generated `BuildConfig.java` (see android-plugin.md) |
+| `buildConfigField` | list `[type, name, initializer]`, repeatable | custom field in the generated `BuildConfig.java` (see architecture.md §5.2) |
 
 ### `buildTypes { ... }`
 
