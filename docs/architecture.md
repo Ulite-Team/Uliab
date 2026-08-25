@@ -693,7 +693,8 @@ Android logic).
 | 11 (done) | APK signing | release/debug keystores, signing {} block, v1/v2/v3 schemes |
 | 12 (done) | Build variants | debug/release/flavor splits, per-variant task naming |
 | 13 (done) | `uliab init` | scaffold new project from templates |
-| 14 | KMP Android target | plugin-to-plugin ABI composition (dependencies + cross-plugin dep resolution) |
+| 14 (done) | KMP Android target | plugin-to-plugin ABI composition (dependencies + cross-plugin dep resolution) |
+| 15 (done) | Product flavors / variant matrix | `--variant` host-side selection + per-variant source-set layering in plugins |
 
 Phases 2–6 are sequential (each depends on the previous); 7a/7b/7c are
 independent core services and were built in parallel on top of 4. 8a
