@@ -647,6 +647,10 @@ fn variant_selection_is_consistent_across_modules() {
     let project = TestProject::new("variant-multi", &fixture);
     std::fs::create_dir_all(project.dir.join("app")).expect("app dir");
     std::fs::create_dir_all(project.dir.join("lib")).expect("lib dir");
+    // Each module's `source` resolves against ITS OWN directory (the
+    // host injects the module path as projectDir), so both need a copy.
+    std::fs::write(project.dir.join("app/in.txt"), "app input").expect("write app input");
+    std::fs::write(project.dir.join("lib/in.txt"), "lib input").expect("write lib input");
     project.write(
         "settings.ulb",
         "project \"VariantMulti\"\nmodule \"app\"\nmodule \"lib\"\n",
@@ -686,6 +690,7 @@ jvm {\n\
 
     // Full matrices: app has six tasks, lib has four.
     let all = build_project(&project.dir, &project.options()).expect("full build");
+    assert!(all.failure.is_none(), "{:?}", all.failure);
     assert_eq!((all.ran, all.up_to_date), (10, 0));
 
     // freeDebug: app keeps debug+free; lib resolves the Debug component.
@@ -694,6 +699,7 @@ jvm {\n\
         ..project.options()
     };
     let selected = build_project(&project.dir, &options).expect("restricted build");
+    assert!(selected.failure.is_none(), "{:?}", selected.failure);
     assert_eq!((selected.ran, selected.up_to_date), (6, 0));
     let rerun = build_project(&project.dir, &options).expect("rebuild");
     assert_eq!((rerun.ran, rerun.up_to_date), (0, 6));
