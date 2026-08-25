@@ -1418,9 +1418,17 @@ fn resolve_model_deps(
         declared.extend(compose);
     }
     // A deps block whose entries were all project(":…") refs resolves to
-    // nothing here — cross-module wiring happens later against harvested
-    // provider outputs — so an empty declaration list is legal.
+    // nothing here — cross-module wiring happens later against provider
+    // outputs — so that specific emptiness is legal. A genuinely missing
+    // or dependency-free block stays an error.
     if declared.is_empty() {
+        let has_project_refs = match deps_block {
+            Some(block) => !maven::extract_project_deps(block).is_empty(),
+            None => false,
+        };
+        if !has_project_refs {
+            return Err("the model does not declare a deps {} block".to_owned());
+        }
         return Ok(maven::Resolution {
             classpath: maven::Classpath::default(),
             notes: Vec::new(),
