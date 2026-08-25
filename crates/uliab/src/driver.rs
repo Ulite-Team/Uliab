@@ -1421,7 +1421,10 @@ fn resolve_model_deps(
     // nothing here — cross-module wiring happens later against harvested
     // provider outputs — so an empty declaration list is legal.
     if declared.is_empty() {
-        return Ok(maven::Resolution::default());
+        return Ok(maven::Resolution {
+            classpath: maven::Classpath::default(),
+            notes: Vec::new(),
+        });
     }
     let resolver = maven::Resolver::new(repos.to_vec(), cache_dir);
     resolver
