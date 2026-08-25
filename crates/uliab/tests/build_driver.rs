@@ -651,10 +651,7 @@ fn variant_selection_is_consistent_across_modules() {
         "settings.ulb",
         "project \"VariantMulti\"\nmodule \"app\"\nmodule \"lib\"\n",
     );
-    project.write(
-        "conventions.ulb",
-        "",
-    );
+    project.write("conventions.ulb", "");
     project.write(
         "libs.ulb",
         "plugins {\n  fixture = \"ulite/fixture\" @ \"0.1.0\"\n}\n",
