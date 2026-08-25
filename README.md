@@ -103,6 +103,7 @@ the registry, configure each plugin, execute the task graph incrementally:
 
 ```sh
 uliab build [--project DIR] [--registry SOURCE] [--cache-dir DIR] [--repo REPO]
+  [--variant NAME]
 ```
 
 A build reports per-task `ran` / `up-to-date` lines; a failed task fails

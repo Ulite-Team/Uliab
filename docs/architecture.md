@@ -441,8 +441,10 @@ host's `java` tool, and a `jar` packaging step. The host's `write` action
   selected variants' build types and flavors remain — every plugin then
   registers exactly those variants' tasks, and because the restriction is
   project-wide, cross-module `project(":…")` refs stay matched across
-  variants (a provider without flavors simply builds its matching build
-  type for each selected consumer variant).
+  variants (a provider without flavors resolves a consumer-style
+  selection like `freeDebug` to its build-type component via unique
+  prefix/suffix match; none or ambiguous matches error naming the
+  module's valid variants).
 - Owns manifest merging (old §8) and dex/APK/AAR packaging via `aapt2`/
   `d8` (`run_tool`).
 - Declares a dependency on `ulite/jvm` in its own plugin manifest (§3.2)
