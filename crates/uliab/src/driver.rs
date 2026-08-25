@@ -1060,8 +1060,10 @@ fn restrict_model_to_variants(model: &Value, selected: Option<&[String]>) -> Res
             let bt_matches: Vec<&Candidate<'_>> = candidates
                 .iter()
                 .filter(|candidate| {
-                    candidate.flavor.is_none()
-                        && lowered.starts_with(&candidate.canonical.to_lowercase())
+                    // Component order varies (`freeDebug` vs `DebugFree`),
+                    // so the bare build type may sit at either end.
+                    let canonical = &candidate.canonical.to_lowercase();
+                    lowered.starts_with(canonical.as_str()) || lowered.ends_with(canonical.as_str())
                 })
                 .collect();
             if let [one] = bt_matches.as_slice() {
