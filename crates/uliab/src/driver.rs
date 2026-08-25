@@ -1417,8 +1417,11 @@ fn resolve_model_deps(
     if let Some(compose) = compose_deps(model)? {
         declared.extend(compose);
     }
+    // A deps block whose entries were all project(":…") refs resolves to
+    // nothing here — cross-module wiring happens later against harvested
+    // provider outputs — so an empty declaration list is legal.
     if declared.is_empty() {
-        return Err("the model does not declare a deps {} block".to_owned());
+        return Ok(maven::Resolution::default());
     }
     let resolver = maven::Resolver::new(repos.to_vec(), cache_dir);
     resolver
