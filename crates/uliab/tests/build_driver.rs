@@ -97,6 +97,7 @@ impl TestProject {
             cache_dir: Some(self.dir.join(".cache")),
             repos: None,
             android_sdk: None,
+            variants: None,
         }
     }
 }
@@ -577,4 +578,129 @@ fn cross_plugin_task_refs_are_scheduled_through_the_driver() {
     assert_eq!((first.ran, first.up_to_date), (3, 0));
     let second = build_project(&project.dir, &options).expect("second build");
     assert_eq!((second.ran, second.up_to_date), (0, 3));
+}
+
+#[test]
+fn variant_selection_restricts_registered_tasks() {
+    let fixture = build_fixture("ulb-plugin-fixture");
+    let build_ulb = "source = \"in.txt\"\n\
+output = \"out.txt\"\n\
+variantProbe true\n\
+buildTypes {\n\
+  debug { minifyEnabled false }\n\
+  release { minifyEnabled true }\n\
+}\n\
+productFlavors {\n\
+  dimension \"tier\"\n\
+  free { applicationIdSuffix \".free\" }\n\
+  paid { applicationIdSuffix \".paid\" }\n\
+}\n";
+    let libs_ulb = "plugins {\n  fixture = \"ulite/fixture\" @ \"0.1.0\"\n}\n";
+
+    // Without selection, the full matrix is registered: stage + announce
+    // plus one probe per variant (debug/release × free/paid).
+    let full = TestProject::new("variant-full", &fixture);
+    full.write("build.ulb", build_ulb);
+    full.write("libs.ulb", libs_ulb);
+    let all = build_project(&full.dir, &full.options()).expect("full build");
+    assert_eq!((all.ran, all.up_to_date), (6, 0));
+
+    // Restricted to a single variant: only that probe joins the two
+    // always-registered fixture tasks.
+    let single = TestProject::new("variant-single", &fixture);
+    single.write("build.ulb", build_ulb);
+    single.write("libs.ulb", libs_ulb);
+    let options = BuildOptions {
+        variants: Some(vec!["freeDebug".to_owned()]),
+        ..single.options()
+    };
+    let selected = build_project(&single.dir, &options).expect("restricted build");
+    assert_eq!((selected.ran, selected.up_to_date), (3, 0));
+    let rerun = build_project(&single.dir, &options).expect("rebuild");
+    assert_eq!((rerun.ran, rerun.up_to_date), (0, 3));
+
+    // An unknown variant fails with the valid set named.
+    let bad = build_project(
+        &single.dir,
+        &BuildOptions {
+            variants: Some(vec!["turbo".to_owned()]),
+            ..single.options()
+        },
+    )
+    .expect_err("unknown variant must fail");
+    assert!(
+        bad.contains("unknown variant 'turbo'")
+            && bad.contains("DebugFree")
+            && bad.contains("ReleasePaid"),
+        "{bad}"
+    );
+}
+
+#[test]
+fn variant_selection_is_consistent_across_modules() {
+    let fixture = build_fixture("ulb-plugin-fixture");
+
+    // A flavored consumer depending on a flavor-less provider through
+    // settings.ulb + project(":lib"). Selecting the consumer's freeDebug
+    // must restrict BOTH modules consistently: the provider (no flavors)
+    // resolves its build-type component and registers only probeDebug.
+    let project = TestProject::new("variant-multi", &fixture);
+    std::fs::create_dir_all(project.dir.join("app")).expect("app dir");
+    std::fs::create_dir_all(project.dir.join("lib")).expect("lib dir");
+    // Each module's `source` resolves against ITS OWN directory (the
+    // host injects the module path as projectDir), so both need a copy.
+    std::fs::write(project.dir.join("app/in.txt"), "app input").expect("write app input");
+    std::fs::write(project.dir.join("lib/in.txt"), "lib input").expect("write lib input");
+    project.write(
+        "settings.ulb",
+        "project \"VariantMulti\"\nmodule \"app\"\nmodule \"lib\"\n",
+    );
+    project.write("conventions.ulb", "");
+    project.write(
+        "libs.ulb",
+        "plugins {\n  fixture = \"ulite/fixture\" @ \"0.1.0\"\n}\n",
+    );
+    project.write(
+        "app/build.ulb",
+        "source = \"in.txt\"\n\
+output = \"out.txt\"\n\
+variantProbe true\n\
+deps {\n\
+  implementation project(\":lib\")\n\
+}\n\
+buildTypes {\n\
+  debug { minifyEnabled false }\n\
+  release { minifyEnabled true }\n\
+}\n\
+productFlavors {\n\
+  dimension \"tier\"\n\
+  free { applicationIdSuffix \".free\" }\n\
+  paid { applicationIdSuffix \".paid\" }\n\
+}\n",
+    );
+    project.write(
+        "lib/build.ulb",
+        "source = \"in.txt\"\n\
+output = \"lib-out.txt\"\n\
+variantProbe true\n\
+jvm {\n\
+  jarFile \"build/lib.jar\"\n\
+}\n",
+    );
+
+    // Full matrices: app has six tasks, lib has four.
+    let all = build_project(&project.dir, &project.options()).expect("full build");
+    assert!(all.failure.is_none(), "{:?}", all.failure);
+    assert_eq!((all.ran, all.up_to_date), (10, 0));
+
+    // freeDebug: app keeps debug+free; lib resolves the Debug component.
+    let options = BuildOptions {
+        variants: Some(vec!["freeDebug".to_owned()]),
+        ..project.options()
+    };
+    let selected = build_project(&project.dir, &options).expect("restricted build");
+    assert!(selected.failure.is_none(), "{:?}", selected.failure);
+    assert_eq!((selected.ran, selected.up_to_date), (6, 0));
+    let rerun = build_project(&project.dir, &options).expect("rebuild");
+    assert_eq!((rerun.ran, rerun.up_to_date), (0, 6));
 }

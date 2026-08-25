@@ -435,7 +435,16 @@ host's `java` tool, and a `jar` packaging step. The host's `write` action
 - Owns the variant matrix (build type × flavor dimensions), per-variant
   source-set layering, and down-module variant propagation — the old §5
   content, now android-plugin-owned logic that calls into the *core*
-  task engine (§4) the same way any other plugin does.
+  task engine (§4) the same way any other plugin does. The core
+  contributes one capability here: `uliab build --variant NAME[,NAME…]`
+  rewrites every module's evaluated model before plugins run so only the
+  selected variants' build types and flavors remain — every plugin then
+  registers exactly those variants' tasks, and because the restriction is
+  project-wide, cross-module `project(":…")` refs stay matched across
+  variants (a provider without flavors resolves a consumer-style
+  selection like `freeDebug` to its build-type component via unique
+  prefix/suffix match; none or ambiguous matches error naming the
+  module's valid variants).
 - Owns manifest merging (old §8) and dex/APK/AAR packaging via `aapt2`/
   `d8` (`run_tool`).
 - Declares a dependency on `ulite/jvm` in its own plugin manifest (§3.2)
