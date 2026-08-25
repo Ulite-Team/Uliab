@@ -1082,7 +1082,7 @@ fn restrict_model_to_variants(model: &Value, selected: Option<&[String]>) -> Res
     // computing both default variants.
     let kept_bt_block: BTreeMap<String, Value> = build_type_names
         .iter()
-        .filter(|bt| kept_build_types.contains(bt.as_str()))
+        .filter(|bt| kept_build_types.contains(&bt.as_str()))
         .map(|bt| (bt.clone(), Value::Block(BTreeMap::new())))
         .collect();
     restricted.insert(
@@ -1090,7 +1090,7 @@ fn restrict_model_to_variants(model: &Value, selected: Option<&[String]>) -> Res
         Value::Block(match entries.get("buildTypes") {
             Some(Value::Block(bt)) => bt
                 .iter()
-                .filter(|(key, _)| kept_build_types.contains(key.as_str()))
+                .filter(|(key, _)| kept_build_types.contains(&key.as_str()))
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
             _ => kept_bt_block.clone(),
