@@ -1106,10 +1106,7 @@ fn restrict_model_to_variants(model: &Value, selected: Option<&[String]>) -> Res
         let filtered: BTreeMap<String, Value> = pf
             .iter()
             .filter(|(key, _)| {
-                key.as_str() == "dimension"
-                    || kept_flavors
-                        .iter()
-                        .any(|kept| *kept == key.as_str())
+                key.as_str() == "dimension" || kept_flavors.iter().any(|kept| *kept == key.as_str())
             })
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
