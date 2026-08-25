@@ -1105,9 +1105,7 @@ fn restrict_model_to_variants(model: &Value, selected: Option<&[String]>) -> Res
     if let Some(Value::Block(pf)) = entries.get("productFlavors") {
         let filtered: BTreeMap<String, Value> = pf
             .iter()
-            .filter(|(key, _)| {
-                key.as_str() == "dimension" || kept_flavors.contains(&key.as_str())
-            })
+            .filter(|(key, _)| key.as_str() == "dimension" || kept_flavors.contains(&key.as_str()))
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
         restricted.insert("productFlavors".to_owned(), Value::Block(filtered));
