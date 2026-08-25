@@ -635,3 +635,69 @@ productFlavors {\n\
         "{bad}"
     );
 }
+
+#[test]
+fn variant_selection_is_consistent_across_modules() {
+    let fixture = build_fixture("ulb-plugin-fixture");
+
+    // A flavored consumer depending on a flavor-less provider through
+    // settings.ulb + project(":lib"). Selecting the consumer's freeDebug
+    // must restrict BOTH modules consistently: the provider (no flavors)
+    // resolves its build-type component and registers only probeDebug.
+    let project = TestProject::new("variant-multi", &fixture);
+    std::fs::create_dir_all(project.dir.join("app")).expect("app dir");
+    std::fs::create_dir_all(project.dir.join("lib")).expect("lib dir");
+    project.write(
+        "settings.ulb",
+        "project \"VariantMulti\"\nmodule \"app\"\nmodule \"lib\"\n",
+    );
+    project.write(
+        "conventions.ulb",
+        "",
+    );
+    project.write(
+        "libs.ulb",
+        "plugins {\n  fixture = \"ulite/fixture\" @ \"0.1.0\"\n}\n",
+    );
+    project.write(
+        "app/build.ulb",
+        "source = \"in.txt\"\n\
+output = \"out.txt\"\n\
+variantProbe true\n\
+deps {\n\
+  implementation project(\":lib\")\n\
+}\n\
+buildTypes {\n\
+  debug { minifyEnabled false }\n\
+  release { minifyEnabled true }\n\
+}\n\
+productFlavors {\n\
+  dimension \"tier\"\n\
+  free { applicationIdSuffix \".free\" }\n\
+  paid { applicationIdSuffix \".paid\" }\n\
+}\n",
+    );
+    project.write(
+        "lib/build.ulb",
+        "source = \"in.txt\"\n\
+output = \"lib-out.txt\"\n\
+variantProbe true\n\
+jvm {\n\
+  jarFile \"build/lib.jar\"\n\
+}\n",
+    );
+
+    // Full matrices: app has six tasks, lib has four.
+    let all = build_project(&project.dir, &project.options()).expect("full build");
+    assert_eq!((all.ran, all.up_to_date), (10, 0));
+
+    // freeDebug: app keeps debug+free; lib resolves the Debug component.
+    let options = BuildOptions {
+        variants: Some(vec!["freeDebug".to_owned()]),
+        ..project.options()
+    };
+    let selected = build_project(&project.dir, &options).expect("restricted build");
+    assert_eq!((selected.ran, selected.up_to_date), (6, 0));
+    let rerun = build_project(&project.dir, &options).expect("rebuild");
+    assert_eq!((rerun.ran, rerun.up_to_date), (0, 6));
+}

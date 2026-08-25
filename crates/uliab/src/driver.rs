@@ -1052,6 +1052,24 @@ fn restrict_model_to_variants(model: &Value, selected: Option<&[String]>) -> Res
                 || candidate.swapped_lower.as_deref() == Some(lowered.as_str())
         });
         let Some(matched) = matched else {
+            // A flavor-less module (a provider, say) only exposes bare
+            // build types — `Debug`, `Release` — while a consumer-style
+            // selection like `freeDebug` names a full variant. Resolve the
+            // selection's BUILD-TYPE component instead so cross-module
+            // project(":…") refs stay matched across variants.
+            let bt_matches: Vec<&Candidate<'_>> = candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.flavor.is_none()
+                        && lowered.starts_with(&candidate.canonical.to_lowercase())
+                })
+                .collect();
+            if let [one] = bt_matches.as_slice() {
+                if !kept_build_types.contains(&one.build_type) {
+                    kept_build_types.push(one.build_type);
+                }
+                continue;
+            }
             let known = if candidates.is_empty() {
                 "none".to_owned()
             } else {
@@ -1723,6 +1741,8 @@ mod tests {
         assert_eq!(pascal_case("debug"), "Debug");
         assert_eq!(pascal_case("free"), "Free");
         assert_eq!(pascal_case("paid_tier"), "PaidTier");
+        assert_eq!(pascal_case("myFlavor"), "MyFlavor");
+        assert_eq!(pascal_case("3d"), "3d");
         assert_eq!(pascal_case("_leading"), "Leading");
         assert_eq!(pascal_case(""), "");
     }
@@ -1844,6 +1864,27 @@ mod tests {
             error.contains("unknown variant 'turbo'") && error.contains("Debug, Release"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn restrict_resolves_consumer_selection_to_provider_build_type() {
+        // A flavor-less module only exposes Debug/Release; a consumer-style
+        // selection like freeDebug resolves to its build-type component so
+        // cross-module refs stay matched.
+        let model = Value::Block(BTreeMap::from([(
+            "jvm".to_owned(),
+            Value::Block(BTreeMap::new()),
+        )]));
+        let restricted =
+            restrict_model_to_variants(&model, Some(&["freeDebug".to_owned()])).expect("restricts");
+        let Value::Block(entries) = &restricted else {
+            panic!("expected a block");
+        };
+        let Some(Value::Block(build_types)) = entries.get("buildTypes") else {
+            panic!("expected buildTypes");
+        };
+        assert_eq!(build_types.len(), 1);
+        assert!(build_types.contains_key("debug"));
     }
 
     #[test]
