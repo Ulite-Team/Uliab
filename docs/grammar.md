@@ -106,6 +106,7 @@ bundle  plugins  maven  dimension  dependsOn  run  plugin  project  module
 lspCompat  namespace  applicationId  compileSdk  minSdk  targetSdk
 versionCode  versionName  api  implementation  runtimeOnly  compileOnly  ksp
 testImplementation  androidTestImplementation  copy  exec  description
+buildConfigField
 ```
 
 Contextual keywords keep the reserved set tiny, which keeps the grammar
@@ -567,6 +568,7 @@ Required diagnostic cases (each gets an assertion test in `ulb-lang`):
 | `versionCode` | number | integer version code |
 | `versionName` | `ver(...)` or string | display version |
 | `signing { ... }` | block | see below (also valid at top level of `build.ulb`) |
+| `buildConfigField` | list `[type, name, initializer]`, repeatable | custom field in the generated `BuildConfig.java` (see android-plugin.md) |
 
 ### `buildTypes { ... }`
 

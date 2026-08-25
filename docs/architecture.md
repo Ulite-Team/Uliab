@@ -447,6 +447,10 @@ host's `java` tool, and a `jar` packaging step. The host's `write` action
   module's valid variants).
 - Owns manifest merging (old §8) and dex/APK/AAR packaging via `aapt2`/
   `d8` (`run_tool`).
+- Generates `BuildConfig.java` per variant (nine default fields plus
+  user-declared `buildConfigField` entries) and adds the output directory
+  to `javac`'s `-sourcepath` so generated constants are available at
+  compile time.
 - Declares a dependency on `ulite/jvm` in its own plugin manifest (§3.2)
   so the tool loads both and `ulite/android` can call into `ulite/jvm`'s
   registered compile tasks rather than re-implementing compilation.

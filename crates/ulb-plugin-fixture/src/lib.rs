@@ -17,7 +17,10 @@
 //! the manifest-declared-tools gate (ARCHITECTURE.md §3.5). A
 //! `probeAndroidSdk` config key makes configure assert that the module's
 //! `android.sdkDir` (or the injected `androidSdkDir`) is readable from the
-//! guest, proving the host preopened it. The `uliab`
+//! guest, proving the host preopened it. A `buildConfigProbe` config key
+//! reads `android.buildConfigField` list triples and writes the parsed
+//! fields to a file, proving the host passes buildConfigField entries to the
+//! plugin. The `uliab`
 //! integration tests build this crate for `wasm32-wasip2` and drive it
 //! through [`uliab::host::PluginHost`] to prove configure -> task graph ->
 //! execute end to end.
@@ -373,6 +376,43 @@ impl exports::ulite::ulb::ulb_plugin::Guest for Fixture {
             };
             std::fs::metadata(&sdk_dir).map_err(|error| {
                 format!("android SDK root '{sdk_dir}' is not readable from the plugin: {error}")
+            })?;
+        }
+
+        // A `buildConfigProbe` config key (a file path) makes configure
+        // read the module's `android.buildConfigField` entries (list
+        // triples), format them as "TYPE NAME = INITIALIZER;" lines, and
+        // write the result to the given path. The host tests use this to
+        // prove buildConfigField triples reach the plugin and the
+        // three-element list form is parseable from the evaluated model.
+        if let Some(path) = config
+            .get("buildConfigProbe")
+            .and_then(serde_json::Value::as_str)
+        {
+            let fields = config
+                .get("android")
+                .and_then(|block| block.get("buildConfigField"))
+                .and_then(serde_json::Value::as_array);
+            let mut body = String::new();
+            if let Some(arr) = fields {
+                for triple in arr {
+                    if let Some(elems) = triple.as_array().filter(|a| a.len() == 3) {
+                        let ty = elems[0].as_str().unwrap_or("?");
+                        let name = elems[1].as_str().unwrap_or("?");
+                        let init = elems[2].as_str().unwrap_or("?");
+                        body.push_str(&format!("{ty} {name} = {init};\n"));
+                    }
+                }
+            }
+            task_registrar::register_task(&Task {
+                name: "buildconfig-probe".to_owned(),
+                inputs: Vec::new(),
+                outputs: vec![path.to_owned()],
+                depends_on: Vec::new(),
+                action: Action::WriteFile(WriteFileArgs {
+                    path: path.to_owned(),
+                    contents: body,
+                }),
             })?;
         }
 
