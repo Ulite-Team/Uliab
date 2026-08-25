@@ -62,7 +62,7 @@ Grouped by how soon a real Compose Android app build would actually hit them:
 - Rust/JNI native module support (relevant to NoteScribe specifically: a Rust/JNI backend module) — cross-compiling a Rust crate per Android ABI and packaging the resulting `.so` files into `jniLibs/<abi>/` inside the APK/AAR. Needs NDK toolchain discovery (same shape as the existing Android SDK discovery, §3.2) plus a `cargo`/NDK-`clang` entry in `AllowlistedTool`.
 
 **Would surface within the first few real builds:**
-- BuildConfig generation (`buildConfigField`-style codegen) — common for per-variant API keys/base URLs; a separate codegen step from the variant matrix above.
+- BuildConfig generation (`buildConfigField`-style codegen) — common for per-variant API keys/base URLs; a separate codegen step from the variant matrix above. **Done** (2026-08-25): `ulite/android` now generates `BuildConfig.java` per variant with nine default fields plus user-defined `buildConfigField` entries.
 - Dependency excludes + BOM/`dependencyManagement` support in the Maven resolver — BOM support is implemented; dependency excludes not yet supported.
 - JDK auto-discovery — Android SDK discovery exists (§3.2); nothing analogous locates a JDK yet, so `javac`/`kotlinc` invocation implicitly relies on `PATH`.
 - Local/composite builds across separate repos — different from the same-repo `project(":module")` refs done in Phase 10: sharing code between Amr's separate real projects (NoteScribe, Apex, Ulite SaaS) needs building against a sibling repo's local (unpublished) output.

@@ -704,3 +704,42 @@ jvm {\n\
     let rerun = build_project(&project.dir, &options).expect("rebuild");
     assert_eq!((rerun.ran, rerun.up_to_date), (0, 6));
 }
+
+#[test]
+fn build_config_probe_writes_parsed_triples_to_file() {
+    let fixture = build_fixture("ulb-plugin-fixture");
+    let project = TestProject::new("buildconfig-probe", &fixture);
+    let probe_path = project.dir.join("buildconfig-probe.txt");
+    project.write(
+        "build.ulb",
+        &format!(
+            "source = {:?}\noutput = {:?}\n\
+             android {{\n\
+               buildConfigField [\"String\", \"API_KEY\", \"abc123\"]\n\
+               buildConfigField [\"int\", \"MAX_RETRIES\", \"3\"]\n\
+             }}\n\
+             buildConfigProbe = {:?}\n",
+            project.dir.join("in.txt").display().to_string(),
+            project.dir.join("out.txt").display().to_string(),
+            probe_path.display().to_string(),
+        ),
+    );
+    project.write(
+        "libs.ulb",
+        "plugins {\n  fixture = \"ulite/fixture\" @ \"0.1.0\"\n}\n",
+    );
+
+    let result = build_project(&project.dir, &project.options()).expect("build");
+    assert!(result.failure.is_none(), "{:?}", result.failure);
+    assert_eq!((result.ran, result.up_to_date), (3, 0));
+
+    let contents = std::fs::read_to_string(&probe_path).expect("buildconfig probe output file");
+    assert!(
+        contents.contains("String API_KEY = abc123;"),
+        "expected API_KEY field in probe output: {contents}"
+    );
+    assert!(
+        contents.contains("int MAX_RETRIES = 3;"),
+        "expected MAX_RETRIES field in probe output: {contents}"
+    );
+}
