@@ -410,11 +410,7 @@ fn expanded_tokens_debug(input: &DeriveInput, specs: &[FieldSpec]) -> String {
     for spec in specs {
         lines.push(format!(
             "field {}:{} kind={} opt={} feature={}",
-            spec.dsl_name,
-            spec.ident,
-            spec.kind,
-            spec.optional,
-            spec.is_feature
+            spec.dsl_name, spec.ident, spec.kind, spec.optional, spec.is_feature
         ));
     }
     format!(
