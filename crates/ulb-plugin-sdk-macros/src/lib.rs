@@ -130,14 +130,14 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
 
     let debug_text = impl_tokens.to_string();
 
-    quote! {
+    Ok(quote! {
         const _: () = ::core::compile_error!(#debug_text);
         #impl_tokens
 
         #[cfg(target_arch = "wasm32")]
         #[link_section = "ulb:config-schema"]
         static _ULB_CONFIG_SCHEMA_SECTION: [u8; #schema_len] = *#schema_bytes;
-    }
+    })
 }
 
 fn field_spec(field: &Field) -> syn::Result<FieldSpec> {
