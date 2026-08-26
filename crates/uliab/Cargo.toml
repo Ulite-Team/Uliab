@@ -22,6 +22,9 @@ sha2 = "0.10"
 ureq = "3"
 # POM parsing for the Maven dependency resolver.
 quick-xml = "0.37"
+# Binary-level WASM parsing for reading plugin config schemas from custom
+# sections without instantiating the plugin (ARCHITECTURE.md §3.8).
+wasmparser = "0.219"
 
 [lints]
 workspace = true

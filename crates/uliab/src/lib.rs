@@ -17,4 +17,5 @@ pub mod init;
 pub mod maven;
 pub mod project;
 pub mod registry;
+pub mod schema;
 pub mod task;
