@@ -128,11 +128,13 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         }
     };
 
-    let debug_text = impl_tokens.to_string();
+    eprintln!(
+        "[ulb-config] EXPANSION for {}: {}",
+        quote! { #type_name },
+        impl_tokens.to_string()
+    );
 
-    Ok(quote! {
-        const _: () = ::core::compile_error!(#debug_text);
-        #impl_tokens
+    Ok(impl_tokens)
 
         #[cfg(target_arch = "wasm32")]
         #[link_section = "ulb:config-schema"]
