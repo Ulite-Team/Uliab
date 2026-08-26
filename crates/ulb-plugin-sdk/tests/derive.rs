@@ -37,20 +37,3 @@ fn schema_catalog_renders_keys_features_and_descriptions() {
     );
 }
 
-#[test]
-fn from_config_reads_typed_values() {
-    let value = serde_json::json!({
-        "message": "hi",
-        "volume": 3,
-        "shout": true,
-        "extraFiles": ["a.txt", "b.txt"],
-        "note": null,
-        "unknownKey": 42
-    });
-    let config = Flat::from_config(&value).expect("parses");
-    assert_eq!(config.message, "hi");
-    assert_eq!(config.volume, 3);
-    assert!(config.shout);
-    assert_eq!(config.extra_files, ["a.txt".to_owned(), "b.txt".to_owned()]);
-    assert_eq!(config.note, None);
-}

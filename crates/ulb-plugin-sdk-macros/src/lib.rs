@@ -12,23 +12,22 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{Data, DeriveInput, Expr, Field, Fields, Lit, Meta, parse_macro_input};
 
-/// Derives typed config deserialization plus an embedded schema catalog.
+/// Derives the plugin's embedded config-schema catalog.
 ///
 /// The struct's fields become the keys the plugin owns. Field names are
-/// converted to lowerCamelCase DSL names unless renamed with
-/// `#[ulb(rename = "name")]`; doc comments become the key's description
-/// unless overridden with `#[ulb(desc = "text")]`. An `Option<T>` field is
+/// converted to lowerCamelCase DSL names unless renamed — pair this derive
+/// with `#[derive(serde::Deserialize)]` + `#[serde(rename_all =
+/// "camelCase")]` and the two agree automatically; per-field renames must
+/// be declared in BOTH attributes (`#[serde(rename = "x")]` and
+/// `#[ulb(rename = "x")]`). Doc comments become descriptions unless
+/// overridden with `#[ulb(desc = "text")]`. An `Option<T>` field is
 /// optional; every other field is required. A `bool` field annotated with
 /// `#[ulb(feature)]` is additionally published as a build feature.
 ///
-/// Supported field types: `String`, booleans, integer primitives,
-/// `Vec<String>`, and nested structs that also derive [`UlbConfig`] (they
-/// appear as `block` entries; their own catalog lives on their type).
-///
-/// Deserialization reads out of a `serde_json::Value` and is deliberately
-/// lenient in this first cut: unknown keys are ignored — host-side
-/// validation against the embedded catalog arrives later. A missing
-/// required key or a wrongly typed value is an error naming the key.
+/// Deserialization is NOT generated: derive `serde::Deserialize` on the
+/// same struct and call `serde_json::from_value` in `configure`. Keeping
+/// deserialization on serde's battle-tested path leaves this macro a
+/// pure metadata generator — nothing here can break a build.
 #[proc_macro_derive(UlbConfig, attributes(ulb))]
 pub fn derive_ulb_config(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -101,13 +100,6 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     let schema_len = schema_text.len();
     let schema_bytes = proc_macro2::Literal::byte_string(schema_text.as_bytes());
 
-    let extractions = specs.iter().map(|spec| {
-        let ident = &spec.ident;
-        let extract = extraction_for(spec);
-        quote! { let #ident = #extract; }
-    });
-    let idents = specs.iter().map(|spec| &spec.ident);
-
     let impl_tokens = quote! {
         #[automatically_derived]
         impl #type_name {
@@ -115,15 +107,6 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
             /// `ulb-config-schema 1` line format (ARCHITECTURE.md §3.8).
             pub const ULB_CONFIG_SCHEMA: &'static str = #schema_text;
 
-            /// Builds this config out of the module-config JSON. Unknown
-            /// keys are ignored; missing required keys or wrongly typed
-            /// values error with the key named.
-            pub fn from_config(
-                value: &::serde_json::Value,
-            ) -> ::std::result::Result<Self, String> {
-                #(#extractions)*
-                ::std::result::Result::Ok(Self { #(#idents),* })
-            }
         }
 
         #[cfg(target_arch = "wasm32")]
@@ -198,108 +181,6 @@ fn field_spec(field: &Field) -> syn::Result<FieldSpec> {
         description,
         is_feature,
     })
-}
-
-fn extraction_for(spec: &FieldSpec) -> TokenStream2 {
-    let dsl = &spec.dsl_name;
-    let kind_missing = quote! {
-        return ::std::result::Result::Err(format!("missing required key '{}'", #dsl))
-    };
-
-    // Nested blocks recurse into their own derived from_config.
-    if spec.kind == "block" {
-        let ty = &spec.ty;
-        return if spec.optional {
-            quote! {
-                match value.get(#dsl) {
-                    ::std::option::Option::Some(v) if !v.is_null() => {
-                        ::std::option::Option::Some(#ty::from_config(v)?)
-                    }
-                    _ => ::std::option::Option::None,
-                }
-            }
-        } else {
-            quote! {
-                match value.get(#dsl) {
-                    ::std::option::Option::Some(v) => #ty::from_config(v)?,
-                    ::std::option::Option::None => #kind_missing,
-                }
-            }
-        };
-    }
-
-    // Parse to a canonical shape first, then adapt integers down to the
-    // declared field width with an out-of-range error.
-    let (parse, type_word): (TokenStream2, TokenStream2) = match spec.kind {
-        "string" => (
-            quote! { v.as_str().map(::std::string::ToString::to_owned) },
-            quote! { "a string" },
-        ),
-        "int" => (quote! { v.as_i64() }, quote! { "an integer" }),
-        "bool" => (quote! { v.as_bool() }, quote! { "true or false" }),
-        "list" => (
-            quote! {
-                v.as_array().and_then(|items| {
-                    items
-                        .iter()
-                        .map(|item| item.as_str().map(::std::string::ToString::to_owned))
-                        .collect::<::std::option::Option<::std::vec::Vec<_>>>()
-                })
-            },
-            quote! { "a list of strings" },
-        ),
-        other => unreachable!("catalog kinds are closed; got {other}"),
-    };
-    let type_mismatch = quote! {
-        return ::std::result::Result::Err(format!("key '{}' must be {}", #dsl, #type_word))
-    };
-    let adapt = if spec.kind == "int" {
-        let ty = &spec.ty;
-        quote! {
-            <#ty>::try_from(parsed)
-                .map_err(|_| format!("key '{}' out of range", #dsl))?
-        }
-    } else {
-        quote! { parsed }
-    };
-
-    if spec.optional {
-        quote! {
-            match value.get(#dsl) {
-                ::std::option::Option::Some(v) if !v.is_null() => {
-                    match #parse {
-                        ::std::option::Option::Some(parsed) => {
-                            ::std::option::Option::Some(#adapt)
-                        }
-                        ::std::option::Option::None => #type_mismatch,
-                    }
-                }
-                _ => ::std::option::Option::None,
-            }
-        }
-    } else {
-        quote! {
-            match value.get(#dsl) {
-                ::std::option::Option::Some(v) => match #parse {
-                    ::std::option::Option::Some(parsed) => #adapt,
-                    ::std::option::Option::None => #type_mismatch,
-                },
-                ::std::option::Option::None => #kind_missing,
-            }
-        }
-    }
-}
-
-fn expect_string(value: &Expr) -> syn::Result<String> {
-    if let Expr::Lit(lit) = value
-        && let Lit::Str(text) = &lit.lit
-    {
-        return Ok(text.value());
-    }
-    Err(syn::Error::new_spanned(
-        value,
-        "#[ulb] values must be string literals",
-    ))
 }
 
 fn doc_description(field: &Field) -> String {
