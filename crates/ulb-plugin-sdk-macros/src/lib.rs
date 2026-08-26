@@ -9,7 +9,7 @@
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::{Data, DeriveInput, Expr, Field, Fields, Lit, Meta, parse_macro_input};
 
 /// Derives typed config deserialization plus an embedded schema catalog.
