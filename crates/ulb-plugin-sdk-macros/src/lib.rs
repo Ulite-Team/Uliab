@@ -183,6 +183,18 @@ fn field_spec(field: &Field) -> syn::Result<FieldSpec> {
     })
 }
 
+fn expect_string(value: &Expr) -> syn::Result<String> {
+    if let Expr::Lit(lit) = value
+        && let Lit::Str(text) = &lit.lit
+    {
+        return Ok(text.value());
+    }
+    Err(syn::Error::new_spanned(
+        value,
+        "#[ulb] values must be string literals",
+    ))
+}
+
 fn doc_description(field: &Field) -> String {
     let mut parts: Vec<String> = Vec::new();
     for attr in &field.attrs {
