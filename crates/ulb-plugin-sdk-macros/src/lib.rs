@@ -8,7 +8,7 @@
 //! machine-readable description cannot drift apart.
 
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream;
+use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{Data, DeriveInput, Expr, Field, Fields, Lit, Meta, parse_macro_input};
 
@@ -33,10 +33,9 @@ use syn::{Data, DeriveInput, Expr, Field, Fields, Lit, Meta, parse_macro_input};
 pub fn derive_ulb_config(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     match expand(&input) {
-        Ok(tokens) => tokens,
-        Err(error) => error.to_compile_error(),
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.to_compile_error().into(),
     }
-    .into()
 }
 
 struct FieldSpec {
@@ -50,7 +49,7 @@ struct FieldSpec {
     is_feature: bool,
 }
 
-fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
+fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     let type_name = &input.ident;
     if !input.generics.params.is_empty() || input.generics.where_clause.is_some() {
         return Err(syn::Error::new_spanned(
@@ -196,7 +195,7 @@ fn field_spec(field: &Field) -> syn::Result<FieldSpec> {
     })
 }
 
-fn extraction_for(spec: &FieldSpec) -> TokenStream {
+fn extraction_for(spec: &FieldSpec) -> TokenStream2 {
     let dsl = &spec.dsl_name;
 
     match spec.kind {
