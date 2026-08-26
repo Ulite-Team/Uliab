@@ -39,8 +39,6 @@ pub fn derive_ulb_config(input: TokenStream) -> TokenStream {
 
 struct FieldSpec {
     dsl_name: String,
-    ident: syn::Ident,
-    ty: syn::Type,
     kind: &'static str,
     optional: bool,
     description: String,
@@ -174,8 +172,6 @@ fn field_spec(field: &Field) -> syn::Result<FieldSpec> {
 
     Ok(FieldSpec {
         dsl_name,
-        ident: field.ident.clone().expect("named field"),
-        ty: visible.clone(),
         kind,
         optional,
         description,
