@@ -70,7 +70,7 @@ impl TestProject {
                 "ulite/fixture": {
                     "versions": {
                         "0.1.0": {
-                            "abi": { "min": "0.4", "max": "0.7" },
+                            "abi": { "min": "0.4", "max": "0.8" },
                             "artifact_url": fixture.display().to_string(),
                         }
                     }
@@ -542,7 +542,7 @@ fn cross_plugin_task_refs_are_scheduled_through_the_driver() {
             "ulite/fixture": {
                 "versions": {
                     "0.1.0": {
-                        "abi": { "min": "0.4", "max": "0.7" },
+                        "abi": { "min": "0.4", "max": "0.8" },
                         "artifact_url": fixture.display().to_string(),
                     }
                 }
@@ -550,7 +550,7 @@ fn cross_plugin_task_refs_are_scheduled_through_the_driver() {
             "ulite/cross-dep-fixture": {
                 "versions": {
                     "0.1.0": {
-                        "abi": { "min": "0.4", "max": "0.7" },
+                        "abi": { "min": "0.4", "max": "0.8" },
                         "artifact_url": consumer.display().to_string(),
                     }
                 }

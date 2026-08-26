@@ -825,7 +825,7 @@ Android logic).
 | 13 (done) | `uliab init` | scaffold new project from templates |
 | 14 (done) | KMP Android target | plugin-to-plugin ABI composition (dependencies + cross-plugin dep resolution) |
 | 15 (done) | Product flavors / variant matrix | `--variant` host-side selection + per-variant source-set layering in plugins |
-| **16A (not started)** | `#[derive(UlbConfig)]` macro in `ulb-plugin-sdk` (§3.8) | typed config struct → deserializer + `.wasm`-embedded schema, proven on `hello-plugin` only |
+| **16A (done)** | `#[derive(UlbConfig)]` macro in `ulb-plugin-sdk` (§3.8) | typed config struct → deserializer + `.wasm`-embedded schema, proven on `hello-plugin` + `ulb-plugin-fixture` |
 | **16B (not started)** | Migrate `ulite/jvm`, `ulite/android`, `ulite/kmp` to `UlbConfig` structs | every shipped plugin's raw-JSON reads replaced; ABI bump for the schema section |
 | **16C (not started)** | Host schema extraction + enforcement | `uliab plugins describe` prints a resolved plugin's schema from its `.wasm` alone; unknown-key/unknown-feature become named errors sourced from the schema, not a hardcoded table |
 | **16D (not started)** | `ulb-lsp` consumes the schema | completions/hover/diagnostics for plugin-owned keys, degrading gracefully for a pre-16A plugin with no schema section (§3.8 open question) |

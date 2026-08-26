@@ -35,6 +35,41 @@ use ulite::ulb::task_registrar::{
     self, Action, AllowlistedTool, CopyArgs, RunToolArgs, Task, WriteFileArgs,
 };
 
+use ulb_plugin_sdk::UlbConfig;
+
+/// Typed config schema for the fixture plugin. Only the fields exercised
+/// by integration tests are declared here; the actual `configure` fn
+/// still reads from raw JSON so test-only keys (e.g. `infiniteLoop`)
+/// remain ad-hoc.
+#[derive(UlbConfig, serde::Deserialize)]
+pub struct FixtureConfig {
+    /// Source file path to copy from.
+    pub source: String,
+    /// Destination file path to copy to.
+    pub output: String,
+    /// Host-resolved classpath object (optional).
+    #[ulb(description = "Resolved classpath with compile/runtime buckets")]
+    #[serde(default)]
+    pub classpath: Option<serde_json::Value>,
+    /// Output path for the first compile jar (optional).
+    #[serde(default)]
+    pub classpath_output: Option<String>,
+    /// Source set classpath specification (optional).
+    #[serde(default)]
+    pub source_set_classpath: Option<serde_json::Value>,
+    /// Tool name to probe via a no-op run-tool task (optional).
+    #[serde(default)]
+    pub probe_tool: Option<String>,
+    /// Whether to assert android.sdkDir readability (optional).
+    #[serde(default)]
+    pub probe_android_sdk: Option<bool>,
+    /// Whether to exercise buildConfigField parsing (optional).
+    #[serde(default)]
+    pub build_config_probe: Option<bool>,
+}
+
+ulb_plugin_sdk::embed_schema!(FixtureConfig);
+
 /// The fixture plugin: a copy task plus an echo task per configuration.
 struct Fixture;
 
