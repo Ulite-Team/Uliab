@@ -25,6 +25,7 @@ use crate::host::PluginHost;
 use crate::maven::{self, MavenRepo};
 use crate::project::{self, read_libs_plugins};
 use crate::registry::{Registry, RegistrySource};
+use crate::schema::{self, extract_schema};
 use crate::task::{
     AllowlistedTool, BuildResult, Executor, FingerprintContext, FingerprintStore, TaskGraph,
     split_cross_plugin_ref,
@@ -35,6 +36,41 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// The registry index consulted when [`BuildOptions`] does not name one.
 pub const DEFAULT_REGISTRY: &str =
     "https://raw.githubusercontent.com/Ulite-Team/ulb-plugins/main/registry/index.json";
+
+/// Reads the plugin's `.wasm`, extracts its config schema, and validates
+/// `config` against it.  Returns `Ok(())` when the plugin has no schema
+/// (degraded mode) or the config passes validation.  Returns `Err` with
+/// one message per unknown key.
+///
+/// # Errors
+///
+/// Returns `Err` with a formatted error message when the plugin declares
+/// a schema and the config contains keys not present in it.
+fn validate_config_against_schema(
+    wasm_path: &Path,
+    plugin_name: &str,
+    config: &serde_json::Value,
+) -> Result<(), String> {
+    let wasm = match std::fs::read(wasm_path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("warning: skipping schema validation for '{plugin_name}': {e}");
+            return Ok(());
+        }
+    };
+    let schema = match extract_schema(&wasm) {
+        Some(s) => s,
+        // Plugin has no schema section — degraded mode, skip validation.
+        None => return Ok(()),
+    };
+    if let Err(errors) = schema::validate_plugin_config(&schema, config) {
+        let joined = errors.join("; ");
+        return Err(format!(
+            "plugin '{plugin_name}' config validation failed: {joined}"
+        ));
+    }
+    Ok(())
+}
 
 /// Options for a [`build_project`] run.
 pub struct BuildOptions {
@@ -344,6 +380,7 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
         if let Some(warning) = &resolved.warning {
             eprintln!("warning: {warning}");
         }
+        validate_config_against_schema(&resolved.path, &resolved.name, &plugin_config)?;
         let result = host
             .configure(&resolved.path, &resolved.name, &config_text, dir)
             .map_err(|error| format!("configuring {label}: {error}"))?;
@@ -719,6 +756,7 @@ fn build_project_multi(
             }
 
             let module_prefixed_name = format!("{}/{}", rel, resolved.name);
+            validate_config_against_schema(&resolved.path, &resolved.name, &plugin_config)?;
 
             let result = module_host
                 .configure(&resolved.path, &module_prefixed_name, &config_text, &dir)

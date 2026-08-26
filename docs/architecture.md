@@ -18,11 +18,12 @@ support), the `ulite/kmp` plugin (JVM + Android targets: commonMain +
 jvmMain → jar, commonMain + androidMain → per-variant merged dex into
 APK), `uliab init` project scaffolding, and multi-module `settings.ulb`
 support are implemented and building. The plugin registry is live on
-GitHub. **Not yet implemented:** the compile-time-derived plugin config
-schema described in §3.8 (Phase 16) — today a plugin reads its config
-block as raw untyped JSON, with no machine-readable record of which keys
-it owns, which is why the LSP and host cannot yet offer plugin-aware
-completions/diagnostics or catch a plugin author's own key typos.
+GitHub. The compile-time-derived plugin config schema (§3.8) is
+implemented: plugins embed a JSON schema in a wasm custom section via
+`#[derive(UlbConfig)]`, and the host validates plugin-owned config
+blocks against it before `configure()`. **Not yet implemented:** LSP
+consumption of the schema (Phase 16D) — completions/diagnostics for
+plugin-owned keys still require the LSP to read the schema.
 
 ---
 
@@ -435,9 +436,9 @@ The schema is **embedded in the compiled `.wasm` as a custom section**
 (§3.4), so the single published artifact carries both its executable
 behavior and its own machine-readable description — they cannot diverge
 because they come from one macro expansion over one struct, at one
-compile. The host and `ulb-lsp` read the schema via static introspection
-(`wasm-tools`-style parsing of the custom section) without instantiating
-or running the plugin at all.
+compile. The host and `ulb-lsp` read the schema via binary-level wasm parsing
+(via `wasmparser`) of the custom section without instantiating or
+running the plugin at all.
 
 **Why this genuinely closes the drift, rather than narrowing it.** Under
 the rejected design, nothing stops a plugin author from adding a field
@@ -463,19 +464,15 @@ plugin first, specifically so this migration doesn't get bundled with
 the host/LSP consumption work (16C/16D) before the foundation itself is
 validated.
 
-**Open questions to resolve during 16A, not guessed at here:**
+**Design decisions resolved:**
 
-- *Cross-plugin duplicate declarations.* If two plugins' schemas declare
-  overlapping feature/key names, what happens — first-registered wins,
-  or is it a hard configuration error? Undecided; must be answered before
-  16B's host enforcement lands, not after.
-- *Version skew.* A plugin built before this phase (ABI < the version
-  this lands under) has no schema custom section at all. The host and
-  LSP must treat "no schema section present" as "no completions/
-  validation available for this plugin's keys" — silently degraded, not
-  an error — mirroring how `legacy-plugin.wit` already lets a
+- *Cross-plugin duplicate declarations.* First-registered wins with a
+  warning. Implemented in the driver's plugin-merge loop.
+- *Version skew.* A plugin built before this phase (ABI < 0.8) has no
+  schema custom section. The host treats "no schema section present" as
+  "no validation available for this plugin's keys" — silently degraded,
+  not an error. This mirrors how `legacy-plugin.wit` lets a
   pre-`configure` component keep working via `run` alone (§3.2 history).
-  This needs an explicit test, not an assumption.
 
 ---
 
@@ -826,8 +823,8 @@ Android logic).
 | 14 (done) | KMP Android target | plugin-to-plugin ABI composition (dependencies + cross-plugin dep resolution) |
 | 15 (done) | Product flavors / variant matrix | `--variant` host-side selection + per-variant source-set layering in plugins |
 | **16A (done)** | `#[derive(UlbConfig)]` macro in `ulb-plugin-sdk` (§3.8) | typed config struct → deserializer + `.wasm`-embedded schema, proven on `hello-plugin` + `ulb-plugin-fixture` |
-| **16B (not started)** | Migrate `ulite/jvm`, `ulite/android`, `ulite/kmp` to `UlbConfig` structs | every shipped plugin's raw-JSON reads replaced; ABI bump for the schema section |
-| **16C (not started)** | Host schema extraction + enforcement | `uliab plugins describe` prints a resolved plugin's schema from its `.wasm` alone; unknown-key/unknown-feature become named errors sourced from the schema, not a hardcoded table |
+| **16B (done)** | Migrate `ulite/jvm`, `ulite/android`, `ulite/kmp` to `UlbConfig` structs | every shipped plugin's raw-JSON reads replaced; ABI bump for the schema section |
+| **16C (done)** | Host schema extraction + enforcement | `uliab plugins describe` prints a resolved plugin's schema from its `.wasm` alone; unknown-key/unknown-feature become named errors sourced from the schema, not a hardcoded table |
 | **16D (not started)** | `ulb-lsp` consumes the schema | completions/hover/diagnostics for plugin-owned keys, degrading gracefully for a pre-16A plugin with no schema section (§3.8 open question) |
 
 Phases 2–6 are sequential (each depends on the previous); 7a/7b/7c are
