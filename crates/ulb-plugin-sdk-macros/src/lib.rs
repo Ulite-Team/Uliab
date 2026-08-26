@@ -222,7 +222,7 @@ fn extraction_for(spec: &FieldSpec) -> TokenStream2 {
             }
         }
         other => {
-            let check: TokenStream = match other {
+            let check: TokenStream2 = match other {
                 "string" => quote! {
                     v.as_str().map(::std::string::ToString::to_owned)
                 },
