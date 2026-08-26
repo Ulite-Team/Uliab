@@ -26,5 +26,8 @@ quick-xml = "0.37"
 # sections without instantiating the plugin (ARCHITECTURE.md §3.8).
 wasmparser = "0.219"
 
+[dev-dependencies]
+wasmparser = "0.219"
+
 [lints]
 workspace = true

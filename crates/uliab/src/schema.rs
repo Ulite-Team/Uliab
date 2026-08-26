@@ -72,16 +72,38 @@ pub struct PluginSchema {
 /// }
 /// ```
 pub fn extract_schema(wasm_bytes: &[u8]) -> Option<PluginSchema> {
-    for result in wasmparser::Parser::new(0).parse_all(wasm_bytes) {
+    // Try module parser first (works for core wasm modules).
+    if let Some(schema) = extract_schema_inner(wasm_bytes, false) {
+        return Some(schema);
+    }
+    // Fall back to component parser (works for wasm32-wasip2 components
+    // that wrap the core module).
+    extract_schema_inner(wasm_bytes, true)
+}
+
+fn extract_schema_inner(wasm_bytes: &[u8], component_model: bool) -> Option<PluginSchema> {
+    let mut parser = wasmparser::Parser::new(0);
+    if component_model {
+        let mut features = parser.features();
+        features |= wasmparser::WasmFeatures::COMPONENT_MODEL;
+        parser.set_features(features);
+    }
+    for result in parser.parse_all(wasm_bytes) {
         let payload = match result {
             Ok(payload) => payload,
-            Err(_) => return None,
+            Err(_) => continue,
         };
 
         if let wasmparser::Payload::CustomSection(custom) = payload
             && custom.name() == SCHEMA_CUSTOM_SECTION
         {
-            return serde_json::from_slice(custom.data()).ok();
+            let mut data = custom.data();
+            // The `embed_schema!` macro null-terminates the bytes for
+            // defense-in-depth; strip it before JSON parsing.
+            if data.last() == Some(&0) {
+                data = &data[..data.len() - 1];
+            }
+            return serde_json::from_slice(data).ok();
         }
     }
 
@@ -92,10 +114,23 @@ pub fn extract_schema(wasm_bytes: &[u8]) -> Option<PluginSchema> {
 /// present. Unlike [`extract_schema`], this does not deserialize — useful
 /// for forwarding the schema to the LSP or for debugging.
 pub fn raw_schema_section(wasm_bytes: &[u8]) -> Option<Vec<u8>> {
-    for result in wasmparser::Parser::new(0).parse_all(wasm_bytes) {
+    if let Some(raw) = raw_schema_section_inner(wasm_bytes, false) {
+        return Some(raw);
+    }
+    raw_schema_section_inner(wasm_bytes, true)
+}
+
+fn raw_schema_section_inner(wasm_bytes: &[u8], component_model: bool) -> Option<Vec<u8>> {
+    let mut parser = wasmparser::Parser::new(0);
+    if component_model {
+        let mut features = parser.features();
+        features |= wasmparser::WasmFeatures::COMPONENT_MODEL;
+        parser.set_features(features);
+    }
+    for result in parser.parse_all(wasm_bytes) {
         let payload = match result {
             Ok(payload) => payload,
-            Err(_) => return None,
+            Err(_) => continue,
         };
 
         if let wasmparser::Payload::CustomSection(custom) = payload
