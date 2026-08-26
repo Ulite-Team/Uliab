@@ -96,5 +96,75 @@ fn fixture_plugin_embeds_config_schema() {
         .find(|p| p.name == "probe_tool")
         .expect("schema should have a 'probe_tool' field");
     assert_eq!(probe_tool.type_name, "string");
-    assert!(!probe_tool.required, "probe_tool should be optional");
+    assert!(!probe_tool.required, "probe_tool field should be optional");
+}
+
+/// Helper: read a pre-built wasm file from the ulb-plugins workspace and
+/// extract its embedded config schema.
+fn read_plugin_schema(wasm_path: std::path::PathBuf) -> uliab::schema::PluginSchema {
+    let wasm = std::fs::read(&wasm_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", wasm_path.display()));
+    extract_schema(&wasm).unwrap_or_else(|| panic!("no schema in {}", wasm_path.display()))
+}
+
+/// The ulb-plugins target directory, honouring `CARGO_TARGET_DIR`.
+fn plugins_target_dir() -> std::path::PathBuf {
+    let base = if let Some(dir) = std::env::var_os("CARGO_TARGET_DIR") {
+        std::path::PathBuf::from(dir)
+    } else {
+        // crates/uliab → crates → Uliab → UliteAmrProjects → ulb-plugins/target
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent() // crates
+            .unwrap()
+            .parent() // Uliab
+            .unwrap()
+            .parent() // UliteAmrProjects
+            .unwrap()
+            .join("ulb-plugins")
+            .join("target")
+    };
+    base.join("wasm32-wasip2")
+}
+
+#[test]
+fn hello_plugin_embeds_config_schema() {
+    let schema = read_plugin_schema(plugins_target_dir().join("debug").join("hello_plugin.wasm"));
+    assert_eq!(schema.name, "PluginConfig");
+}
+
+#[test]
+fn jvm_plugin_embeds_config_schema() {
+    let schema = read_plugin_schema(plugins_target_dir().join("debug").join("jvm_plugin.wasm"));
+    assert_eq!(schema.name, "PluginConfig");
+    assert!(
+        !schema.properties.is_empty(),
+        "jvm-plugin should declare config properties"
+    );
+}
+
+#[test]
+fn android_plugin_embeds_config_schema() {
+    let schema = read_plugin_schema(
+        plugins_target_dir()
+            .join("debug")
+            .join("android_plugin.wasm"),
+    );
+    assert_eq!(schema.name, "AndroidPluginConfig");
+    let android = schema
+        .properties
+        .iter()
+        .find(|p| p.name == "android")
+        .expect("android-plugin should have 'android' field");
+    assert_eq!(android.type_name, "object");
+    assert!(android.required);
+}
+
+#[test]
+fn kmp_plugin_embeds_config_schema() {
+    let schema = read_plugin_schema(plugins_target_dir().join("debug").join("kmp_plugin.wasm"));
+    assert_eq!(schema.name, "KmpPluginConfig");
+    assert!(
+        schema.properties.iter().any(|p| p.name == "kmp"),
+        "kmp-plugin should have 'kmp' field"
+    );
 }
