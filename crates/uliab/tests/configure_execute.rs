@@ -610,3 +610,18 @@ fn same_module_cycle_is_detected_even_with_cross_deps_present() {
         "error should report a cycle: {error}"
     );
 }
+
+#[test]
+fn legacy_component_has_no_schema_section() {
+    // The degraded mode for pre-schema artifacts: reading the built
+    // legacy fixture statically yields no catalog at all — not an error —
+    // so hosts and the LSP skip validation for its keys instead of
+    // failing the build (ARCHITECTURE.md §3.8).
+    let plugin = build_fixture("ulb-plugin-legacy-fixture");
+    let bytes = std::fs::read(&plugin).expect("read fixture wasm");
+    assert_eq!(
+        ulb_plugin_sdk::schema::read_schema(&bytes),
+        Ok(None),
+        "a pre-16A component must present no schema"
+    );
+}

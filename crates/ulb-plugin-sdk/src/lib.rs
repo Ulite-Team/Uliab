@@ -16,6 +16,10 @@
 
 #![warn(missing_docs)]
 
+pub mod schema;
+
+pub use ulb_plugin_sdk_macros::UlbConfig;
+
 /// The WIT document defining the `ulb-plugin` world. Both the host and
 /// plugin sides generate their bindings from this exact text.
 pub const WIT: &str = include_str!("../plugin.wit");

@@ -7,3 +7,9 @@ license = "MIT"
 
 [lints]
 workspace = true
+
+[dependencies]
+ulb-plugin-sdk-macros = { path = "../ulb-plugin-sdk-macros" }
+
+[dev-dependencies]
+serde_json = "1"
