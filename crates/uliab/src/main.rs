@@ -11,6 +11,10 @@
 //!   into the cache on a miss (ARCHITECTURE.md §9, steps 5–6), and prints
 //!   the resulting local artifact paths. `SOURCE` is a registry index URL
 //!   (`https://…`) or a local `index.json` path.
+//! - `uliab plugins describe <name> [--project DIR] [--registry SOURCE]`
+//!   — resolves a single plugin, reads its wasm manifest and config
+//!   schema, and prints a human-readable summary including the declared
+//!   tools, dependencies, and typed config fields.
 //! - `uliab build [--project DIR] [--registry SOURCE] [--cache-dir DIR] [--repo REPO] [--android-sdk DIR] [--variant NAME]`
 //!   — evaluates the project, configures each declared plugin with the
 //!   module model, and executes the registered task graphs incrementally
@@ -179,8 +183,9 @@ fn cmd_plugins(args: &[String]) -> ExitCode {
     let sub = match args.first().map(String::as_str) {
         Some("list") => "list",
         Some("resolve") => "resolve",
+        Some("describe") => "describe",
         _ => {
-            eprintln!("usage: uliab plugins <list|resolve> [options]");
+            eprintln!("usage: uliab plugins <list|resolve|describe> [options]");
             return ExitCode::from(2);
         }
     };
@@ -212,8 +217,136 @@ fn cmd_plugins(args: &[String]) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        "describe" => cmd_plugins_describe(&libs.plugins, &args[1..], &options),
         _ => resolve_all(&libs.plugins, &options),
     }
+}
+
+/// `uliab plugins describe <name> [options]` — resolves a single plugin,
+/// reads its wasm manifest and config schema, and prints a human-readable
+/// summary.
+fn cmd_plugins_describe(
+    specs: &[uliab::registry::PluginSpec],
+    args: &[String],
+    options: &Options,
+) -> ExitCode {
+    // The plugin name is the first positional arg after "describe".
+    let plugin_name = match args.first() {
+        Some(name) if !name.starts_with('-') => name.clone(),
+        _ => {
+            eprintln!("usage: uliab plugins describe <name> [--project DIR]");
+            return ExitCode::from(2);
+        }
+    };
+
+    let spec = match specs.iter().find(|s| s.name == plugin_name) {
+        Some(spec) => spec.clone(),
+        None => {
+            eprintln!("error: plugin '{plugin_name}' is not declared in libs.ulb");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let source = match &options.registry {
+        Some(source) => parse_registry_source(source),
+        None => RegistrySource::Url(DEFAULT_REGISTRY.to_owned()),
+    };
+    let registry = Registry::new(source, options.cache_dir.clone());
+
+    let resolved = match registry.resolve(&spec) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            eprintln!("error: {plugin_name}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let wasm = match std::fs::read(&resolved.path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("error: failed to read {}: {error}", resolved.path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Extract the manifest by instantiating the plugin (requires wasm32
+    // target support, but manifest_of_bytes handles the engine setup).
+    let host = match PluginHost::new() {
+        Ok(host) => host,
+        Err(error) => {
+            eprintln!("error: failed to create plugin host: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let manifest = match host.manifest_of_bytes(&wasm) {
+        Ok(manifest) => Some(manifest),
+        Err(error) => {
+            eprintln!("warning: could not read manifest: {error}");
+            None
+        }
+    };
+
+    // Extract the config schema from the wasm custom section (no
+    // instantiation needed — pure byte-level extraction).
+    let schema = uliab::schema::extract_schema(&wasm);
+
+    // Print the description.
+    println!("name:     {}", resolved.name);
+    println!("version:  {}", resolved.version);
+    println!("abi:      {}-{}", resolved.abi.min, resolved.abi.max);
+    println!("artifact: {}", resolved.path.display());
+    if resolved.from_cache {
+        println!("source:   cache");
+    } else {
+        println!("source:   registry");
+    }
+
+    if let Some(ref m) = manifest {
+        println!(
+            "tools:    {}",
+            if m.tools.is_empty() {
+                "(none)".to_string()
+            } else {
+                m.tools.join(", ")
+            }
+        );
+        println!(
+            "deps:     {}",
+            if m.dependencies.is_empty() {
+                "(none)".to_string()
+            } else {
+                m.dependencies.join(", ")
+            }
+        );
+    }
+
+    match schema {
+        Some(s) => {
+            println!("config schema: {}", s.name);
+            if s.properties.is_empty() {
+                println!("  (no config fields)");
+            } else {
+                for prop in &s.properties {
+                    let req = if prop.required {
+                        "required"
+                    } else {
+                        "optional"
+                    };
+                    let desc = if prop.description.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {}", prop.description)
+                    };
+                    println!("  {}: {} ({req}){desc}", prop.name, prop.type_name);
+                }
+            }
+        }
+        None => {
+            println!("config schema: (not available — plugin predates schema support)");
+        }
+    }
+
+    ExitCode::SUCCESS
 }
 
 fn resolve_all(specs: &[uliab::registry::PluginSpec], options: &Options) -> ExitCode {
