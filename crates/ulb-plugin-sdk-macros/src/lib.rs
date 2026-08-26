@@ -404,10 +404,7 @@ fn lower_camel_case(name: &str) -> String {
 
 /// Temporary diagnostic: renders the exact tokens the derive emits so a
 /// failing build log shows the expansion verbatim.
-fn expanded_tokens_debug(
-    input: &DeriveInput,
-    specs: &[FieldSpec],
-) -> String {
+fn expanded_tokens_debug(input: &DeriveInput, specs: &[FieldSpec]) -> String {
     let type_name = &input.ident;
     let mut lines = Vec::new();
     for spec in specs {
