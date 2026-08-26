@@ -84,11 +84,11 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     for spec in &specs {
         let requirement = if spec.optional { "opt" } else { "req" };
         schema_lines.push(format!(
-            "k {}\t{}\t{}\t{}",
+            "k\t{}\t{}\t{}\t{}",
             spec.dsl_name, spec.kind, requirement, spec.description
         ));
         if spec.is_feature {
-            schema_lines.push(format!("f {}\t{}", spec.dsl_name, spec.description));
+            schema_lines.push(format!("f\t{}\t{}", spec.dsl_name, spec.description));
         }
     }
     let schema_text = schema_lines.join("\n");

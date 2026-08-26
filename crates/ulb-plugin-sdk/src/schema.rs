@@ -183,9 +183,10 @@ fn walk_sections(bytes: &[u8], component: bool, depth: u8) -> Result<Option<Stri
                     Err(_) => Err("schema section is not valid UTF-8".to_owned()),
                 };
             }
-        } else if component && id == 1 && depth == 0 {
-            // A component wraps its core code module as section id 1;
-            // descend into it to reach the plugin's own custom sections.
+        } else if payload.len() >= 4 && payload[..4] == [0x00, 0x61, 0x73, 0x6d] {
+            // Components wrap their core code module in an inner section;
+            // rather than hardcoding which section id each encoder picks,
+            // descend into any nested binary.
             if let found @ Some(_) = walk_sections(payload, false, depth + 1)? {
                 return Ok(found);
             }
@@ -235,7 +236,7 @@ mod tests {
     fn reads_a_schema_from_a_plain_core_module() {
         let wasm = core_module_with_custom(
             SCHEMA_SECTION_NAME.as_bytes(),
-            b"ulb-config-schema 1\nk greeting\tstring\treq\tThe text.\nf shout\tLoud.\n",
+            b"ulb-config-schema 1\nk\tgreeting\tstring\treq\tThe text.\nf\tshout\tLoud.\n",
         );
         let schema = read_schema(&wasm).expect("parses").expect("has schema");
         assert_eq!(schema.keys.len(), 1);
@@ -253,7 +254,7 @@ mod tests {
     fn descends_into_a_component_wrapped_core_module() {
         let inner = core_module_with_custom(
             SCHEMA_SECTION_NAME.as_bytes(),
-            b"ulb-config-schema 1\nk depth\tint\topt\t\n",
+            b"ulb-config-schema 1\nk\tdepth\tint\topt\t\n",
         );
         // Component preamble magic/version, then the core module as a
         // section with id 1.
