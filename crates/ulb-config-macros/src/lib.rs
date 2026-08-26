@@ -89,7 +89,12 @@ pub fn embed_schema(input: TokenStream) -> TokenStream {
     let expanded = quote! {
         // The schema bytes. Null-terminated so the host can validate
         // without relying on the custom section length.
-        #[cfg_attr(target_arch = "wasm32", link_section = #section_name)]
+        //
+        // Safety: the link section name is a compile-time constant
+        // containing only ASCII characters, satisfying the requirements
+        // of `#[link_section]`.
+        #[cfg_attr(target_arch = "wasm32", unsafe(link_section = #section_name))]
+        #[used]
         static __ULB_CONFIG_SCHEMA: [u8; {
             const __SCHEMA: &str = <#input>::SCHEMA_JSON;
             __SCHEMA.as_bytes().len() + 1
@@ -231,7 +236,7 @@ fn build_schema_json_string(struct_name: &str, struct_doc: &str, fields: &[Field
         let mut prop = serde_json::Map::new();
         prop.insert("name".into(), serde_json::Value::String(f.json_key.clone()));
         prop.insert(
-            "type".into(),
+            "type_name".into(),
             serde_json::Value::String(f.type_name.clone()),
         );
         prop.insert(
