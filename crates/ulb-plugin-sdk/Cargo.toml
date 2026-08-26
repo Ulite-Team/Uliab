@@ -5,5 +5,8 @@ edition.workspace = true
 version.workspace = true
 license = "MIT"
 
+[dependencies]
+ulb-config-macros = { path = "../ulb-config-macros" }
+
 [lints]
 workspace = true

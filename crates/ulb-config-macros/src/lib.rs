@@ -32,7 +32,7 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, Data, DeriveInput, Fields, Lit, Meta, MetaNameValue};
+use syn::{Data, DeriveInput, Fields, Lit, Meta, MetaNameValue, parse_macro_input};
 
 /// Derives a plugin config schema from a struct definition.
 ///
@@ -44,6 +44,72 @@ pub fn derive_ulb_config(input: TokenStream) -> TokenStream {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }
+}
+
+/// Embeds a type's config schema into the wasm binary as a custom section.
+///
+/// Accepts a type that implements `UlbConfig` (via `#[derive(UlbConfig)]`).
+/// Generates a `#[link_section = "ulb-config-schema"]` static containing
+/// the schema JSON bytes, null-terminated.
+///
+/// On non-wasm targets, this is a no-op (the static is still emitted but
+/// the linker discards unused link sections).
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// #[derive(UlbConfig, serde::Deserialize)]
+/// struct MyConfig { /* ... */ }
+///
+/// ulb_config_macros::embed_schema!(MyConfig);
+/// ```
+#[proc_macro]
+pub fn embed_schema(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as syn::Path);
+    let section_name = "ulb-config-schema";
+
+    // The generated code calls <Type>::SCHEMA_JSON at compile time. The
+    // schema string is a const &str, and .as_bytes() gives us the raw
+    // bytes. We build a null-terminated byte array with a #[link_section]
+    // attribute so it ends up in the wasm custom section.
+    //
+    // Key insight: at this point in macro expansion we don't know the
+    // string content (it comes from another const), so we emit runtime
+    // code that uses const evaluation. Rust's const evaluator can handle
+    // `<Type>::SCHEMA_JSON.as_bytes().len()` when the const is in scope.
+    //
+    // However, [u8; N] requires N to be a const expression known at
+    // compile time *for the array declaration*. We use a two-step trick:
+    // (1) declare a const for the length, (2) use it in the array type.
+    //
+    // This works because Rust allows `const LEN: usize = expr;` followed
+    // by `[u8; LEN]` in the same scope — both are evaluated at compile
+    // time.
+
+    let expanded = quote! {
+        // The schema bytes. Null-terminated so the host can validate
+        // without relying on the custom section length.
+        #[cfg_attr(target_arch = "wasm32", link_section = #section_name)]
+        static __ULB_CONFIG_SCHEMA: [u8; {
+            const __SCHEMA: &str = <#input>::SCHEMA_JSON;
+            __SCHEMA.as_bytes().len() + 1
+        }] = {
+            const __SCHEMA: &str = <#input>::SCHEMA_JSON;
+            const __BYTES: &[u8] = __SCHEMA.as_bytes();
+            const __LEN: usize = __BYTES.len() + 1;
+            let mut buf = [0u8; __LEN];
+            let mut i = 0usize;
+            while i < __BYTES.len() {
+                buf[i] = __BYTES[i];
+                i += 1;
+            }
+            // Null terminator
+            buf[__LEN - 1] = 0;
+            buf
+        };
+    };
+
+    expanded.into()
 }
 
 fn expand_ulb_config(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
@@ -78,9 +144,7 @@ fn expand_ulb_config(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         }
 
         let field_name = field.ident.as_ref().unwrap();
-        let json_key = attrs
-            .rename
-            .unwrap_or_else(|| field_name.to_string());
+        let json_key = attrs.rename.unwrap_or_else(|| field_name.to_string());
         let description = attrs
             .description
             .or_else(|| extract_doc_comment(&field.attrs))
@@ -126,16 +190,9 @@ struct FieldSchema {
 }
 
 /// Builds the schema JSON string at compile time from the collected metadata.
-fn build_schema_json_string(
-    struct_name: &str,
-    struct_doc: &str,
-    fields: &[FieldSchema],
-) -> String {
+fn build_schema_json_string(struct_name: &str, struct_doc: &str, fields: &[FieldSchema]) -> String {
     let mut schema = serde_json::Map::new();
-    schema.insert(
-        "name".into(),
-        serde_json::Value::String(struct_name.into()),
-    );
+    schema.insert("name".into(), serde_json::Value::String(struct_name.into()));
     schema.insert(
         "description".into(),
         serde_json::Value::String(struct_doc.into()),
@@ -157,10 +214,7 @@ fn build_schema_json_string(
         properties.push(serde_json::Value::Object(prop));
     }
 
-    schema.insert(
-        "properties".into(),
-        serde_json::Value::Array(properties),
-    );
+    schema.insert("properties".into(), serde_json::Value::Array(properties));
 
     serde_json::to_string(&serde_json::Value::Object(schema))
         .expect("schema JSON serialization should not fail")

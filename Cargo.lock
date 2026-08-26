@@ -1700,6 +1700,9 @@ dependencies = [
 [[package]]
 name = "ulb-plugin-sdk"
 version = "0.1.0"
+dependencies = [
+ "ulb-config-macros",
+]
 
 [[package]]
 name = "uliab"
