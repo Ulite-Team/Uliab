@@ -197,96 +197,68 @@ fn field_spec(field: &Field) -> syn::Result<FieldSpec> {
 
 fn extraction_for(spec: &FieldSpec) -> TokenStream2 {
     let dsl = &spec.dsl_name;
+    let missing = quote! {
+        return ::std::result::Result::Err(format!("missing required key '{}'", #dsl))
+    };
 
-    match spec.kind {
-        "block" => {
-            let ty = &spec.ty;
-            if spec.optional {
-                let inner = spec.inner_ty.as_ref().unwrap_or(ty);
-                quote! {
-                    match value.get(#dsl) {
-                        ::std::option::Option::Some(v) if !v.is_null() =>
-                            #inner::from_config(v).map(::std::option::Option::Some)?,
-                        _ => ::std::option::Option::None,
-                    }
-                }
-            } else {
-                quote! {
-                    match value.get(#dsl) {
-                        ::std::option::Option::Some(v) => #ty::from_config(v)?,
-                        ::std::option::Option::None => return ::std::result::Result::Err(
-                            format!("missing required key '{}'", #dsl)
-                        ),
-                    }
-                }
-            }
+    // Parse to the canonical shape first, then adapt integers down to the
+    // declared field width (i32/u16/...) with an out-of-range error.
+    let (parse, type_word): (TokenStream2, TokenStream2) = match spec.kind {
+        "string" => (
+            quote! { v.as_str().map(::std::string::ToString::to_owned) },
+            quote! { "a string" },
+        ),
+        "int" => (quote! { v.as_i64() }, quote! { "an integer" }),
+        "bool" => (quote! { v.as_bool() }, quote! { "true or false" }),
+        "list" => (
+            quote! {
+                v.as_array().and_then(|items| {
+                    items
+                        .iter()
+                        .map(|item| item.as_str().map(::std::string::ToString::to_owned))
+                        .collect::<::std::option::Option<::std::vec::Vec<_>>>()
+                })
+            },
+            quote! { "a list of strings" },
+        ),
+        other => unreachable!("unhandled catalog kind: {other}"),
+    };
+    let adapt = if spec.kind == "int" {
+        let ty = &spec.ty;
+        quote! {
+            <#ty>::try_from(parsed)
+                .map_err(|_| format!("key '{}' out of range", #dsl))
         }
-        other => {
-            let check: TokenStream2 = match other {
-                "string" => quote! {
-                    v.as_str().map(::std::string::ToString::to_owned)
-                },
-                "int" => quote! {
-                    v.as_i64()
-                },
-                "bool" => quote! {
-                    v.as_bool()
-                },
-                "list" => quote! {
-                    v.as_str_list_checked()
-                },
-                _ => unreachable!("unhandled catalog kind"),
-            };
-            let type_word = match other {
-                "list" => quote! { a list of strings },
-                other => quote! { #other },
-            };
-            let wrap_some = spec.optional;
-            let value_expr = if other == "list" {
-                // serde_json has no as_str_list; build it inline.
-                quote! {
-                    v.as_array().and_then(|items| {
-                        items
-                            .iter()
-                            .map(|item| item.as_str().map(::std::string::ToString::to_owned))
-                            .collect::<::std::option::Option<::std::vec::Vec<_>>>()
-                    })
-                }
-            } else {
-                quote! { #check }
-            };
-            if spec.optional {
-                let ty = &spec.ty;
-                let inner = spec.inner_ty.as_ref().unwrap_or(ty);
-                quote! {
-                    match value.get(#dsl) {
-                        ::std::option::Option::Some(v) if !v.is_null() => match #value_expr {
-                            ::std::option::Option::Some(parsed) =>
-                                ::std::result::Result::Ok(
-                                    ::std::option::Option::Some::<#inner>(parsed)
-                                ),
-                            ::std::option::Option::None => ::std::result::Result::Err(format!(
-                                "key '{}' must be {}", #dsl, #type_word
-                            )),
-                        },
-                        _ => ::std::result::Result::Ok(::std::option::Option::None),
-                    }
-                }
-            } else {
-                quote! {
-                    match value.get(#dsl) {
-                        ::std::option::Option::Some(v) => match #value_expr {
-                            ::std::option::Option::Some(parsed) =>
-                                ::std::result::Result::Ok(parsed),
-                            ::std::option::Option::None => ::std::result::Result::Err(format!(
-                                "key '{}' must be {}", #dsl, #type_word
-                            )),
-                        },
+    } else {
+        quote! { ::std::result::Result::Ok(parsed) }
+    };
+
+    if spec.optional {
+        quote! {
+            match value.get(#dsl) {
+                ::std::option::Option::Some(v) if !v.is_null() => {
+                    match #parse {
+                        ::std::option::Option::Some(parsed) => {
+                            #adapt.map(::std::option::Option::Some)
+                        }
                         ::std::option::Option::None => ::std::result::Result::Err(format!(
-                            "missing required key '{}'", #dsl
+                            "key '{}' must be {}", #dsl, #type_word
                         )),
                     }
                 }
+                _ => ::std::result::Result::Ok(::std::option::Option::None),
+            }
+        }
+    } else {
+        quote! {
+            match value.get(#dsl) {
+                ::std::option::Option::Some(v) => match #parse {
+                    ::std::option::Option::Some(parsed) => #adapt,
+                    ::std::option::Option::None => ::std::result::Result::Err(format!(
+                        "key '{}' must be {}", #dsl, #type_word
+                    )),
+                },
+                ::std::option::Option::None => #missing,
             }
         }
     }

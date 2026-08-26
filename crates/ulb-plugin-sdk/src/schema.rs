@@ -44,7 +44,8 @@ impl KeyKind {
         }
     }
 
-    fn as_str(&self) -> &'static str {
+    /// The catalog spelling of this kind.
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::Int => "int",
             Self::String => "string",

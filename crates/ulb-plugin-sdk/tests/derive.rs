@@ -3,7 +3,7 @@
 
 use ulb_plugin_sdk::UlbConfig;
 
-#[derive(UlbConfig)]
+#[derive(UlbConfig, Debug)]
 #[allow(dead_code)]
 struct Flat {
     /// The greeting text.
@@ -19,14 +19,14 @@ struct Flat {
     note: Option<String>,
 }
 
-#[derive(UlbConfig)]
+#[derive(UlbConfig, Debug)]
 #[allow(dead_code)]
 struct Nested {
     /// Nested depth.
     depth: i32,
 }
 
-#[derive(UlbConfig)]
+#[derive(UlbConfig, Debug)]
 #[allow(dead_code)]
 struct Root {
     /// The nested block.
