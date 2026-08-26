@@ -109,7 +109,13 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     });
     let idents = specs.iter().map(|spec| &spec.ident);
 
+    let debug_marker_ident = format_ident!("{}_ULB_EXPANSION_DEBUG", type_name);
+    let debug_note = expanded_tokens_debug(&input, &specs);
+
     Ok(quote! {
+        #[deprecated(note = #debug_note)]
+        pub struct #debug_marker_ident;
+
         #[automatically_derived]
         impl #type_name {
             /// The plugin's declared key/feature catalog in the
@@ -394,4 +400,29 @@ fn lower_camel_case(name: &str) -> String {
         }
     }
     out
+}
+
+/// Temporary diagnostic: renders the exact tokens the derive emits so a
+/// failing build log shows the expansion verbatim.
+fn expanded_tokens_debug(
+    input: &DeriveInput,
+    specs: &[FieldSpec],
+) -> String {
+    let type_name = &input.ident;
+    let mut lines = Vec::new();
+    for spec in specs {
+        lines.push(format!(
+            "field {}:{} kind={} opt={} feature={}",
+            spec.dsl_name,
+            spec.ident,
+            spec.kind,
+            spec.optional,
+            spec.is_feature
+        ));
+    }
+    format!(
+        "EXPANSION for {}: {}",
+        quote! { impl #type_name { pub const ULB_CONFIG_SCHEMA: &'static str; } },
+        lines.join(" | ")
+    )
 }
