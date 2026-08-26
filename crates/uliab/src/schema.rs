@@ -143,6 +143,148 @@ fn raw_schema_section_inner(wasm_bytes: &[u8], component_model: bool) -> Option<
     None
 }
 
+/// Validates a plugin's config JSON against its declared schema.
+///
+/// Only validates keys **inside** objects whose schema declares nested
+/// properties (e.g. the `android {}` block). Top-level unknown keys are
+/// allowed because the driver sends the entire module model to every
+/// plugin, and other plugins' keys coexist at the top level.
+///
+/// Returns `Ok(())` when every checked key matches a declared field.
+/// Returns `Err(errors)` with one message per unknown key, each
+/// including a "did you mean?" suggestion when the edit distance is
+/// small enough.
+///
+/// When the plugin has no schema ([`None`] from [`extract_schema`]),
+/// callers should skip validation — degraded mode.
+///
+/// # Errors
+///
+/// Returns `Err` containing validation messages when a plugin-owned
+/// block contains keys not declared in the schema.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// let schema = extract_schema(&wasm).unwrap();
+/// let config: serde_json::Value = serde_json::from_str(&json)?;
+/// validate_plugin_config(&schema, &config)?;
+/// ```
+pub fn validate_plugin_config(
+    schema: &PluginSchema,
+    config: &serde_json::Value,
+) -> Result<(), Vec<String>> {
+    let Some(object) = config.as_object() else {
+        return Ok(());
+    };
+    validate_nested_objects(&schema.properties, object)
+}
+
+/// For each schema field that declares an `"object"` type with nested
+/// properties, validates the keys inside that object in the config.
+fn validate_nested_objects(
+    fields: &[SchemaField],
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+
+    for field in fields {
+        if field.type_name != "object" || field.properties.is_empty() {
+            continue;
+        }
+        let Some(nested_value) = object.get(&field.name) else {
+            continue;
+        };
+        let Some(nested_object) = nested_value.as_object() else {
+            continue;
+        };
+        if let Err(nested_errors) = validate_object(&field.properties, nested_object, &field.name) {
+            errors.extend(nested_errors);
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Validates all keys in `object` against `fields`, rejecting unknown
+/// keys with "did you mean?" suggestions.  Used for plugin-owned
+/// blocks where every key should match a declared schema field.
+fn validate_object(
+    fields: &[SchemaField],
+    object: &serde_json::Map<String, serde_json::Value>,
+    prefix: &str,
+) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+    let declared: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+
+    for key in object.keys() {
+        if declared.contains(&key.as_str()) {
+            continue;
+        }
+
+        let suggestion = suggest_key(key, &declared);
+        let msg = match suggestion {
+            Some(hint) => format!("unknown key '{prefix}.{key}' — did you mean '{hint}'?"),
+            None => format!("unknown key '{prefix}.{key}'"),
+        };
+        errors.push(msg);
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Returns the closest matching candidate from `candidates` using
+/// Levenshtein distance, or `None` when the best match is farther
+/// than 3 edits away.
+fn suggest_key(input: &str, candidates: &[&str]) -> Option<String> {
+    let mut best_dist = usize::MAX;
+    let mut best: Option<String> = None;
+    for candidate in candidates {
+        let dist = levenshtein(input, candidate);
+        if dist < best_dist {
+            best_dist = dist;
+            best = Some(candidate.to_string());
+        }
+    }
+    if best_dist <= 3 { best } else { None }
+}
+
+/// Levenshtein edit distance between two strings.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a_len = a.len();
+    let b_len = b.len();
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+
+    if a_len == 0 {
+        return b_len;
+    }
+    if b_len == 0 {
+        return a_len;
+    }
+
+    let mut prev = (0..=b_len).collect::<Vec<usize>>();
+    let mut curr = vec![0usize; b_len + 1];
+
+    for i in 1..=a_len {
+        curr[0] = i;
+        for j in 1..=b_len {
+            let cost = usize::from(a_bytes[i - 1] != b_bytes[j - 1]);
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b_len]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +379,202 @@ mod tests {
     fn raw_schema_section_returns_none_when_absent() {
         let wasm = wasm_with_custom_section(b"other", b"data");
         assert!(raw_schema_section(&wasm).is_none());
+    }
+
+    // ── Levenshtein tests ─────────────────────────────────────────────
+
+    #[test]
+    fn levenshtein_identical_strings() {
+        assert_eq!(levenshtein("abc", "abc"), 0);
+    }
+
+    #[test]
+    fn levenshtein_single_insert() {
+        assert_eq!(levenshtein("abc", "abcd"), 1);
+    }
+
+    #[test]
+    fn levenshtein_single_delete() {
+        assert_eq!(levenshtein("abcd", "abc"), 1);
+    }
+
+    #[test]
+    fn levenshtein_single_substitution() {
+        assert_eq!(levenshtein("abc", "axc"), 1);
+    }
+
+    #[test]
+    fn levenshtein_completely_different() {
+        assert_eq!(levenshtein("abc", "xyz"), 3);
+    }
+
+    #[test]
+    fn levenshtein_empty_strings() {
+        assert_eq!(levenshtein("", ""), 0);
+        assert_eq!(levenshtein("abc", ""), 3);
+        assert_eq!(levenshtein("", "abc"), 3);
+    }
+
+    // ── suggest_key tests ─────────────────────────────────────────────
+
+    #[test]
+    fn suggest_key_returns_closest_match() {
+        let candidates = ["compose", "sources", "manifest"];
+        assert_eq!(
+            suggest_key("compos", &candidates),
+            Some("compose".to_owned())
+        );
+    }
+
+    #[test]
+    fn suggest_key_returns_none_for_distant() {
+        let candidates = ["compose", "sources", "manifest"];
+        assert_eq!(suggest_key("xyzzy", &candidates), None);
+    }
+
+    #[test]
+    fn suggest_key_prefers_exact_prefix_match() {
+        let candidates = ["buildTypes", "buildConfigField"];
+        // "buildType" is 1 away from "buildTypes"
+        let suggestion = suggest_key("buildType", &candidates).unwrap();
+        assert_eq!(suggestion, "buildTypes");
+    }
+
+    // ── validate_plugin_config tests ──────────────────────────────────
+
+    fn make_schema(fields: Vec<(&str, &str, bool)>) -> PluginSchema {
+        PluginSchema {
+            name: "ulite/test".to_owned(),
+            properties: fields
+                .into_iter()
+                .map(|(name, type_name, required)| SchemaField {
+                    name: name.to_owned(),
+                    type_name: type_name.to_owned(),
+                    description: String::new(),
+                    required,
+                    properties: vec![],
+                    items: None,
+                    variants: vec![],
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_valid_config() {
+        let schema = make_schema(vec![
+            ("projectDir", "string", true),
+            ("android", "object", true),
+        ]);
+        let config = serde_json::json!({
+            "projectDir": "/proj",
+            "android": { "compileSdk": 36 }
+        });
+        assert!(validate_plugin_config(&schema, &config).is_ok());
+    }
+
+    #[test]
+    fn validate_top_level_unknown_keys_are_allowed() {
+        // The driver sends the full module model to every plugin.
+        // Other plugins' keys coexist at the top level and must not
+        // trigger validation errors.
+        let schema = make_schema(vec![
+            ("projectDir", "string", true),
+            ("android", "object", true),
+        ]);
+        let config = serde_json::json!({
+            "projectDir": "/proj",
+            "jvm": { "sources": ["Main.java"] },
+            "android": {}
+        });
+        assert!(validate_plugin_config(&schema, &config).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_unknown_key_inside_nested_object() {
+        let nested_field = SchemaField {
+            name: "compileSdk".to_owned(),
+            type_name: "integer".to_owned(),
+            description: String::new(),
+            required: true,
+            properties: vec![],
+            items: None,
+            variants: vec![],
+        };
+        let schema = PluginSchema {
+            name: "ulite/test".to_owned(),
+            properties: vec![SchemaField {
+                name: "android".to_owned(),
+                type_name: "object".to_owned(),
+                description: String::new(),
+                required: true,
+                properties: vec![nested_field],
+                items: None,
+                variants: vec![],
+            }],
+        };
+        let config = serde_json::json!({
+            "android": { "compileSdk": 36, "complieSdk": 99 }
+        });
+        let errors = validate_plugin_config(&schema, &config).unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("complieSdk"));
+        assert!(errors[0].contains("did you mean"));
+    }
+
+    #[test]
+    fn validate_no_error_for_non_object_config() {
+        let schema = make_schema(vec![("x", "string", true)]);
+        let config = serde_json::json!("just a string");
+        assert!(validate_plugin_config(&schema, &config).is_ok());
+    }
+
+    #[test]
+    fn validate_skips_unknown_when_no_properties_declared() {
+        let schema = PluginSchema {
+            name: "ulite/test".to_owned(),
+            properties: vec![SchemaField {
+                name: "kmp".to_owned(),
+                type_name: "object".to_owned(),
+                description: String::new(),
+                required: true,
+                properties: vec![], // empty = dynamic map, no recursion
+                items: None,
+                variants: vec![],
+            }],
+        };
+        let config = serde_json::json!({
+            "kmp": { "commonMain": {}, "jvm": {} }
+        });
+        assert!(validate_plugin_config(&schema, &config).is_ok());
+    }
+
+    #[test]
+    fn validate_multiple_unknown_keys_in_nested_object() {
+        let schema = PluginSchema {
+            name: "ulite/test".to_owned(),
+            properties: vec![SchemaField {
+                name: "block".to_owned(),
+                type_name: "object".to_owned(),
+                description: String::new(),
+                required: true,
+                properties: vec![SchemaField {
+                    name: "sources".to_owned(),
+                    type_name: "array".to_owned(),
+                    description: String::new(),
+                    required: true,
+                    properties: vec![],
+                    items: None,
+                    variants: vec![],
+                }],
+                items: None,
+                variants: vec![],
+            }],
+        };
+        let config = serde_json::json!({
+            "block": { "sources": [], "typo1": 1, "typo2": 2 }
+        });
+        let errors = validate_plugin_config(&schema, &config).unwrap_err();
+        assert_eq!(errors.len(), 2);
     }
 }
