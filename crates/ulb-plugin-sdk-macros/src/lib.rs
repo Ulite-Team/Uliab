@@ -200,9 +200,6 @@ fn extraction_for(spec: &FieldSpec) -> TokenStream2 {
     let kind_missing = quote! {
         return ::std::result::Result::Err(format!("missing required key '{}'", #dsl))
     };
-    let type_mismatch = quote! {
-        return ::std::result::Result::Err(format!("key '{}' must be {}", #dsl, #type_word))
-    };
 
     // Nested blocks recurse into their own derived from_config.
     if spec.kind == "block" {
@@ -247,6 +244,9 @@ fn extraction_for(spec: &FieldSpec) -> TokenStream2 {
             quote! { "a list of strings" },
         ),
         other => unreachable!("catalog kinds are closed; got {other}"),
+    };
+    let type_mismatch = quote! {
+        return ::std::result::Result::Err(format!("key '{}' must be {}", #dsl, #type_word))
     };
     let adapt = if spec.kind == "int" {
         let ty = &spec.ty;
