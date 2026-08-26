@@ -64,13 +64,8 @@ pub struct PluginSchema {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// let wasm = std::fs::read("plugin.wasm")?;
-/// match extract_schema(&wasm) {
-///     Some(schema) => println!("{} has {} fields", schema.name, schema.properties.len()),
-///     None => println!("no schema section — degraded mode"),
-/// }
-/// ```
+/// See `tests/schema_roundtrip.rs` for a full extraction example that
+/// builds a real plugin and reads its embedded schema.
 pub fn extract_schema(wasm_bytes: &[u8]) -> Option<PluginSchema> {
     // Try module parser first (works for core wasm modules).
     if let Some(schema) = extract_schema_inner(wasm_bytes, false) {
@@ -165,11 +160,9 @@ fn raw_schema_section_inner(wasm_bytes: &[u8], component_model: bool) -> Option<
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// let schema = extract_schema(&wasm).unwrap();
-/// let config: serde_json::Value = serde_json::from_str(&json)?;
-/// validate_plugin_config(&schema, &config)?;
-/// ```
+/// See the `validate_accepts_valid_config` and
+/// `validate_rejects_unknown_key_inside_nested_object` unit tests
+/// below for usage examples.
 pub fn validate_plugin_config(
     schema: &PluginSchema,
     config: &serde_json::Value,
@@ -520,6 +513,62 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("complieSdk"));
         assert!(errors[0].contains("did you mean"));
+    }
+
+    #[test]
+    fn validate_nested_object_non_object_value_is_skipped() {
+        let schema = PluginSchema {
+            name: "ulite/test".to_owned(),
+            properties: vec![SchemaField {
+                name: "android".to_owned(),
+                type_name: "object".to_owned(),
+                description: String::new(),
+                required: true,
+                properties: vec![SchemaField {
+                    name: "compileSdk".to_owned(),
+                    type_name: "integer".to_owned(),
+                    description: String::new(),
+                    required: true,
+                    properties: vec![],
+                    items: None,
+                    variants: vec![],
+                }],
+                items: None,
+                variants: vec![],
+            }],
+        };
+        // "android" is a string, not an object — validation skips it.
+        let config = serde_json::json!({ "android": "not_an_object" });
+        assert!(validate_plugin_config(&schema, &config).is_ok());
+    }
+
+    #[test]
+    fn suggest_key_rejects_distant_matches() {
+        let schema = PluginSchema {
+            name: "ulite/test".to_owned(),
+            properties: vec![SchemaField {
+                name: "android".to_owned(),
+                type_name: "object".to_owned(),
+                description: String::new(),
+                required: true,
+                properties: vec![SchemaField {
+                    name: "compileSdk".to_owned(),
+                    type_name: "integer".to_owned(),
+                    description: String::new(),
+                    required: true,
+                    properties: vec![],
+                    items: None,
+                    variants: vec![],
+                }],
+                items: None,
+                variants: vec![],
+            }],
+        };
+        let config = serde_json::json!({ "android": { "totallyUnrelated": 1 } });
+        let errors = validate_plugin_config(&schema, &config).unwrap_err();
+        assert_eq!(errors.len(), 1);
+        // "totallyUnrelated" is too far from "compileSdk" — no suggestion.
+        assert!(!errors[0].contains("did you mean"));
     }
 
     #[test]

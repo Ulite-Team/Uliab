@@ -41,6 +41,11 @@ pub const DEFAULT_REGISTRY: &str =
 /// `config` against it.  Returns `Ok(())` when the plugin has no schema
 /// (degraded mode) or the config passes validation.  Returns `Err` with
 /// one message per unknown key.
+///
+/// # Errors
+///
+/// Returns `Err` with a formatted error message when the plugin declares
+/// a schema and the config contains keys not present in it.
 fn validate_config_against_schema(
     wasm_path: &Path,
     plugin_name: &str,
@@ -48,12 +53,14 @@ fn validate_config_against_schema(
 ) -> Result<(), String> {
     let wasm = match std::fs::read(wasm_path) {
         Ok(bytes) => bytes,
-        // If the wasm can't be read, let configure() handle the error.
-        Err(_) => return Ok(()),
+        Err(e) => {
+            eprintln!("warning: skipping schema validation for '{plugin_name}': {e}");
+            return Ok(());
+        }
     };
     let schema = match extract_schema(&wasm) {
         Some(s) => s,
-        // Pre-16A plugin — no schema section, degraded mode.
+        // Plugin has no schema section — degraded mode, skip validation.
         None => return Ok(()),
     };
     if let Err(errors) = schema::validate_plugin_config(&schema, config) {
