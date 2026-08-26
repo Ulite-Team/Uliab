@@ -9,7 +9,7 @@
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::{format_ident, quote};
+use quote::quote;
 use syn::{Data, DeriveInput, Expr, Field, Fields, Lit, Meta, parse_macro_input};
 
 /// Derives typed config deserialization plus an embedded schema catalog.
@@ -109,13 +109,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     });
     let idents = specs.iter().map(|spec| &spec.ident);
 
-    let debug_marker_ident = format_ident!("{}_ULB_EXPANSION_DEBUG", type_name);
-    let debug_note = expanded_tokens_debug(&input, &specs);
-
-    Ok(quote! {
-        #[deprecated(note = #debug_note)]
-        pub struct #debug_marker_ident;
-
+    let impl_tokens = quote! {
         #[automatically_derived]
         impl #type_name {
             /// The plugin's declared key/feature catalog in the
@@ -131,12 +125,18 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 #(#extractions)*
                 ::std::result::Result::Ok(Self { #(#idents),* })
             }
-        }
+        };
+
+    let debug_text = impl_tokens.to_string();
+
+    quote! {
+        const _: () = ::core::compile_error!(#debug_text);
+        #impl_tokens
 
         #[cfg(target_arch = "wasm32")]
         #[link_section = "ulb:config-schema"]
         static _ULB_CONFIG_SCHEMA_SECTION: [u8; #schema_len] = *#schema_bytes;
-    })
+    }
 }
 
 fn field_spec(field: &Field) -> syn::Result<FieldSpec> {
@@ -289,6 +289,117 @@ fn extraction_for(spec: &FieldSpec) -> TokenStream2 {
             }
         }
     }
+}
+
+fn expect_string(value: &Expr) -> syn::Result<String> {
+    if let Expr::Lit(lit) = value
+        && let Lit::Str(text) = &lit.lit
+    {
+        return Ok(text.value());
+    }
+    Err(syn::Error::new_spanned(
+        value,
+        "#[ulb] values must be string literals",
+    ))
+}
+
+fn doc_description(field: &Field) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for attr in &field.attrs {
+        if !attr.path().is_ident("doc") {
+            continue;
+        }
+        if let Meta::NameValue(nv) = &attr.meta
+            && let Expr::Lit(lit) = &nv.value
+            && let Lit::Str(text) = &lit.lit
+        {
+            parts.push(text.value().trim().to_owned());
+        }
+    }
+    parts.join(" ")
+}
+
+fn unwrap_option(ty: &syn::Type) -> (bool, Option<syn::Type>) {
+    if let syn::Type::Path(path) = ty
+        && path.qself.is_none()
+        && path.path.segments.len() == 1
+        && path.path.segments[0].ident == "Option"
+        && let syn::PathArguments::AngleBracketed(args) = &path.path.segments[0].arguments
+        && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
+    {
+        return (true, Some(inner.clone()));
+    }
+    (false, None)
+}
+
+fn classify(ty: &syn::Type) -> syn::Result<&'static str> {
+    let syn::Type::Path(path) = ty else {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "UlbConfig fields must be simple paths (String, bool, ints, Vec<String>, or a nested UlbConfig struct)",
+        ));
+    };
+    if path.qself.is_none() && path.path.segments.len() == 1 {
+        let name = path.path.segments.last().unwrap().ident.to_string();
+        match name.as_str() {
+            "String" => return Ok("string"),
+            "bool" => return Ok("bool"),
+            "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "isize" | "usize" => {
+                return Ok("int");
+            }
+            "Vec" => {
+                let is_string_list = matches!(
+                    &path.path.segments.last().unwrap().arguments,
+                    syn::PathArguments::AngleBracketed(args)
+                        if matches!(
+                            args.args.first(),
+                            Some(syn::GenericArgument::Type(inner))
+                                if type_path_is_string(inner)
+                        )
+                );
+                return if is_string_list {
+                    Ok("list")
+                } else {
+                    Err(syn::Error::new_spanned(
+                        ty,
+                        "only Vec<String> lists are supported by UlbConfig",
+                    ))
+                };
+            }
+            _ => {}
+        }
+    }
+    // Anything else must be a nested struct deriving UlbConfig; the
+    // generated `from_config` call makes a non-conforming type a compile
+    // error at the use site.
+    Ok("block")
+}
+
+fn type_path_is_string(ty: &syn::Type) -> bool {
+    matches!(
+        ty,
+        syn::Type::Path(path)
+            if path.qself.is_none()
+                && path.path.is_ident("String")
+    )
+}
+
+fn lower_camel_case(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut upper_next = false;
+    for ch in name.chars() {
+        if ch == '_' {
+            upper_next = true;
+            continue;
+        }
+        if upper_next {
+            out.extend(ch.to_uppercase());
+            upper_next = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn expect_string(value: &Expr) -> syn::Result<String> {
