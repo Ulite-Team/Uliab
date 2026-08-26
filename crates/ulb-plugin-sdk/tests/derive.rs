@@ -36,4 +36,3 @@ fn schema_catalog_renders_keys_features_and_descriptions() {
         Flat::ULB_CONFIG_SCHEMA
     );
 }
-
