@@ -126,6 +126,10 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 ::std::result::Result::Ok(Self { #(#idents),* })
             }
         }
+
+        #[cfg(target_arch = "wasm32")]
+        #[link_section = "ulb:config-schema"]
+        static _ULB_CONFIG_SCHEMA_SECTION: [u8; #schema_len] = *#schema_bytes;
     };
 
     let debug_note = format!("EXPANSION[{}]: {}", type_name, impl_tokens);
@@ -134,11 +138,6 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     eprintln!("{}", debug_note);
 
     Ok(impl_tokens)
-
-        #[cfg(target_arch = "wasm32")]
-        #[link_section = "ulb:config-schema"]
-        static _ULB_CONFIG_SCHEMA_SECTION: [u8; #schema_len] = *#schema_bytes;
-    })
 }
 
 fn field_spec(field: &Field) -> syn::Result<FieldSpec> {
