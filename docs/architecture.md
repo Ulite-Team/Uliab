@@ -18,7 +18,11 @@ support), the `ulite/kmp` plugin (JVM + Android targets: commonMain +
 jvmMain → jar, commonMain + androidMain → per-variant merged dex into
 APK), `uliab init` project scaffolding, and multi-module `settings.ulb`
 support are implemented and building. The plugin registry is live on
-GitHub.
+GitHub. **Not yet implemented:** the compile-time-derived plugin config
+schema described in §3.8 (Phase 16) — today a plugin reads its config
+block as raw untyped JSON, with no machine-readable record of which keys
+it owns, which is why the LSP and host cannot yet offer plugin-aware
+completions/diagnostics or catch a plugin author's own key typos.
 
 ---
 
@@ -44,6 +48,10 @@ GitHub.
    syntax presentation and an LSP built on the same typed AST the
    evaluator uses, so semantic diagnostics always match real evaluation
    behavior.
+5. **A plugin's declared DSL surface must be derived from the same code
+   that consumes it, never hand-maintained separately** (§3.8). Two
+   authored sources describing the same thing always drift; the fix is
+   to make there be only one.
 
 ### Non-goals (this pass)
 
@@ -87,7 +95,9 @@ Four repositories under `Ulite-Team`:
     ▼                  ▼
 ┌─────────────────┐   ┌─────────────────────────────────────────┐
 │  ulb-lsp        │   │  ulb-plugins/{jvm,android,kmp}           │
-│  reuses parser  │   │  Rust source → compiled once to .wasm    │
+│  reads §3.8     │   │  Rust source → compiled once to .wasm,   │
+│  schema from    │   │  #[derive(UlbConfig)] embeds a schema    │
+│  each .wasm     │   │  custom section in the same artifact     │
 └─────────────────┘   │  published to the Ulite Team registry    │
                        └─────────────────────────────────────────┘
 ┌─────────────────────┐
@@ -163,10 +173,12 @@ The wasm boundary itself is a WIT world in `ulb-plugin-sdk` (see
 `docs/abi.md`): the plugin **exports** `manifest`, `configure`, and `run`
 entry points and **imports** a `task-registrar` interface. Across that
 boundary the module model travels as a JSON serialization (the whole
-resolved `Value` tree plus the resolved classpaths — see §9), not as
-typed Rust structs; the trait above is the shape a plugin author writes
-against before the SDK compiles it to wasm. `docs/authoring-plugins.md`
-shows the end-to-end flow a plugin author follows.
+resolved `Value` tree plus the resolved classpaths — see §9). Today a
+plugin author deserializes that JSON by hand (string-indexed lookups);
+§3.8 replaces this with a `#[derive(UlbConfig)]` struct that both
+deserializes it *and* is the single source the plugin's declared schema
+is derived from. `docs/authoring-plugins.md` shows the end-to-end flow a
+plugin author follows.
 
 A plugin does **not** get a raw filesystem/network/process handle. It
 gets `host: &mut TaskRegistrar` — a narrow, capability-based API for:
@@ -232,7 +244,7 @@ gate which registered plugins apply is future work.
 This was the open design question worth being explicit about (flagged
 for confirmation, not a silent pick):
 
-- **No ABI drift.** Rust has no stable ABI across compiler versions —a
+- **No ABI drift.** Rust has no stable ABI across compiler versions — a
   plugin compiled with one `rustc` and a tool built with a different one
   is undefined behavior if loaded as a native `dylib` via `extern "C"`.
   WASM's binary format is stable regardless of which Rust version
@@ -255,6 +267,13 @@ for confirmation, not a silent pick):
 - **Cross-platform for free.** The same `.wasm` artifact runs unmodified
   on any development or CI machine — no per-platform plugin builds to
   publish or cache.
+- **A `.wasm` file is introspectable without running it.** Custom
+  sections are part of the binary format itself; a tool like `wasm-tools`
+  can read one out of a `.wasm` module with no wasmtime instantiation at
+  all. §3.8 relies on exactly this property: the plugin's declared config
+  schema travels as data embedded in the same artifact as its code,
+  readable by the LSP or the host's `describe` CLI without executing
+  anything.
 
 Trade-off worth naming honestly: calling into WASM has real (small)
 overhead versus a native `dylib` call, and a plugin cannot itself spawn
@@ -277,18 +296,17 @@ fn run_tool(&mut self, tool: AllowlistedTool, args: Vec<String>, cwd: &Path)
 ```
 
 `AllowlistedTool` is a closed enum the *core* defines — currently `cp`,
-`cat`, `mkdir`, `echo` for filesystem plumbing, `javac`, `kotlinc`,
-`jar`, `java` for the JVM toolchain, `aapt2` and `apksigner` (both
-resolved under the Android SDK `build-tools` directory a task names as
-its first argument) for asset packaging and APK signing (see
-`docs/abi.md` for the exact set) — and a plugin
-manifest must declare which tools it needs (checked at load time, so a
-plugin can't silently start invoking something new after being
-installed). The plugin computes *what* to run (e.g. every `kotlinc` flag
-for a given module + variant); the host actually spawns
-the process. This is the same "plugin decides, host executes" split as
-`TaskRegistrar` (§3.2) and mirrors the DSL's own `copy`/`exec` design
-(grammar.md Appendix C) one layer up.
+`cat`, `mkdir`, `echo` for filesystem plumbing, `javac`, `kotlinc`, `jar`,
+`java` for the JVM toolchain, `aapt2` and `apksigner` (both resolved
+under the Android SDK `build-tools` directory a task names as its first
+argument) for asset packaging and APK signing (see `docs/abi.md` for the
+exact set) — and a plugin manifest must declare which tools it needs
+(checked at load time, so a plugin can't silently start invoking
+something new after being installed). The plugin computes *what* to run
+(e.g. every `kotlinc` flag for a given module + variant); the host
+actually spawns the process. This is the same "plugin decides, host
+executes" split as `TaskRegistrar` (§3.2) and mirrors the DSL's own
+`copy`/`exec` design (grammar.md Appendix C) one layer up.
 
 ### 3.6 Plugin registry & resolution
 
@@ -298,9 +316,11 @@ the process. This is the same "plugin decides, host executes" split as
   repos, but *never touching* Maven Central, Google Maven, or the Gradle
   Plugin Portal. The client's default registry source is the index's raw
   GitHub URL; a different source can be passed with `--plugin-registry`.
+
 - **Hosting.** Plugin artifacts are published to GitHub releases
   (`hello-plugin-v0.4.0`, `jvm-plugin-v0.5.0`), with the `.wasm` binaries
   as release assets that each index entry's `artifact_url` points at.
+
 - **Index format.** `index.json` is a single document with a
   `schema_version` and a `plugins` table keyed by plugin name; each entry
   maps version strings to an ABI range and an artifact URL:
@@ -321,24 +341,27 @@ the process. This is the same "plugin decides, host executes" split as
   }
   ```
 
-  `abi` is the plugin-ABI range that build declares support for
-  (§3.7) — the value the tool's compatibility check keys on.
-  `artifact_url` is an HTTP(S) URL or a `file://`/relative filesystem path
-  (the local forms exist so the client can be tested and run without a
-  network). Before an artifact is cached, the tool instantiates it and
-  cross-checks its `manifest` entry against the index row: name and
-  version must match the coordinate and the reported ABI version must lie
-  inside the declared range.
-- Local plugin cache: `~/.cache/uliab/plugins/<name>/<version>/plugin.wasm`
-  plus an `abi.json` recording the ABI range the cached build was verified
-  under — checked first; the tool only fetches from the registry on a
-  cache miss. A cached build whose recorded range no longer contains the
-  host ABI (the tool was upgraded) is refetched. This directly parallels
-  the Maven artifact cache design but is a fully separate cache root —
-  plugin artifacts and Maven artifacts are never comingled.
+  `abi` is the plugin-ABI range that build declares support for (§3.7)
+  — the value the tool's compatibility check keys on. `artifact_url` is
+  an HTTP(S) URL or a `file://`/relative filesystem path (the local forms
+  exist so the client can be tested and run without a network). Before
+  an artifact is cached, the tool instantiates it and cross-checks its
+  `manifest` entry against the index row: name and version must match
+  the coordinate and the reported ABI version must lie inside the
+  declared range.
+
+- Local plugin cache:
+  `~/.cache/uliab/plugins/<name>/<version>/plugin.wasm` plus an
+  `abi.json` recording the ABI range the cached build was verified under
+  — checked first; the tool only fetches from the registry on a cache
+  miss. A cached build whose recorded range no longer contains the host
+  ABI (the tool was upgraded) is refetched. This directly parallels the
+  Maven artifact cache design but is a fully separate cache root — plugin
+  artifacts and Maven artifacts are never comingled.
+
 - **Version compatibility**: each plugin declares which core plugin-ABI
-  version range it targets; the host refuses to load a plugin whose range
-  does not contain the host ABI, checked before the plugin is
+  version range it targets; the host refuses to load a plugin whose
+  range does not contain the host ABI, checked before the plugin is
   instantiated. Keeping the last-known-compatible build running when the
   host upgrades past a plugin's declared range is designed but not
   implemented — today that situation is a hard error. A plugin update is
@@ -349,11 +372,110 @@ the process. This is the same "plugin decides, host executes" split as
 The `UlbPlugin` trait (§3.2) and the `TaskRegistrar`/`run_tool`
 capability surface (§3.2, §3.5) together are "the plugin ABI." It is
 versioned independently of the core tool's own version (semver, with the
-compatibility behavior from §3.6). Growing the ABI (a new
-capability, a new field on `ModuleConfig`) is additive-only within a
-major version; anything else is a major-version bump, which is exactly
-the kind of change that should be rare precisely because plugins — not
-the core — absorb almost all day-to-day churn (§1 goal 2).
+compatibility behavior from §3.6). Growing the ABI (a new capability, a
+new field on `ModuleConfig`) is additive-only within a major version;
+anything else is a major-version bump, which is exactly the kind of
+change that should be rare precisely because plugins — not the core —
+absorb almost all day-to-day churn (§1 goal 2).
+
+### 3.8 Plugin config schema: derived, not hand-written (Phase 16)
+
+**The problem this section fixes.** A plugin's DSL surface — which keys
+`android {}` accepts, their types, what `buildFeatures.compose` means —
+exists nowhere in machine-readable form today. It is prose in a plugin's
+own reference doc plus whatever string-indexed JSON lookups happen to
+appear in that plugin's `configure()`. Consequences: the host can't catch
+a typo (`buildFeaturse`) — an unknown key passes through silently until a
+human notices nothing happened; the LSP can't suggest plugin fields
+because there is nothing to read; and every new capability invites
+another hardcoded special case in the host or the LSP.
+
+**The rejected fix, recorded so it is not proposed again.** An earlier
+plan for this phase had plugin authors hand-write a manifest
+(`features: list<feature-info>`, `keys: list<key-info>`) next to their
+`configure()` code. This does not solve the problem — it relocates it: a
+plugin author can add a field to their config struct, forget to update
+the manifest, and the exact same silent-drift failure mode returns,
+just authored by a person instead of inherited from history. Two
+independently-maintained descriptions of the same thing always drift
+eventually; the fix has to remove the second description, not add
+discipline around keeping it in sync.
+
+**The actual fix: derive the schema from the same struct that
+deserializes the config.** `ulb-plugin-sdk` ships a `#[derive(UlbConfig)]`
+procedural macro. A plugin author writes their config as an ordinary
+typed Rust struct:
+
+```rust
+#[derive(UlbConfig)]
+struct Android {
+    /// The compile SDK version.
+    compile_sdk: i32,
+    build_features: BuildFeatures,
+}
+```
+
+The macro expands, at the plugin's own compile time, into two things
+generated from the *same* struct definition — never two separately
+authored artifacts:
+
+1. **Real deserialization code** for that struct out of the module
+   config JSON — replacing today's hand-written string-indexed
+   `json["android"]["compileSdk"].as_i64()` lookups with a typed,
+   compiler-checked path. This is a strict improvement on its own, before
+   any schema benefit: a renamed or mistyped field is now a Rust compile
+   error in the plugin, not a silent runtime `None`.
+2. **A schema description** (key paths, primitive types, and the field's
+   `///` doc comments as human-readable descriptions) of exactly the same
+   shape `key-info`/`feature-info` would have held under the rejected
+   design — except it is a byproduct of macro expansion, not something a
+   person writes.
+
+The schema is **embedded in the compiled `.wasm` as a custom section**
+(§3.4), so the single published artifact carries both its executable
+behavior and its own machine-readable description — they cannot diverge
+because they come from one macro expansion over one struct, at one
+compile. The host and `ulb-lsp` read the schema via static introspection
+(`wasm-tools`-style parsing of the custom section) without instantiating
+or running the plugin at all.
+
+**Why this genuinely closes the drift, rather than narrowing it.** Under
+the rejected design, nothing stops a plugin author from adding a field
+to their config-reading code without touching the manifest. Under this
+design, there is no second place to update: the config-reading code *is*
+the schema source. Adding a field to the struct changes both outputs of
+the same macro expansion simultaneously, by construction.
+
+**Design intent beyond the immediate problem.** `ulb-plugin-sdk` is meant
+to grow a small family of derive macros this way, not just this one —
+the same "one struct, compiler-generated everything downstream" shape
+should cover other Cargo-boilerplate-shaped problems for plugin authors
+as they come up (task-registration boilerplate, common argument-building
+patterns), so the SDK becomes progressively more load-bearing rather
+than every plugin re-deriving the same scaffolding by hand.
+
+**Cost, stated plainly.** The three shipped plugins (`hello`, `jvm`,
+`android`) currently read their config as raw JSON string indexing. This
+is a real migration, not an additive feature — every `configure()` needs
+its ad hoc JSON reads replaced with a `#[derive(UlbConfig)]` struct.
+Phase 16 is scoped below to land the macro and prove it on the smallest
+plugin first, specifically so this migration doesn't get bundled with
+the host/LSP consumption work (16C/16D) before the foundation itself is
+validated.
+
+**Open questions to resolve during 16A, not guessed at here:**
+
+- *Cross-plugin duplicate declarations.* If two plugins' schemas declare
+  overlapping feature/key names, what happens — first-registered wins,
+  or is it a hard configuration error? Undecided; must be answered before
+  16B's host enforcement lands, not after.
+- *Version skew.* A plugin built before this phase (ABI < the version
+  this lands under) has no schema custom section at all. The host and
+  LSP must treat "no schema section present" as "no completions/
+  validation available for this plugin's keys" — silently degraded, not
+  an error — mirroring how `legacy-plugin.wit` already lets a
+  pre-`configure` component keep working via `run` alone (§3.2 history).
+  This needs an explicit test, not an assumption.
 
 ---
 
@@ -401,7 +523,9 @@ what `ulb-plugins/jvm`, `ulb-plugins/android`, and `ulb-plugins/kmp` are
 each *responsible for designing and shipping*, not core-tool behavior.
 Each plugin publishes its own reference doc (mirroring grammar.md
 Appendix A's tables, but plugin-owned) describing exactly which keys it
-understands inside the blocks it claims.
+understands inside the blocks it claims — and, once Phase 16 lands, this
+prose reference becomes secondary to the schema embedded in the plugin's
+own `.wasm` (§3.8).
 
 ### 5.1 `ulite/jvm` — plain Java & Kotlin/JVM
 
@@ -424,6 +548,8 @@ the core task engine, Maven resolution of `deps {}` scopes, KSP wired
 through `kotlinc`, a test task that runs JUnit Platform tests via the
 host's `java` tool, and a `jar` packaging step. The host's `write` action
 (§4.1) is how the plugin materializes its generated test runner.
+**Reads its config as raw JSON today; migrating to `#[derive(UlbConfig)]`
+is the first real plugin to move under Phase 16 (§3.8) after `hello`.**
 
 ### 5.2 `ulite/android` — depends on `ulite/jvm`
 
@@ -454,22 +580,24 @@ host's `java` tool, and a `jar` packaging step. The host's `write` action
   so the tool loads both and `ulite/android` can call into `ulite/jvm`'s
   registered compile tasks rather than re-implementing compilation.
 
-Cross-plugin composition is designed on paper only: no plugin-to-plugin
-dependency mechanism exists in the ABI today. What exists so far is the
-compile and variant slice (`ulb-plugins/android-plugin`,
-`docs/android-plugin.md`): an `android {}` block with `compileSdk`,
-`sources`, `namespace`, manifest, and resource directory; toolchain
-discovery of the platform jar and the highest `build-tools` release
-carrying `aapt2`/`d8` (both the resolved root and a module-declared
-`sdkDir` are preopened read-only, §3.2); the variant matrix (build types
-x product flavors, or the default `[debug, release]` pair) with
-per-variant `linkResources`/`compile`/`d8`/`package`/`sign` tasks;
-flavor-level `minSdk` override and `applicationIdSuffix` passed via
-`--rename-manifest-package` to `aapt2 link`; APK signing via `apksigner`
-when the module's `signing {}` block is present (passwords written to
-temp files and passed via `--ks-pass file:`/`--key-pass file:`).
-Manifest merging and additional packaging features remain future slices
-of the same plugin.
+What exists so far is the compile and variant slice
+(`ulb-plugins/android-plugin`, `docs/android-plugin.md`): an `android {}`
+block with `compileSdk`, `sources`, `namespace`, manifest, and resource
+directory; toolchain discovery of the platform jar and the highest
+`build-tools` release carrying `aapt2`/`d8` (both the resolved root and a
+module-declared `sdkDir` are preopened read-only, §3.2); the variant
+matrix (build types × product flavors, or the default `[debug, release]`
+pair) with per-variant `linkResources`/`compile`/`d8`/`package`/`sign`
+tasks; flavor-level `minSdk` override and `applicationIdSuffix` passed
+via `--rename-manifest-package` to `aapt2 link`; APK signing via
+`apksigner` when the module's `signing {}` block is present (passwords
+written to temp files and passed via `--ks-pass file:`/`--key-pass
+file:`). Manifest merging, R8/minification, and AAB packaging remain
+future slices of the same plugin. **The Compose compiler plugin is not
+yet invoked** — plain `kotlinc` is run even when `android.compose` is
+true, so any `@Composable` source fails to compile; this is tracked as
+the top-priority gap in `PROGRESS.md`'s candidate-phases list, ahead of
+Phase 16.
 
 ### 5.3 `ulite/kmp` — depends on `ulite/jvm`, optionally `ulite/android`
 
@@ -494,7 +622,8 @@ classes jars, and `assembleAndroid<Variant>` grafts the merged dex into
 the APK. The kmp plugin declares `dependencies: ["ulite/android"]` and
 references android tasks via cross-plugin composition
 (`ulite/android:prepareBuildDir`, `ulite/android:jarClasses<Variant>`,
-`ulite/android:packageApk<Variant>`, `ulite/android:writeSigningPasswords`,
+`ulite/android:packageApk<Variant>`,
+`ulite/android:writeSigningPasswords`,
 `ulite/android:writeSigningKeyPassword`). Signing is handled by the kmp
 plugin's own `signKmpAndroid<Variant>` task, which runs after the dex
 graft so the APK is never modified after `apksigner` seals it. Variant
@@ -515,16 +644,16 @@ first pass, discovers each module's output artifact (`jvm.jarFile` or
 `android.apk`), then resolves Maven dependencies for every module (each
 module's api classpath recorded) before resolving `project(":mod")` refs
 in a second pass and configuring plugins. Because refs resolve only after
-every module's api classpath is known, declaration order in `settings.ulb`
-plays no role. The resolver skips `ProjectRef` entries during Maven
-resolution; `extract_project_deps` collects them for the host, and
-`resolve_project_classpath` maps them to jar paths on the classpath. The
-`api`/`implementation` distinction carries through: both inject the
-referenced module's jar into compile and runtime classpaths, an `api` ref
-additionally carries the referenced module's api-scoped jars,
-`runtimeOnly` injects into runtime only, and `testImplementation` injects
-into the test compile and runtime classpaths. Source-set-level refs merge
-into that source set's own classpath under the same rules.
+every module's api classpath is known, declaration order in
+`settings.ulb` plays no role. The resolver skips `ProjectRef` entries
+during Maven resolution; `extract_project_deps` collects them for the
+host, and `resolve_project_classpath` maps them to jar paths on the
+classpath. The `api`/`implementation` distinction carries through: both
+inject the referenced module's jar into compile and runtime classpaths,
+an `api` ref additionally carries the referenced module's api-scoped
+jars, `runtimeOnly` injects into runtime only, and `testImplementation`
+injects into the test compile and runtime classpaths. Source-set-level
+refs merge into that source set's own classpath under the same rules.
 
 ### 6.2 `api` vs `implementation` classpath rules (core resolver, jvm-family-wide)
 
@@ -591,14 +720,12 @@ output* means, not the syntax grammar or the LSP's use of the AST.
 | parse + semantic diagnostics, hover, goto-definition, completion | `ulb-lsp` |
 
 The LSP does **not** use tree-sitter for analysis; it walks the same
-typed AST + spans from `ulb-lang` the evaluator uses. One consequence of
-this redesign worth flagging: some semantic diagnostics (e.g. "unknown
-key inside `android {}`") now depend on which plugin's manifest is
-active for a given `build.ulb`, not on a fixed core table — `ulb-lsp`
-will need to load the same plugin manifests (not the full WASM
-execution, just the declared-keys metadata from §3.2's `manifest()`) to
-offer that specific diagnostic. Not designed in detail yet; noted here so
-it isn't lost.
+typed AST + spans from `ulb-lang` the evaluator uses. Plugin-owned
+completions/diagnostics (e.g. "unknown key inside `android {}`") depend
+on the §3.8 schema embedded in each resolved plugin's `.wasm`, not on a
+fixed core table — this is Phase 16C/16D, not yet built. `ulb-lsp` will
+read the schema the same way the host does: static introspection of the
+plugin artifact, no wasmtime execution required.
 
 ### 8.1 Grammar sync-by-hand risk (unchanged)
 
@@ -698,6 +825,10 @@ Android logic).
 | 13 (done) | `uliab init` | scaffold new project from templates |
 | 14 (done) | KMP Android target | plugin-to-plugin ABI composition (dependencies + cross-plugin dep resolution) |
 | 15 (done) | Product flavors / variant matrix | `--variant` host-side selection + per-variant source-set layering in plugins |
+| **16A (not started)** | `#[derive(UlbConfig)]` macro in `ulb-plugin-sdk` (§3.8) | typed config struct → deserializer + `.wasm`-embedded schema, proven on `hello-plugin` only |
+| **16B (not started)** | Migrate `ulite/jvm`, `ulite/android`, `ulite/kmp` to `UlbConfig` structs | every shipped plugin's raw-JSON reads replaced; ABI bump for the schema section |
+| **16C (not started)** | Host schema extraction + enforcement | `uliab plugins describe` prints a resolved plugin's schema from its `.wasm` alone; unknown-key/unknown-feature become named errors sourced from the schema, not a hardcoded table |
+| **16D (not started)** | `ulb-lsp` consumes the schema | completions/hover/diagnostics for plugin-owned keys, degrading gracefully for a pre-16A plugin with no schema section (§3.8 open question) |
 
 Phases 2–6 are sequential (each depends on the previous); 7a/7b/7c are
 independent core services and were built in parallel on top of 4. 8a
@@ -705,7 +836,13 @@ landed before 8b/8c (both depend on it); 8b and 8c landed in parallel.
 Phase 9 (settings.ulb) landed after 8c. Phase 10 (module dependency
 syntax) landed after 9. Phase 11 (APK signing) landed after 10.
 Phase 12 (build variants) landed after 11. Phase 13 (`uliab init`)
-landed after 12. Phase 14 completes the KMP story.
+landed after 12. Phase 14 completes the KMP story. Phase 16A must land
+and be proven on `hello-plugin` alone *before* 16B starts — the whole
+point of splitting it this way is to validate the macro's foundation on
+the smallest possible surface before touching the three plugins real
+builds depend on. 16C and 16D both depend on 16B (there is no schema to
+extract or consume until the real plugins carry one), but can proceed in
+parallel with each other once 16B lands.
 
 ---
 
@@ -716,7 +853,13 @@ kotlinc-as-DSL-interpreter, third-party (non-Ulite-Team) plugin registry
 sources, general Android compat, remote cache, publishing, LSP rename/
 find-all-references/advanced semantic tokens.
 
-New from this redesign, explicitly not designed yet:
-- `ulb-lsp` loading plugin manifests for plugin-owned diagnostics (§8).
+New, explicitly not designed yet:
+
 - Non-JVM KMP native targets (iOS, desktop) — deferred until cross-
   compilation toolchain integration is designed.
+- Cross-plugin duplicate schema-declaration policy (§3.8) — must be
+  answered during 16A, not deferred past it.
+- Whether `UlbConfig`-style derive macros extend to task-registration
+  boilerplate or other SDK-author pain points beyond config parsing
+  (§3.8's stated design intent) — direction only, no concrete second
+  macro scoped yet.
