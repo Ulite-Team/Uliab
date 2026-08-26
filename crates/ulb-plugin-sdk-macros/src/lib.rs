@@ -512,21 +512,3 @@ fn lower_camel_case(name: &str) -> String {
     }
     out
 }
-
-/// Temporary diagnostic: renders the exact tokens the derive emits so a
-/// failing build log shows the expansion verbatim.
-fn expanded_tokens_debug(input: &DeriveInput, specs: &[FieldSpec]) -> String {
-    let type_name = &input.ident;
-    let mut lines = Vec::new();
-    for spec in specs {
-        lines.push(format!(
-            "field {}:{} kind={} opt={} feature={}",
-            spec.dsl_name, spec.ident, spec.kind, spec.optional, spec.is_feature
-        ));
-    }
-    format!(
-        "EXPANSION for {}: {}",
-        quote! { impl #type_name { pub const ULB_CONFIG_SCHEMA: &'static str; } },
-        lines.join(" | ")
-    )
-}
