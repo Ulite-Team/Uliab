@@ -149,11 +149,10 @@ fn find_section_payloads(wasm: &[u8]) -> Result<Option<String>, String> {
     if wasm.len() < 8 || wasm[..4] != [0x00, 0x61, 0x73, 0x6d] {
         return Err("not a WebAssembly binary (bad magic)".to_owned());
     }
-    let is_component = wasm[4..8] == [0x0a, 0x00, 0x01, 0x00];
-    walk_sections(&wasm[8..], is_component, 0)
+    walk_sections(&wasm[8..], 0)
 }
 
-fn walk_sections(bytes: &[u8], component: bool, depth: u8) -> Result<Option<String>, String> {
+fn walk_sections(bytes: &[u8], depth: u8) -> Result<Option<String>, String> {
     if depth > 4 {
         return Err("section nesting too deep".to_owned());
     }
@@ -187,7 +186,7 @@ fn walk_sections(bytes: &[u8], component: bool, depth: u8) -> Result<Option<Stri
             // Components wrap their core code module in an inner section;
             // rather than hardcoding which section id each encoder picks,
             // descend into any nested binary.
-            if let found @ Some(_) = walk_sections(payload, false, depth + 1)? {
+            if let found @ Some(_) = walk_sections(payload, depth + 1)? {
                 return Ok(found);
             }
         }
