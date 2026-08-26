@@ -225,7 +225,7 @@ A task is not truly complete until the following steps finish — not just
    PR comments must only be made from a dedicated CI/action account
    (e.g. `github-actions[bot]`). If no action account is available,
    report the review summary to the user in the terminal instead —
-   never post as the user.
+   never post as the user. Default to terminal-only reporting.
 7. Only after CI is green and all review findings are resolved or
    dismissed does the agent report the task as complete to the user.
 
