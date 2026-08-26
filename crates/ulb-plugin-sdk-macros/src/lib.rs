@@ -128,11 +128,10 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         }
     };
 
-    eprintln!(
-        "[ulb-config] EXPANSION for {}: {}",
-        quote! { #type_name },
-        impl_tokens.to_string()
-    );
+    let debug_note = format!("EXPANSION[{}]: {}", type_name, impl_tokens);
+
+    // Temporary diagnostics channel; removed once the derive is proven.
+    eprintln!("{}", debug_note);
 
     Ok(impl_tokens)
 
