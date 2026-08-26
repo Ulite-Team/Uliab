@@ -18,11 +18,12 @@ support), the `ulite/kmp` plugin (JVM + Android targets: commonMain +
 jvmMain → jar, commonMain + androidMain → per-variant merged dex into
 APK), `uliab init` project scaffolding, and multi-module `settings.ulb`
 support are implemented and building. The plugin registry is live on
-GitHub. **Not yet implemented:** the compile-time-derived plugin config
-schema described in §3.8 (Phase 16) — today a plugin reads its config
-block as raw untyped JSON, with no machine-readable record of which keys
-it owns, which is why the LSP and host cannot yet offer plugin-aware
-completions/diagnostics or catch a plugin author's own key typos.
+GitHub. The compile-time-derived plugin config schema (§3.8) is partially
+implemented: `#[derive(UlbConfig)]` generates typed deserialization and
+embeds a JSON schema in the wasm custom section, `plugins describe` prints
+it, and `hello-plugin` / the test fixture carry embedded schemas. The
+remaining plugins (`jvm`, `android`, `kmp`) have not yet been migrated
+from raw `serde_json::Value` reads.
 
 ---
 
@@ -523,9 +524,9 @@ what `ulb-plugins/jvm`, `ulb-plugins/android`, and `ulb-plugins/kmp` are
 each *responsible for designing and shipping*, not core-tool behavior.
 Each plugin publishes its own reference doc (mirroring grammar.md
 Appendix A's tables, but plugin-owned) describing exactly which keys it
-understands inside the blocks it claims — and, once Phase 16 lands, this
-prose reference becomes secondary to the schema embedded in the plugin's
-own `.wasm` (§3.8).
+understands inside the blocks it claims — and, once the plugin has been
+migrated to `#[derive(UlbConfig)]`, this prose reference becomes secondary
+to the schema embedded in the plugin's own `.wasm` (§3.8).
 
 ### 5.1 `ulite/jvm` — plain Java & Kotlin/JVM
 
@@ -596,8 +597,7 @@ file:`). Manifest merging, R8/minification, and AAB packaging remain
 future slices of the same plugin. **The Compose compiler plugin is not
 yet invoked** — plain `kotlinc` is run even when `android.compose` is
 true, so any `@Composable` source fails to compile; this is tracked as
-the top-priority gap in `PROGRESS.md`'s candidate-phases list, ahead of
-Phase 16.
+the top-priority gap in `PROGRESS.md`'s candidate-phases list.
 
 ### 5.3 `ulite/kmp` — depends on `ulite/jvm`, optionally `ulite/android`
 

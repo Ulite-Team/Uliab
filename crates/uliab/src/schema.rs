@@ -16,6 +16,9 @@ use serde::{Deserialize, Serialize};
 
 /// The wasm custom section name where a `#[derive(UlbConfig)]` plugin
 /// embeds its config schema.
+///
+/// This constant must stay in sync with the copy in `ulb-plugin-sdk`
+/// (the canonical source for plugin-facing code).
 pub const SCHEMA_CUSTOM_SECTION: &str = "ulb-config-schema";
 
 /// A single field in a plugin's config schema.
@@ -237,5 +240,38 @@ mod tests {
     fn raw_schema_section_returns_none_when_absent() {
         let wasm = wasm_with_custom_section(b"other", b"data");
         assert!(raw_schema_section(&wasm).is_none());
+    }
+
+    #[test]
+    fn extract_schema_strips_null_terminator() {
+        let schema = PluginSchema {
+            name: "t".into(),
+            properties: vec![],
+        };
+        let mut json = serde_json::to_vec(&schema).unwrap();
+        json.push(0); // null-terminate like embed_schema! does
+        let wasm = wasm_with_custom_section(SCHEMA_CUSTOM_SECTION.as_bytes(), &json);
+        let extracted = extract_schema(&wasm).expect("schema present despite null terminator");
+        assert_eq!(extracted, schema);
+    }
+
+    #[test]
+    fn raw_schema_section_includes_null_terminator() {
+        let mut json = b"{\"name\":\"t\",\"properties\":[]}".to_vec();
+        json.push(0);
+        let wasm = wasm_with_custom_section(SCHEMA_CUSTOM_SECTION.as_bytes(), &json);
+        let raw = raw_schema_section(&wasm).expect("section present");
+        assert_eq!(raw.last(), Some(&0));
+        // extract_schema should have stripped it and still parse:
+        assert!(extract_schema(&wasm).is_some());
+    }
+
+    #[test]
+    fn extract_schema_returns_none_for_wrong_json_shape() {
+        let wasm = wasm_with_custom_section(
+            SCHEMA_CUSTOM_SECTION.as_bytes(),
+            b"{\"not_a_schema\": true}",
+        );
+        assert!(extract_schema(&wasm).is_none());
     }
 }
