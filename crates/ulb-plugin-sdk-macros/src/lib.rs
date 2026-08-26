@@ -197,12 +197,37 @@ fn field_spec(field: &Field) -> syn::Result<FieldSpec> {
 
 fn extraction_for(spec: &FieldSpec) -> TokenStream2 {
     let dsl = &spec.dsl_name;
-    let missing = quote! {
+    let kind_missing = quote! {
         return ::std::result::Result::Err(format!("missing required key '{}'", #dsl))
     };
+    let type_mismatch = quote! {
+        return ::std::result::Result::Err(format!("key '{}' must be {}", #dsl, #type_word))
+    };
 
-    // Parse to the canonical shape first, then adapt integers down to the
-    // declared field width (i32/u16/...) with an out-of-range error.
+    // Nested blocks recurse into their own derived from_config.
+    if spec.kind == "block" {
+        let ty = &spec.ty;
+        return if spec.optional {
+            quote! {
+                match value.get(#dsl) {
+                    ::std::option::Option::Some(v) if !v.is_null() => {
+                        ::std::option::Option::Some(#ty::from_config(v)?)
+                    }
+                    _ => ::std::option::Option::None,
+                }
+            }
+        } else {
+            quote! {
+                match value.get(#dsl) {
+                    ::std::option::Option::Some(v) => #ty::from_config(v)?,
+                    ::std::option::Option::None => #kind_missing,
+                }
+            }
+        };
+    }
+
+    // Parse to a canonical shape first, then adapt integers down to the
+    // declared field width with an out-of-range error.
     let (parse, type_word): (TokenStream2, TokenStream2) = match spec.kind {
         "string" => (
             quote! { v.as_str().map(::std::string::ToString::to_owned) },
@@ -221,16 +246,16 @@ fn extraction_for(spec: &FieldSpec) -> TokenStream2 {
             },
             quote! { "a list of strings" },
         ),
-        other => unreachable!("unhandled catalog kind: {other}"),
+        other => unreachable!("catalog kinds are closed; got {other}"),
     };
     let adapt = if spec.kind == "int" {
         let ty = &spec.ty;
         quote! {
             <#ty>::try_from(parsed)
-                .map_err(|_| format!("key '{}' out of range", #dsl))
+                .map_err(|_| format!("key '{}' out of range", #dsl))?
         }
     } else {
-        quote! { ::std::result::Result::Ok(parsed) }
+        quote! { parsed }
     };
 
     if spec.optional {
@@ -239,14 +264,12 @@ fn extraction_for(spec: &FieldSpec) -> TokenStream2 {
                 ::std::option::Option::Some(v) if !v.is_null() => {
                     match #parse {
                         ::std::option::Option::Some(parsed) => {
-                            #adapt.map(::std::option::Option::Some)
+                            ::std::option::Option::Some(#adapt)
                         }
-                        ::std::option::Option::None => ::std::result::Result::Err(format!(
-                            "key '{}' must be {}", #dsl, #type_word
-                        )),
+                        ::std::option::Option::None => #type_mismatch,
                     }
                 }
-                _ => ::std::result::Result::Ok(::std::option::Option::None),
+                _ => ::std::option::Option::None,
             }
         }
     } else {
@@ -254,11 +277,9 @@ fn extraction_for(spec: &FieldSpec) -> TokenStream2 {
             match value.get(#dsl) {
                 ::std::option::Option::Some(v) => match #parse {
                     ::std::option::Option::Some(parsed) => #adapt,
-                    ::std::option::Option::None => ::std::result::Result::Err(format!(
-                        "key '{}' must be {}", #dsl, #type_word
-                    )),
+                    ::std::option::Option::None => #type_mismatch,
                 },
-                ::std::option::Option::None => #missing,
+                ::std::option::Option::None => #kind_missing,
             }
         }
     }
