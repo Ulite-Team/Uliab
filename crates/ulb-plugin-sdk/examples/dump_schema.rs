@@ -23,7 +23,11 @@ fn main() {
     };
     match ulb_plugin_sdk::schema::read_schema(&bytes) {
         Ok(Some(schema)) => {
-            println!("plugin schema ({} keys, {} features):", schema.keys.len(), schema.features.len());
+            println!(
+                "plugin schema ({} keys, {} features):",
+                schema.keys.len(),
+                schema.features.len()
+            );
             for key in &schema.keys {
                 let requirement = if key.required { "req" } else { "opt" };
                 println!(

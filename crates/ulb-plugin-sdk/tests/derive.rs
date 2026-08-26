@@ -78,8 +78,7 @@ fn missing_required_key_is_an_error_naming_the_key() {
 
 #[test]
 fn wrongly_typed_value_names_the_expected_kind() {
-    let error =
-        Flat::from_config(&serde_json::json!({ "message": 7 })).expect_err("must fail");
+    let error = Flat::from_config(&serde_json::json!({ "message": 7 })).expect_err("must fail");
     assert_eq!(error, "key 'message' must be string");
 }
 

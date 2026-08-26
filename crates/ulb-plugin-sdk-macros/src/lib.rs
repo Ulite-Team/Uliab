@@ -10,7 +10,7 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, Data, DeriveInput, Expr, Field, Fields, Lit, Meta};
+use syn::{Data, DeriveInput, Expr, Field, Fields, Lit, Meta, parse_macro_input};
 
 /// Derives typed config deserialization plus an embedded schema catalog.
 ///
@@ -65,14 +65,14 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
                 return Err(syn::Error::new_spanned(
                     &input.ident,
                     "UlbConfig requires a struct with named fields",
-                ))
+                ));
             }
         },
         _ => {
             return Err(syn::Error::new_spanned(
                 &input.ident,
                 "UlbConfig can only be derived for structs",
-            ))
+            ));
         }
     };
 
@@ -161,7 +161,7 @@ fn field_spec(field: &Field) -> syn::Result<FieldSpec> {
                     return Err(syn::Error::new_spanned(
                         other,
                         "unknown ulb attribute; expected feature, rename, or desc",
-                    ))
+                    ));
                 }
             }
         }
@@ -347,7 +347,7 @@ fn classify(ty: &syn::Type) -> syn::Result<&'static str> {
             "String" => return Ok("string"),
             "bool" => return Ok("bool"),
             "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "isize" | "usize" => {
-                return Ok("int")
+                return Ok("int");
             }
             "Vec" => {
                 let is_string_list = matches!(

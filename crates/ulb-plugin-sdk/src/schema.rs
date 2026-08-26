@@ -114,7 +114,7 @@ pub fn read_schema(wasm: &[u8]) -> Result<Option<PluginSchema>, String> {
                             _ => {
                                 return Err(format!(
                                     "malformed schema line (requirement): {line:?}"
-                                ))
+                                ));
                             }
                         };
                         let description = parts.next().unwrap_or_default().to_owned();
@@ -199,7 +199,9 @@ fn read_leb_u32(bytes: &[u8], start: usize) -> Result<(u32, usize), String> {
     let mut shift = 0u32;
     let mut consumed = 0usize;
     loop {
-        let byte = *bytes.get(start + consumed).ok_or("truncated LEB128 number")?;
+        let byte = *bytes
+            .get(start + consumed)
+            .ok_or("truncated LEB128 number")?;
         consumed += 1;
         result |= u32::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
@@ -258,7 +260,9 @@ mod tests {
         component.push(1);
         component.push(inner.len() as u8);
         component.extend_from_slice(&inner);
-        let schema = read_schema(&component).expect("parses").expect("has schema");
+        let schema = read_schema(&component)
+            .expect("parses")
+            .expect("has schema");
         assert_eq!(schema.keys[0].path, "depth");
         assert!(!schema.keys[0].required);
     }
@@ -282,10 +286,8 @@ mod tests {
 
     #[test]
     fn unsupported_header_version_is_rejected() {
-        let wasm = core_module_with_custom(
-            SCHEMA_SECTION_NAME.as_bytes(),
-            b"ulb-config-schema 999\n",
-        );
+        let wasm =
+            core_module_with_custom(SCHEMA_SECTION_NAME.as_bytes(), b"ulb-config-schema 999\n");
         let error = read_schema(&wasm).expect_err("unknown version");
         assert!(error.contains("unsupported schema header"), "{error}");
     }
