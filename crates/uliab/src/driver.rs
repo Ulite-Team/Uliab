@@ -149,7 +149,7 @@ pub struct BuildOptions {
 ///         "ulite/fixture": {
 ///             "versions": {
 ///                 "0.1.0": {
-///                     "abi": { "min": "0.4", "max": "0.7" },
+///                     "abi": { "min": "0.4", "max": "0.8" },
 ///                     "artifact_url": fixture.display().to_string(),
 ///                 }
 ///             }
