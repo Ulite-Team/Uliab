@@ -125,7 +125,8 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 #(#extractions)*
                 ::std::result::Result::Ok(Self { #(#idents),* })
             }
-        };
+        }
+    };
 
     let debug_text = impl_tokens.to_string();
 
