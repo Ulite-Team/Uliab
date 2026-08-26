@@ -115,14 +115,18 @@ pub fn embed_schema(input: TokenStream) -> TokenStream {
 fn expand_ulb_config(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let name = &input.ident;
     let name_str = name.to_string();
+    let struct_doc = extract_doc_comment(&input.attrs).unwrap_or_default();
 
     let fields = match &input.data {
         Data::Struct(data) => match &data.fields {
             Fields::Named(fields) => &fields.named,
+            Fields::Unit => {
+                return expand_ulb_config_unit(&name_str, &struct_doc);
+            }
             _ => {
                 return Err(syn::Error::new_spanned(
                     input,
-                    "UlbConfig can only be derived for structs with named fields",
+                    "UlbConfig can only be derived for structs with named fields or unit structs",
                 ));
             }
         },
@@ -134,7 +138,6 @@ fn expand_ulb_config(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         }
     };
 
-    let struct_doc = extract_doc_comment(&input.attrs).unwrap_or_default();
     let mut field_schemas = Vec::new();
 
     for field in fields {
@@ -168,6 +171,31 @@ fn expand_ulb_config(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         impl #name {
             /// Returns the config schema as a JSON value, derived from the
             /// struct's field names, types, and doc comments.
+            pub fn schema() -> serde_json::Value {
+                serde_json::from_str(#schema_json_for_value)
+                    .expect("UlbConfig macro generated invalid schema JSON")
+            }
+
+            /// The config schema as a JSON string constant, for embedding
+            /// in a wasm custom section via
+            /// `ulb_plugin_sdk::embed_schema!`.
+            pub const SCHEMA_JSON: &'static str = #schema_json_str;
+        }
+    })
+}
+
+/// Expands `UlbConfig` for a unit struct (no fields).
+fn expand_ulb_config_unit(
+    struct_name: &str,
+    struct_doc: &str,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let name: syn::Ident = syn::parse_str(struct_name)?;
+    let schema_json_str = build_schema_json_string(struct_name, struct_doc, &[]);
+    let schema_json_for_value = schema_json_str.clone();
+
+    Ok(quote! {
+        impl #name {
+            /// Returns the config schema as a JSON value.
             pub fn schema() -> serde_json::Value {
                 serde_json::from_str(#schema_json_for_value)
                     .expect("UlbConfig macro generated invalid schema JSON")
