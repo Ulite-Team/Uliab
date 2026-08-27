@@ -35,6 +35,6 @@ pub const ABI_VERSION: &str = "0.8";
 /// The name of the wasm custom section where a `#[derive(UlbConfig)]`
 /// plugin embeds its config schema.
 ///
-/// This is the canonical definition; the host-side copy in
-/// `uliab::schema` must match.
+/// This is the canonical definition; the reader-side copy in
+/// `ulb-schema` must match.
 pub const SCHEMA_CUSTOM_SECTION: &str = "ulb-config-schema";

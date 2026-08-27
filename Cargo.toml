@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/ulb-lang",
+    "crates/ulb-schema",
     "crates/ulb-plugin-sdk",
     "crates/ulb-config-macros",
     "crates/ulb-plugin-fixture",

@@ -1706,6 +1706,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ulb-schema"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wasmparser 0.219.2",
+]
+
+[[package]]
 name = "uliab"
 version = "0.1.0"
 dependencies = [
@@ -1715,8 +1724,8 @@ dependencies = [
  "sha2",
  "ulb-lang",
  "ulb-plugin-sdk",
+ "ulb-schema",
  "ureq",
- "wasmparser 0.219.2",
  "wasmtime",
  "wasmtime-wasi",
 ]
