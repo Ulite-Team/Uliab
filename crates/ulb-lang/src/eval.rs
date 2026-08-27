@@ -566,8 +566,8 @@ fn merge_block_value(target: &mut BTreeMap<String, Value>, key: String, value: V
         let Some(Value::Block(existing)) = target.get_mut(&key) else {
             unreachable!("checked above");
         };
-        for (k, v) in new_map.clone() {
-            merge_block_value(existing, k, v);
+        for (k, v) in new_map {
+            merge_block_value(existing, k.clone(), v.clone());
         }
         return;
     }
@@ -693,7 +693,7 @@ impl<'a> Evaluator<'a> {
                 tasks_map.insert(name.clone(), Value::Block(nested));
             }
             StatementKind::Apply { name, .. } => {
-                if let Some(block) = self.defs.conventions.get(name).cloned() {
+                if let Some(block) = self.defs.conventions.get(name) {
                     self.eval_statements(&block.statements, target);
                 } else {
                     self.error(stmt.span, format!("unknown convention '{name}'"));
@@ -811,12 +811,12 @@ impl<'a> Evaluator<'a> {
                 insert_accumulating(target, "__actions__".to_owned(), Value::Block(action));
             }
             name => {
-                let Some((params, block)) = self.defs.functions.get(name).cloned() else {
+                let Some((params, block)) = self.defs.functions.get(name) else {
                     self.error(call_span, format!("unknown function '{name}'"));
                     return;
                 };
                 let mut scope = BTreeMap::new();
-                self.bind_args(&params, args, call_span, &mut scope);
+                self.bind_args(params, args, call_span, &mut scope);
                 self.locals.push(scope);
                 self.eval_statements(&block.statements, target);
                 self.locals.pop();

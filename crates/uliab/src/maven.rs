@@ -455,6 +455,11 @@ impl Resolver {
     /// dependency of a dependency participates in conflict resolution like
     /// any other occurrence of its `group:artifact`.
     ///
+    /// `resolve` is a pure function of its arguments and the resolver's
+    /// repositories and cache directory: each call walks a fresh graph and
+    /// retains no mutable state between calls, so a single resolver may be
+    /// reused (and called concurrently) across independent declarations.
+    ///
     /// # Errors
     ///
     /// Returns [`ResolveError::NotFound`] when an artifact is absent from
