@@ -458,7 +458,7 @@ impl Resolver {
     /// `resolve` is a pure function of its arguments and the resolver's
     /// repositories and cache directory: each call walks a fresh graph and
     /// retains no mutable state between calls, so a single resolver may be
-    /// reused (and called concurrently) across independent declarations.
+    /// reused across independent declarations.
     ///
     /// # Errors
     ///

@@ -1504,9 +1504,9 @@ fn resolve_source_set_classpaths(
         let mut path = vec![key.clone()];
         collect_source_set_deps(&mut blocks, &mut path, value)?;
     }
-    // A resolver is reusable across independent declarations (§`Resolver`),
-    // so one instance serves every source set instead of cloning the
-    // repository list per block.
+    // A resolver is reusable across independent declarations (its `resolve`
+    // is stateless), so one instance serves every source set instead of
+    // cloning the repository list per block.
     let resolver = maven::Resolver::new(repos.to_vec(), cache_dir);
     let mut resolved = Vec::new();
     for (path, deps) in blocks {
