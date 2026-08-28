@@ -932,8 +932,11 @@ fn resolve_tool_binary(tool: AllowlistedTool, args: &[String]) -> Option<PathBuf
             resolve_build_tools_binary(tool, args)
         }
         _ => {
-            let dirs: Vec<PathBuf> =
-                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+            // An unset `PATH` resolves to nothing (the unresolved-tool
+            // marker) rather than probing the current directory, which an
+            // empty-path probe would otherwise do.
+            let path_var = std::env::var_os("PATH")?;
+            let dirs: Vec<PathBuf> = std::env::split_paths(&path_var).collect();
             resolve_on_path(tool.as_str(), &dirs)
         }
     }
@@ -1462,16 +1465,14 @@ mod tests {
         assert!(error.contains("out.txt"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_on_path_finds_the_executable_binary() {
+        use std::os::unix::fs::PermissionsExt;
         let root = temp_dir("resolve-path");
         std::fs::write(root.join("javac"), "fake-tool").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(root.join("javac"), std::fs::Permissions::from_mode(0o755))
-                .unwrap();
-        }
+        std::fs::set_permissions(root.join("javac"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
         assert_eq!(
             resolve_on_path("javac", std::slice::from_ref(&root)),
             Some(root.join("javac"))
