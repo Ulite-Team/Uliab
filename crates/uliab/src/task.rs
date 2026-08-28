@@ -917,10 +917,18 @@ fn resolve_tool_binary(tool: AllowlistedTool, args: &[String]) -> Option<PathBuf
     match tool {
         AllowlistedTool::Aapt2 | AllowlistedTool::Apksigner => {
             let dir = args.first()?;
-            let names: &[&str] = match tool {
-                AllowlistedTool::Apksigner if cfg!(windows) => &["apksigner.bat", "apksigner.exe"],
-                AllowlistedTool::Aapt2 => &["aapt2"],
-                _ => &[tool.as_str()],
+            // `aapt2` lives at `<dir>/aapt2` on Unix and `<dir>/aapt2.exe`
+            // on Windows — the same name [`resolve_tool`] uses to spawn it,
+            // so the hashed binary is always the binary that runs.
+            if tool == AllowlistedTool::Aapt2 {
+                let binary =
+                    PathBuf::from(dir).join(format!("aapt2{}", std::env::consts::EXE_SUFFIX));
+                return binary.is_file().then_some(binary);
+            }
+            let names: &[&str] = if cfg!(windows) {
+                &["apksigner.bat", "apksigner.exe"]
+            } else {
+                &["apksigner"]
             };
             names
                 .iter()
@@ -944,9 +952,14 @@ fn resolve_on_path(name: &str) -> Option<PathBuf> {
             .map(|value| {
                 std::env::split_paths(&value)
                     .filter_map(|part| {
-                        part.extension()
-                            .map(|ext| ext.to_string_lossy().into_owned())
+                        part.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .map(|name| name.trim_start_matches('.').to_owned())
                     })
+                    // PATHEXT entries are dot-led (`.EXE`); `extension`
+                    // would drop them as hidden files, so the dot is
+                    // stripped and the suffix rebuilt as `<name>.<ext>`.
+                    .filter(|ext| !ext.is_empty())
                     .collect()
             })
             .unwrap_or_else(|| vec!["EXE".to_owned(), "BAT".to_owned(), "CMD".to_owned()]);
@@ -1343,7 +1356,7 @@ mod tests {
         let root = temp_dir("tool-fp");
         let build_tools = root.join("build-tools/36.0.0");
         std::fs::create_dir_all(&build_tools).unwrap();
-        let binary = build_tools.join("aapt2");
+        let binary = build_tools.join(format!("aapt2{}", std::env::consts::EXE_SUFFIX));
         std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
         #[cfg(unix)]
         {
