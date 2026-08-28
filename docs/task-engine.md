@@ -68,9 +68,9 @@ Fingerprints are SHA-256 content hashes folded over:
 - the resolved dependency graph,
 - each declared file input's content (an absent input hashes as absent),
 - the registering plugin version,
-- the tool version, as the resolved executable's path and content digest
+- the resolved executable's path and content digest for `run-tool` actions
   (`PATH`-resolved for most tools; a concrete `build-tools` file for the
-  Android tools), so a switched install invalidates the task.
+  Android tools), so a switched or upgraded install invalidates the task.
 
 The fingerprint is computed once per task per wave — once for
 classification and reused on success — and the action is rendered

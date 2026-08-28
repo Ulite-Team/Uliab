@@ -852,57 +852,70 @@ fn verify_outputs(task: &Task) -> Result<(), String> {
 /// Resolves the binary a `run-tool` action invokes, paired with the
 /// arguments that belong to it.
 ///
-/// Most tools run by their bare name on the `PATH`. `aapt2` is different:
-/// it ships inside an Android SDK `build-tools` directory rather than on
-/// the `PATH`, so the action carries that directory as its first argument
-/// and the host resolves `<dir>/aapt2`, stripping the directory from the
-/// arguments the tool actually receives.
+/// Most tools run by their bare name on the `PATH`. `aapt2`/`apksigner` ship
+/// inside an Android SDK `build-tools` directory rather than on the `PATH`,
+/// so the action carries that directory as its first argument and the host
+/// resolves `<dir>/<binary>`, stripping the directory from the arguments the
+/// tool actually receives.
 fn resolve_tool(tool: AllowlistedTool, args: &[String]) -> Result<(String, &[String]), String> {
     match tool {
-        AllowlistedTool::Aapt2 => {
-            let dir = args.first().ok_or_else(|| {
-                "tool 'aapt2' requires the build-tools directory as its first argument".to_owned()
-            })?;
-            let binary = std::path::PathBuf::from(dir)
-                .join(format!("aapt2{}", std::env::consts::EXE_SUFFIX));
-            if !binary.exists() {
-                return Err(format!(
-                    "aapt2 binary '{}' does not exist",
-                    binary.display()
-                ));
-            }
-            Ok((binary.display().to_string(), &args[1..]))
-        }
-        AllowlistedTool::Apksigner => {
-            let dir = args.first().ok_or_else(|| {
-                "tool 'apksigner' requires the build-tools directory as its first argument"
-                    .to_owned()
-            })?;
-            let base = std::path::PathBuf::from(dir);
-            let candidates: Vec<String> = if cfg!(windows) {
-                vec!["apksigner.bat".to_owned(), "apksigner.exe".to_owned()]
-            } else {
-                vec!["apksigner".to_owned()]
-            };
-            let mut found = None;
-            for name in &candidates {
-                let path = base.join(name);
-                if path.exists() {
-                    found = Some(path);
-                    break;
-                }
-            }
-            let binary = found.ok_or_else(|| {
+        AllowlistedTool::Aapt2 | AllowlistedTool::Apksigner => {
+            let _dir = args.first().ok_or_else(|| {
                 format!(
-                    "apksigner binary not found in '{}' (looked for {})",
-                    dir,
-                    candidates.join(", ")
+                    "tool '{}' requires the build-tools directory as its first argument",
+                    tool.as_str()
                 )
+            })?;
+            let binary = resolve_build_tools_binary(tool, args).ok_or_else(|| match tool {
+                AllowlistedTool::Aapt2 => {
+                    let dir = args.first().expect("dir checked above");
+                    let name = format!("aapt2{}", std::env::consts::EXE_SUFFIX);
+                    format!(
+                        "aapt2 binary '{}' does not exist",
+                        PathBuf::from(dir).join(name).display()
+                    )
+                }
+                _ => {
+                    let dir = args.first().expect("dir checked above");
+                    let looked = if cfg!(windows) {
+                        "apksigner.bat, apksigner.exe"
+                    } else {
+                        "apksigner"
+                    };
+                    format!(
+                        "apksigner binary not found in '{}' (looked for {looked})",
+                        dir
+                    )
+                }
             })?;
             Ok((binary.display().to_string(), &args[1..]))
         }
         _ => Ok((tool.as_str().to_owned(), args)),
     }
+}
+
+/// Resolves the concrete `build-tools` file an Android tool action names,
+/// shared by the runtime spawner and the fingerprinter so the two always
+/// agree on which file will run. Returns `None` when the directory argument
+/// is present but no candidate exists; the caller reports the missing
+/// directory argument itself.
+#[must_use]
+fn resolve_build_tools_binary(tool: AllowlistedTool, args: &[String]) -> Option<PathBuf> {
+    let dir = args.first()?;
+    if tool == AllowlistedTool::Aapt2 {
+        // Lives at `<dir>/aapt2` on Unix and `<dir>/aapt2.exe` on Windows.
+        let binary = PathBuf::from(dir).join(format!("aapt2{}", std::env::consts::EXE_SUFFIX));
+        return binary.is_file().then_some(binary);
+    }
+    let names: &[&str] = if cfg!(windows) {
+        &["apksigner.bat", "apksigner.exe"]
+    } else {
+        &["apksigner"]
+    };
+    names
+        .iter()
+        .map(|name| PathBuf::from(dir).join(name))
+        .find(|path| path.is_file())
 }
 
 /// Resolves the concrete executable file a `run-tool` action will invoke,
@@ -916,45 +929,30 @@ fn resolve_tool(tool: AllowlistedTool, args: &[String]) -> Result<(String, &[Str
 fn resolve_tool_binary(tool: AllowlistedTool, args: &[String]) -> Option<PathBuf> {
     match tool {
         AllowlistedTool::Aapt2 | AllowlistedTool::Apksigner => {
-            let dir = args.first()?;
-            // `aapt2` lives at `<dir>/aapt2` on Unix and `<dir>/aapt2.exe`
-            // on Windows — the same name [`resolve_tool`] uses to spawn it,
-            // so the hashed binary is always the binary that runs.
-            if tool == AllowlistedTool::Aapt2 {
-                let binary =
-                    PathBuf::from(dir).join(format!("aapt2{}", std::env::consts::EXE_SUFFIX));
-                return binary.is_file().then_some(binary);
-            }
-            let names: &[&str] = if cfg!(windows) {
-                &["apksigner.bat", "apksigner.exe"]
-            } else {
-                &["apksigner"]
-            };
-            names
-                .iter()
-                .map(|name| PathBuf::from(dir).join(name))
-                .find(|path| path.is_file())
+            resolve_build_tools_binary(tool, args)
         }
-        _ => resolve_on_path(tool.as_str()),
+        _ => {
+            let dirs: Vec<PathBuf> =
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+            resolve_on_path(tool.as_str(), &dirs)
+        }
     }
 }
 
-/// Searches the `PATH` for the first executable matching `name`, returning
-/// its path, or `None` when no candidate exists. The platform `PATH`
-/// separator and Windows executable suffixes are honored so the resolved
-/// file matches the one that would actually run.
+/// Searches `dirs` for the first executable matching `name`, returning its
+/// path, or `None` when no candidate exists. The Windows executable
+/// suffixes (from `PATHEXT`) are honored so the resolved file matches the
+/// one that would actually run.
 #[must_use]
-fn resolve_on_path(name: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    let dirs = std::env::split_paths(&path_var);
+fn resolve_on_path(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     if cfg!(windows) {
         let exts: Vec<String> = std::env::var_os("PATHEXT")
             .map(|value| {
                 std::env::split_paths(&value)
                     .filter_map(|part| {
                         part.file_name()
-                            .map(|name| name.to_string_lossy().into_owned())
-                            .map(|name| name.trim_start_matches('.').to_owned())
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .map(|n| n.trim_start_matches('.').to_owned())
                     })
                     // PATHEXT entries are dot-led (`.EXE`); `extension`
                     // would drop them as hidden files, so the dot is
@@ -963,14 +961,16 @@ fn resolve_on_path(name: &str) -> Option<PathBuf> {
                     .collect()
             })
             .unwrap_or_else(|| vec!["EXE".to_owned(), "BAT".to_owned(), "CMD".to_owned()]);
-        dirs.flat_map(move |dir| {
-            let exts = exts.clone();
-            exts.into_iter()
-                .map(move |ext| dir.join(format!("{name}.{ext}")))
-        })
-        .find(|path| path.is_file())
+        dirs.iter()
+            .flat_map(move |dir| {
+                let exts = exts.clone();
+                exts.into_iter()
+                    .map(move |ext| dir.join(format!("{name}.{ext}")))
+            })
+            .find(|path| path.is_file())
     } else {
-        dirs.map(move |dir| dir.join(name))
+        dirs.iter()
+            .map(move |dir| dir.join(name))
             .filter(|path| path.is_file())
             .find(|path| executable_on_unix(path.as_path()))
     }
@@ -1437,6 +1437,73 @@ mod tests {
             .execute(&graph, &ctx("cfg"), &mut store)
             .expect("schedules");
         assert!(second.failure.is_some());
+    }
+
+    #[test]
+    fn a_copy_that_misses_its_declared_output_fails() {
+        let root = temp_dir("copy-missing-output");
+        std::fs::write(root.join("src.txt"), "data").unwrap();
+        let task = Task::leaf(
+            "stage",
+            "app",
+            vec![],
+            vec![root.join("out.txt")],
+            // The action succeeds but writes a different file than the
+            // declared output — a path mismatch that must be a failure.
+            TaskAction::Copy {
+                from: root.join("src.txt"),
+                to: root.join("produced.txt"),
+            },
+        );
+        let error = Executor::new([])
+            .run_task(&task)
+            .expect_err("declared output missing");
+        assert!(error.contains("declared output"));
+        assert!(error.contains("out.txt"));
+    }
+
+    #[test]
+    fn resolve_on_path_finds_the_executable_binary() {
+        let root = temp_dir("resolve-path");
+        std::fs::write(root.join("javac"), "fake-tool").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root.join("javac"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        assert_eq!(
+            resolve_on_path("javac", std::slice::from_ref(&root)),
+            Some(root.join("javac"))
+        );
+    }
+
+    #[test]
+    fn resolve_on_path_returns_none_for_an_absent_tool() {
+        let root = temp_dir("resolve-absent");
+        assert_eq!(resolve_on_path("javac", std::slice::from_ref(&root)), None);
+        assert_eq!(resolve_on_path("javac", &[]), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_on_path_continues_past_a_non_executable_to_a_later_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_dir("resolve-continue");
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("javac"), "not-executable").unwrap();
+        std::fs::write(second.join("javac"), "executable").unwrap();
+        std::fs::set_permissions(first.join("javac"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        std::fs::set_permissions(second.join("javac"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert_eq!(
+            resolve_on_path("javac", &[first, second]),
+            Some(root.join("second/javac"))
+        );
     }
 
     /// Deterministic, non-trivial content that crosses many 16 KiB

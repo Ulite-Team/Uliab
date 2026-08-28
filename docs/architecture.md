@@ -506,8 +506,13 @@ cases the engine knows about.
    (declaration order) so builds are reproducible.
 3. **UP-TO-DATE:** a task is skipped iff every input fingerprint matches
    the recorded fingerprints of the last successful run (§10 below) and
-   all of its dependencies ran UP-TO-DATE.
-4. **Failure semantics:** a failing task marks the build failed;
+   all of its dependencies ran UP-TO-DATE. A `run-tool` fingerprint also
+   covers the resolved executable's path and content digest, so a switched
+   or upgraded tool re-runs its tasks.
+4. **Output verification:** after a successful run every declared output
+   must exist; a task that exits 0 yet writes none of its outputs is
+   reported as a failure and not recorded UP-TO-DATE (§10).
+5. **Failure semantics:** a failing task marks the build failed;
    dependents are not started; already-scheduled independent tasks
    continue to completion. No partial-success reporting.
 
