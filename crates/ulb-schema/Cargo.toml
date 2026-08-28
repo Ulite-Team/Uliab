@@ -8,6 +8,7 @@ keywords = ["build", "schema", "wasm"]
 categories = ["development-tools::build-utils"]
 
 [dependencies]
+ulb-lang = { path = "../ulb-lang" }
 wasmparser = "0.219"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

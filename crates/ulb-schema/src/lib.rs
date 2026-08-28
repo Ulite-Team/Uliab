@@ -19,6 +19,8 @@
 
 #![warn(missing_docs)]
 
+pub mod plugin;
+
 use serde::{Deserialize, Serialize};
 
 /// The wasm custom section name where a `#[derive(UlbConfig)]` plugin
