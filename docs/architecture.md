@@ -784,15 +784,21 @@ Android logic).
 - A task's **input fingerprint** covers: every `.ulb` file it depends on
   (project files, conventions, catalog), the resolved plugin versions
   (`name@version`), the resolved dependency classpath for the module, the
-  task's declared input files (a missing file hashes as absent), and the
-  rendered action string (tool + arguments). A change to any of them
+  task's declared input files (a missing file hashes as absent), the
+  rendered action string (tool + arguments), and — for `run-tool` actions —
+  the resolved executable's path and content digest, so a switched install
+  (a JDK or Kotlin upgrade) invalidates the task. A change to any of them
   invalidates the task. Content-addressed, not timestamp-based.
 - A task is UP-TO-DATE when its current input fingerprint equals the
   recorded one and all dependencies are UP-TO-DATE (§4.2).
+- After a successful run, every **declared output** must exist; a task
+  that exits 0 yet writes none of its outputs is reported as a failure and
+  is not recorded up-to-date, so a silently-missing artifact is never
+  hashed as present downstream.
 - Fingerprints are persisted in the project's `.uliab/state.json`
-  (versioned format). Output files are *not* fingerprinted — a task
-  whose outputs were deleted externally is not re-run. Known limitation,
-  tracked.
+  (versioned format). Output *contents* are not fingerprinted — a task
+  whose outputs were deleted or edited externally is not re-run. Known
+  limitation, tracked.
 - No remote cache this pass; the fingerprint format should not preclude
   one later.
 

@@ -12,9 +12,12 @@ Task { name, module, inputs, outputs, depends_on, action }
 
 - `name` is module-scoped; `module` disambiguates tasks from different
   plugins.
-- `inputs` / `outputs` are file paths the engine fingerprints. Outputs
-  declared by one task may be consumed by another task's inputs, but
-  `depends_on` edges are the only thing that orders execution.
+- `inputs` / `outputs` are file paths. Inputs feed the task's fingerprint;
+  after a successful run every declared output must exist, so a task that
+  exits 0 yet writes none of its outputs fails instead of being recorded
+  up-to-date. Outputs declared by one task may be consumed by another
+  task's inputs, but `depends_on` edges are the only thing that orders
+  execution.
 - `action` is one of:
   - `Copy { from, to }`
   - `WriteFile { to, contents }` — `contents` participates in the fingerprint
@@ -65,7 +68,9 @@ Fingerprints are SHA-256 content hashes folded over:
 - the resolved dependency graph,
 - each declared file input's content (an absent input hashes as absent),
 - the registering plugin version,
-- the tool version.
+- the tool version, as the resolved executable's path and content digest
+  (`PATH`-resolved for most tools; a concrete `build-tools` file for the
+  Android tools), so a switched install invalidates the task.
 
 The fingerprint is computed once per task per wave — once for
 classification and reused on success — and the action is rendered

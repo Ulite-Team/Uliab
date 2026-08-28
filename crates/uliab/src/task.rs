@@ -139,8 +139,11 @@ pub struct Task {
     /// input may not exist yet when the task is scheduled — it is then
     /// fingerprinted as absent and will run.
     pub inputs: Vec<PathBuf>,
-    /// Files the task is expected to produce (informational; the engine
-    /// does not act on them).
+    /// Files or directories the task is expected to produce. After a
+    /// successful run the executor checks each declared output exists; a
+    /// task that succeeds yet writes none of its outputs is a failure, so a
+    /// silently-missing artifact is never recorded up-to-date and hashed as
+    /// absent downstream.
     pub outputs: Vec<PathBuf>,
     /// Names of tasks in the same module that must succeed before this one
     /// runs. References an undefined task at schedule time.
@@ -572,7 +575,10 @@ impl Executor {
             .unwrap_or(1);
         let runner: Runner = {
             let allowlist = allowlist.clone();
-            Arc::new(move |task| run_action(&allowlist, task))
+            Arc::new(move |task| {
+                run_action(&allowlist, task)?;
+                verify_outputs(task)
+            })
         };
         Self {
             allowlist,
@@ -824,6 +830,25 @@ fn run_action(allowlist: &HashSet<AllowlistedTool>, task: &Task) -> Result<(), S
     }
 }
 
+/// Verifies that every declared output of `task` exists after its action
+/// ran. A tool that exits 0 yet writes none of its declared outputs (a
+/// misconfigured compiler, a path mismatch) is reported as a task failure
+/// rather than a silent success: recording the task up-to-date would leave
+/// the missing artifact to hash as absent the next time a dependent reads
+/// it.
+fn verify_outputs(task: &Task) -> Result<(), String> {
+    for output in &task.outputs {
+        if !output.exists() {
+            return Err(format!(
+                "task '{}' declared output '{}' but it does not exist after the action ran",
+                task.name,
+                output.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Resolves the binary a `run-tool` action invokes, paired with the
 /// arguments that belong to it.
 ///
@@ -880,11 +905,88 @@ fn resolve_tool(tool: AllowlistedTool, args: &[String]) -> Result<(String, &[Str
     }
 }
 
+/// Resolves the concrete executable file a `run-tool` action will invoke,
+/// for fingerprinting. Returns `Some(path)` when a real file backs the
+/// action and `None` when a `PATH`-resolved tool cannot be found or the
+/// action is malformed. The Android tools resolve to their concrete
+/// `build-tools` file; every other tool is resolved against the current
+/// `PATH`, so a switched install (a JDK or Kotlin upgrade) points at a
+/// different file and changes the task's fingerprint.
+#[must_use]
+fn resolve_tool_binary(tool: AllowlistedTool, args: &[String]) -> Option<PathBuf> {
+    match tool {
+        AllowlistedTool::Aapt2 | AllowlistedTool::Apksigner => {
+            let dir = args.first()?;
+            let names: &[&str] = match tool {
+                AllowlistedTool::Apksigner if cfg!(windows) => &["apksigner.bat", "apksigner.exe"],
+                AllowlistedTool::Aapt2 => &["aapt2"],
+                _ => &[tool.as_str()],
+            };
+            names
+                .iter()
+                .map(|name| PathBuf::from(dir).join(name))
+                .find(|path| path.is_file())
+        }
+        _ => resolve_on_path(tool.as_str()),
+    }
+}
+
+/// Searches the `PATH` for the first executable matching `name`, returning
+/// its path, or `None` when no candidate exists. The platform `PATH`
+/// separator and Windows executable suffixes are honored so the resolved
+/// file matches the one that would actually run.
+#[must_use]
+fn resolve_on_path(name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    let dirs = std::env::split_paths(&path_var);
+    if cfg!(windows) {
+        let exts: Vec<String> = std::env::var_os("PATHEXT")
+            .map(|value| {
+                std::env::split_paths(&value)
+                    .filter_map(|part| {
+                        part.extension()
+                            .map(|ext| ext.to_string_lossy().into_owned())
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| vec!["EXE".to_owned(), "BAT".to_owned(), "CMD".to_owned()]);
+        dirs.flat_map(move |dir| {
+            let exts = exts.clone();
+            exts.into_iter()
+                .map(move |ext| dir.join(format!("{name}.{ext}")))
+        })
+        .find(|path| path.is_file())
+    } else {
+        dirs.map(move |dir| dir.join(name))
+            .filter(|path| path.is_file())
+            .find(|path| executable_on_unix(path.as_path()))
+    }
+}
+
+/// Whether a file is executable, checked on Unix by the owner/group/other
+/// execute bits. On non-Unix there is no portable bit to test, so any file
+/// is treated as executable and resolution relies on the `is_file` filter.
+#[cfg(unix)]
+fn executable_on_unix(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// Non-Unix counterpart of [`executable_on_unix`]: every file passes.
+#[cfg(not(unix))]
+fn executable_on_unix(_path: &Path) -> bool {
+    true
+}
+
 /// Content-addressed fingerprint of a task's inputs (ARCHITECTURE §10):
 /// the plugin version, the configuration hash, the contents of each
 /// declared input file (missing inputs hash as absent), a directory input
-/// hashed as its tree of relative paths and file contents, and a rendering
-/// of the action itself so a changed action forces a rerun.
+/// hashed as its tree of relative paths and file contents, a rendering
+/// of the action itself so a changed action forces a rerun, and — for
+/// `run-tool` actions — the resolved executable's path and content digest
+/// so a switched tool install invalidates the task.
 fn fingerprint(task: &Task, ctx: &FingerprintContext) -> String {
     let mut hasher = Sha256::new();
     hasher.update(ctx.plugin_version.as_bytes());
@@ -905,7 +1007,32 @@ fn fingerprint(task: &Task, ctx: &FingerprintContext) -> String {
     }
     hasher.update([0u8]);
     hasher.update(render_action(&task.action).as_bytes());
+    if let TaskAction::RunTool { tool, args, .. } = &task.action {
+        hash_run_tool_binary(&mut hasher, *tool, args);
+    }
     hex(&hasher.finalize())
+}
+
+/// Hashes the executable a `run-tool` action invokes into `hasher`, so a
+/// switched install (a JDK or Kotlin upgrade) changes the fingerprint and
+/// reruns the task. The binary is identified by its resolved path followed
+/// by its content digest; a `PATH`-resolved tool that cannot currently be
+/// found, or a malformed Android action, contributes a fixed "unresolved"
+/// marker — there is no file to hash, and the run would fail at execution
+/// time anyway.
+fn hash_run_tool_binary(hasher: &mut Sha256, tool: AllowlistedTool, args: &[String]) {
+    match resolve_tool_binary(tool, args) {
+        Some(binary) => {
+            hasher.update([3u8]);
+            hasher.update(binary.as_os_str().as_encoded_bytes());
+            hasher.update([0u8]);
+            match streamed_digest(&binary) {
+                Some(digest) => hasher.update(digest),
+                None => hasher.update([0u8]),
+            }
+        }
+        None => hasher.update(b"unresolved-tool"),
+    }
 }
 
 /// Hashes the tree under `dir` into `hasher`: each file's path relative
@@ -1209,6 +1336,94 @@ mod tests {
 
         std::fs::remove_file(dir.join("values/extra.xml")).unwrap();
         assert_eq!(baseline, fingerprint(&task, &ctx("cfg")));
+    }
+
+    #[test]
+    fn run_tool_fingerprint_tracks_the_resolved_binary_contents() {
+        let root = temp_dir("tool-fp");
+        let build_tools = root.join("build-tools/36.0.0");
+        std::fs::create_dir_all(&build_tools).unwrap();
+        let binary = build_tools.join("aapt2");
+        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let task = Task::leaf(
+            "compile",
+            "app",
+            vec![],
+            vec![],
+            TaskAction::RunTool {
+                tool: AllowlistedTool::Aapt2,
+                args: vec![build_tools.display().to_string(), "link".to_owned()],
+                cwd: root.clone(),
+            },
+        );
+
+        let baseline = fingerprint(&task, &ctx("cfg"));
+        assert_eq!(baseline, fingerprint(&task, &ctx("cfg")));
+
+        // A different installed binary (an SDK/toolchain upgrade) must
+        // invalidate the task even though the action is byte-for-byte equal.
+        std::fs::write(&binary, "#!/bin/sh\nexit 0\n# v2\n").unwrap();
+        assert_ne!(baseline, fingerprint(&task, &ctx("cfg")));
+    }
+
+    #[test]
+    fn a_successful_action_that_misses_its_declared_output_fails() {
+        let root = temp_dir("missing-output");
+        let task = Task::leaf(
+            "compile",
+            "app",
+            vec![],
+            vec![root.join("out/Cls.class")],
+            TaskAction::RunTool {
+                tool: AllowlistedTool::Echo,
+                args: vec!["x".to_owned()],
+                cwd: root.clone(),
+            },
+        );
+        let error = Executor::new([AllowlistedTool::Echo])
+            .run_task(&task)
+            .expect_err("missing output");
+        assert!(error.contains("declared output"));
+        assert!(error.contains("Cls.class"));
+    }
+
+    #[test]
+    fn output_verification_refuses_to_record_a_missing_artifact() {
+        let root = temp_dir("output-not-recorded");
+        let mut graph = TaskGraph::new();
+        graph
+            .register(Task::leaf(
+                "compile",
+                "app",
+                vec![],
+                vec![root.join("out/Cls.class")],
+                TaskAction::RunTool {
+                    tool: AllowlistedTool::Echo,
+                    args: vec!["x".to_owned()],
+                    cwd: root.clone(),
+                },
+            ))
+            .unwrap();
+
+        let mut store = FingerprintStore::load(root.join("state.json")).unwrap();
+        let first = Executor::new([AllowlistedTool::Echo])
+            .execute(&graph, &ctx("cfg"), &mut store)
+            .expect("schedules");
+        let failure = first.failure.expect("missing output should fail");
+        assert!(failure.error.contains("declared output"));
+
+        // The missing artifact was not recorded up-to-date, so the task
+        // still runs (and still fails) on the next build instead of being
+        // skipped and leaving the absent output to hash as present.
+        let second = Executor::new([AllowlistedTool::Echo])
+            .execute(&graph, &ctx("cfg"), &mut store)
+            .expect("schedules");
+        assert!(second.failure.is_some());
     }
 
     /// Deterministic, non-trivial content that crosses many 16 KiB
