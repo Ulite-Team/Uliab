@@ -506,8 +506,13 @@ cases the engine knows about.
    (declaration order) so builds are reproducible.
 3. **UP-TO-DATE:** a task is skipped iff every input fingerprint matches
    the recorded fingerprints of the last successful run (§10 below) and
-   all of its dependencies ran UP-TO-DATE.
-4. **Failure semantics:** a failing task marks the build failed;
+   all of its dependencies ran UP-TO-DATE. A `run-tool` fingerprint also
+   covers the resolved executable's path and content digest, so a switched
+   or upgraded tool re-runs its tasks.
+4. **Output verification:** after a successful run every declared output
+   must exist; a task that exits 0 yet writes none of its outputs is
+   reported as a failure and not recorded UP-TO-DATE (§10).
+5. **Failure semantics:** a failing task marks the build failed;
    dependents are not started; already-scheduled independent tasks
    continue to completion. No partial-success reporting.
 
@@ -784,15 +789,21 @@ Android logic).
 - A task's **input fingerprint** covers: every `.ulb` file it depends on
   (project files, conventions, catalog), the resolved plugin versions
   (`name@version`), the resolved dependency classpath for the module, the
-  task's declared input files (a missing file hashes as absent), and the
-  rendered action string (tool + arguments). A change to any of them
+  task's declared input files (a missing file hashes as absent), the
+  rendered action string (tool + arguments), and — for `run-tool` actions —
+  the resolved executable's path and content digest, so a switched install
+  (a JDK or Kotlin upgrade) invalidates the task. A change to any of them
   invalidates the task. Content-addressed, not timestamp-based.
 - A task is UP-TO-DATE when its current input fingerprint equals the
   recorded one and all dependencies are UP-TO-DATE (§4.2).
+- After a successful run, every **declared output** must exist; a task
+  that exits 0 yet writes none of its outputs is reported as a failure and
+  is not recorded up-to-date, so a silently-missing artifact is never
+  hashed as present downstream.
 - Fingerprints are persisted in the project's `.uliab/state.json`
-  (versioned format). Output files are *not* fingerprinted — a task
-  whose outputs were deleted externally is not re-run. Known limitation,
-  tracked.
+  (versioned format). Output *contents* are not fingerprinted — a task
+  whose outputs were deleted or edited externally is not re-run. Known
+  limitation, tracked.
 - No remote cache this pass; the fingerprint format should not preclude
   one later.
 
