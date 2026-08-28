@@ -119,78 +119,11 @@ pub struct RegistryIndex {
     pub plugins: BTreeMap<String, PluginIndexEntry>,
 }
 
-/// A plugin reference extracted from a `libs.ulb` `plugins {}` table.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PluginSpec {
-    /// Plugin name as it resolves in the registry, e.g. `ulite/hello`.
-    pub name: String,
-    /// Pinned version, or `None` to resolve the newest compatible build.
-    pub version: Option<String>,
-}
-
-impl PluginSpec {
-    /// Extracts a spec from the value the evaluator produced for one
-    /// `plugins { NAME = ... }` entry: a `"vendor/name" @ ref` reference
-    /// becomes a [`Value::Coordinate`] (`"name:version"`), an unversioned
-    /// one a [`Value::Str`].
-    ///
-    /// # Errors
-    ///
-    /// Returns a description of the problem when the value is not a plugin
-    /// reference (a non-string base, an invalid value, or a malformed
-    /// coordinate).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use uliab::registry::PluginSpec;
-    /// use ulb_lang::eval::Value;
-    ///
-    /// let versioned = PluginSpec::from_value(&Value::Coordinate(
-    ///     "ulite/hello:0.1.0".to_owned(),
-    /// )).expect("valid coordinate");
-    /// assert_eq!(versioned.name, "ulite/hello");
-    /// assert_eq!(versioned.version.as_deref(), Some("0.1.0"));
-    ///
-    /// let unversioned = PluginSpec::from_value(&Value::Str("ulite/hello".to_owned()))
-    ///     .expect("valid name");
-    /// assert_eq!(unversioned.version, None);
-    ///
-    /// assert!(PluginSpec::from_value(&Value::Bool(true)).is_err());
-    /// ```
-    pub fn from_value(value: &ulb_lang::eval::Value) -> Result<Self, String> {
-        use ulb_lang::eval::Value;
-        match value {
-            Value::Coordinate(coordinate) => match coordinate.split_once(':') {
-                Some((name, version)) => Ok(Self {
-                    name: name.to_owned(),
-                    version: Some(version.to_owned()),
-                }),
-                None => Err(format!(
-                    "malformed plugin coordinate '{coordinate}' (expected 'name:version')"
-                )),
-            },
-            Value::Str(name) => Ok(Self {
-                name: name.clone(),
-                version: None,
-            }),
-            Value::Invalid(message) => Err(message.clone()),
-            other => Err(format!(
-                "plugin reference must be a string coordinate, got {}",
-                value_kind(other)
-            )),
-        }
-    }
-}
-
-impl std::fmt::Display for PluginSpec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.version {
-            Some(version) => write!(f, "{}@{}", self.name, version),
-            None => write!(f, "{}", self.name),
-        }
-    }
-}
+/// Shared plugin identity + cached-artifact path mapping (ARCHITECTURE.md
+/// §3.6). The canonical definition lives in the `ulb-schema` crate so the
+/// host and the editor integration derive the same `(name, version)` and
+/// the same on-disk `.wasm` path from a `libs.ulb` `plugins {}` value.
+pub use ulb_schema::plugin::PluginSpec;
 
 /// Where a registry index comes from.
 #[derive(Debug, Clone)]
@@ -321,7 +254,7 @@ impl Registry {
         });
         Self {
             source,
-            cache_dir: cache_dir.unwrap_or_else(default_cache_dir),
+            cache_dir: cache_dir.unwrap_or_else(ulb_schema::plugin::default_plugins_cache_dir),
             host_abi: ulb_plugin_sdk::ABI_VERSION.to_owned(),
             verifier,
         }
@@ -522,16 +455,6 @@ fn read_file(path: &Path, label: &str) -> Result<Vec<u8>, RegistryError> {
     })
 }
 
-fn default_cache_dir() -> PathBuf {
-    match std::env::var_os("HOME") {
-        Some(home) => PathBuf::from(home)
-            .join(".cache")
-            .join("uliab")
-            .join("plugins"),
-        None => PathBuf::from(".cache").join("uliab").join("plugins"),
-    }
-}
-
 /// Picks the version of `entry` to use for `spec` under host ABI
 /// `host_abi`, implementing the fallback of ARCHITECTURE.md §3.6.
 ///
@@ -626,22 +549,6 @@ pub fn compare_versions(a: &str, b: &str) -> Ordering {
 
 fn parse_segment(segment: &str) -> u64 {
     segment.parse().unwrap_or(0)
-}
-
-fn value_kind(value: &ulb_lang::eval::Value) -> &'static str {
-    use ulb_lang::eval::Value;
-    match value {
-        Value::Str(_) => "string",
-        Value::Number(_) => "number",
-        Value::Bool(_) => "boolean",
-        Value::List(_) => "list",
-        Value::Version(_) => "version",
-        Value::Properties(_) => "properties",
-        Value::Coordinate(_) => "coordinate",
-        Value::Block(_) => "block",
-        Value::Invalid(_) => "invalid",
-        Value::ProjectRef(_) => "project reference",
-    }
 }
 
 #[cfg(test)]

@@ -1711,6 +1711,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "ulb-lang",
  "wasmparser 0.219.2",
 ]
 
