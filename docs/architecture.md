@@ -595,11 +595,15 @@ via `--rename-manifest-package` to `aapt2 link`; APK signing via
 `apksigner` when the module's `signing {}` block is present (passwords
 written to temp files and passed via `--ks-pass file:`/`--key-pass
 file:`). Manifest merging and AAB packaging remain future slices of the
-same plugin. Compose is wired through: when `android.compose` is true the
-resolver injects the Compose BOM, the managed `runtime`/`ui`/`material3`
-artifacts, and the `org.jetbrains.kotlin:compose-compiler-plugin` jar, and
-the plugin passes that jar to `kotlinc` via `-Xplugin`, so `@Composable`
-sources compile.
+same plugin. Compose wiring: when `android.compose` is true the resolver
+injects the Compose BOM, the managed `runtime`/`ui`/`material3`
+artifacts, and the `org.jetbrains.kotlin:kotlin-compose-compiler-plugin`
+jar, and the plugin passes that jar to `kotlinc` via `-Xplugin`. The
+compiler plugin itself resolves as a plain jar. The `@Composable` API
+classes ship in the managed Android artifacts, which are AARs the
+jar-only Maven resolver does not yet unwrap, so a real `@Composable`
+compile still requires AAR materialization plus a kotlinc host (see
+`PROGRESS.md` observed issues).
 
 ### 5.3 `ulite/kmp` — depends on `ulite/jvm`, optionally `ulite/android`
 

@@ -1461,7 +1461,7 @@ fn compose_deps(model: &Value) -> Result<Option<Vec<maven::DeclaredDep>>, String
     let compiler = maven::DeclaredDep {
         scope,
         dependency: maven::Dependency::parse(&format!(
-            "org.jetbrains.kotlin:compose-compiler-plugin:{compiler_version}"
+            "org.jetbrains.kotlin:kotlin-compose-compiler-plugin:{compiler_version}"
         ))
         .map_err(|error| format!("invalid composeCompilerVersion '{compiler_version}': {error}"))?,
     };
@@ -2606,7 +2606,10 @@ mod tests {
         assert_eq!(deps[3].dependency.artifact, "material3");
         assert!(deps[3].dependency.is_version_managed());
         assert_eq!(deps[4].dependency.group, "org.jetbrains.kotlin");
-        assert_eq!(deps[4].dependency.artifact, "compose-compiler-plugin");
+        assert_eq!(
+            deps[4].dependency.artifact,
+            "kotlin-compose-compiler-plugin"
+        );
         assert_eq!(deps[4].dependency.version, DEFAULT_COMPOSE_COMPILER_VERSION);
     }
 
@@ -2637,7 +2640,10 @@ mod tests {
         let deps = compose_deps(&value)
             .expect("resolves")
             .expect("compose is true");
-        assert_eq!(deps[4].dependency.artifact, "compose-compiler-plugin");
+        assert_eq!(
+            deps[4].dependency.artifact,
+            "kotlin-compose-compiler-plugin"
+        );
         assert_eq!(deps[4].dependency.version, "2.1.20");
     }
 
@@ -2674,7 +2680,10 @@ mod tests {
             .expect("jvm.compose is true");
         assert_eq!(deps.len(), 5);
         assert_eq!(deps[0].dependency.artifact, "compose-bom");
-        assert_eq!(deps[4].dependency.artifact, "compose-compiler-plugin");
+        assert_eq!(
+            deps[4].dependency.artifact,
+            "kotlin-compose-compiler-plugin"
+        );
         assert_eq!(deps[4].dependency.version, DEFAULT_COMPOSE_COMPILER_VERSION);
     }
 
@@ -2690,7 +2699,10 @@ mod tests {
         let deps = compose_deps(&value)
             .expect("resolves")
             .expect("jvm.compose is true");
-        assert_eq!(deps[4].dependency.artifact, "compose-compiler-plugin");
+        assert_eq!(
+            deps[4].dependency.artifact,
+            "kotlin-compose-compiler-plugin"
+        );
         assert_eq!(deps[4].dependency.version, "2.0.21");
     }
 
@@ -2871,18 +2883,18 @@ mod tests {
         }
 
         let compiler_dir = repo_dir
-            .join("org/jetbrains/kotlin/compose-compiler-plugin")
+            .join("org/jetbrains/kotlin/kotlin-compose-compiler-plugin")
             .join(DEFAULT_COMPOSE_COMPILER_VERSION);
         std::fs::create_dir_all(&compiler_dir).expect("create compiler dir");
         std::fs::write(
             compiler_dir.join(format!(
-                "compose-compiler-plugin-{DEFAULT_COMPOSE_COMPILER_VERSION}.pom"
+                "kotlin-compose-compiler-plugin-{DEFAULT_COMPOSE_COMPILER_VERSION}.pom"
             )),
             format!(
                 "<?xml version=\"1.0\"?><project>\
                  <modelVersion>4.0.0</modelVersion>\
                  <groupId>org.jetbrains.kotlin</groupId>\
-                 <artifactId>compose-compiler-plugin</artifactId>\
+                 <artifactId>kotlin-compose-compiler-plugin</artifactId>\
                  <version>{DEFAULT_COMPOSE_COMPILER_VERSION}</version>\
                  </project>"
             ),
@@ -2890,7 +2902,7 @@ mod tests {
         .expect("write compiler pom");
         std::fs::write(
             compiler_dir.join(format!(
-                "compose-compiler-plugin-{DEFAULT_COMPOSE_COMPILER_VERSION}.jar"
+                "kotlin-compose-compiler-plugin-{DEFAULT_COMPOSE_COMPILER_VERSION}.jar"
             )),
             b"jar",
         )
@@ -2947,7 +2959,7 @@ mod tests {
         assert!(
             compile_jars
                 .iter()
-                .any(|j| j.contains("compose-compiler-plugin")),
+                .any(|j| j.contains("kotlin-compose-compiler-plugin")),
             "compose compiler plugin should be on compile classpath: {compile_jars:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
