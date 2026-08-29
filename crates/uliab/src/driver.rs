@@ -1372,47 +1372,73 @@ fn evaluate_project_dir(dir: &Path) -> Result<ulb_lang::eval::EvalOutcome, Strin
 /// `composeVersion` is specified in the `android {}` block.
 const DEFAULT_COMPOSE_BOM_VERSION: &str = "2026.08.00";
 
-/// When `android.compose = true` in the module model, returns the
-/// Compose BOM and standard runtime/UI deps that should be injected
-/// into the resolution. The BOM is declared with an explicit version;
-/// the standard artifacts are version-less (resolved from the BOM's
-/// `dependencyManagement`).
+/// Default version of the Compose compiler plugin injected when
+/// `compose = true`. Since Kotlin 2.0 the Compose compiler is released
+/// in lockstep with the Kotlin compiler, so this must match the version
+/// of `kotlinc` the build runs. Override per module with
+/// `android.composeCompilerVersion` (or `jvm.composeCompilerVersion`).
+const DEFAULT_COMPOSE_COMPILER_VERSION: &str = "2.3.10";
+
+/// When `android.compose = true` or `jvm.compose = true` in the module
+/// model, returns the Compose BOM, standard runtime/UI deps, and the
+/// Compose compiler plugin that should be injected into the resolution.
+/// The BOM and compiler plugin are declared with explicit versions; the
+/// standard runtime/UI artifacts are version-less (resolved from the
+/// BOM's `dependencyManagement`).
 ///
-/// The `composeVersion` key in the `android {}` block specifies the
-/// Compose BOM version (e.g. `"2026.08.00"` or `ver("2026.08.00")`);
-/// when omitted the default above is injected.
+/// The `composeVersion` key in the owning `android {}`/`jvm {}` block
+/// specifies the Compose BOM version (e.g. `"2026.08.00"` or
+/// `ver("2026.08.00")`); `composeCompilerVersion` specifies the Compose
+/// compiler plugin version. When either is omitted its default above is
+/// injected. The compiler plugin jar resolves into the module's
+/// `compile` classpath, where the android/kmp/jvm plugins pick it up to
+/// pass as `-Xplugin`. A plain-JVM compose module targets desktop
+/// Compose, so it receives the same managed runtime/UI set.
 ///
 /// # Errors
 ///
-/// Returns an error when `composeVersion` is present but not displayable
-/// as a coordinate version segment.
+/// Returns an error when `composeVersion`/`composeCompilerVersion` is
+/// present but not displayable as a coordinate version segment.
 fn compose_deps(model: &Value) -> Result<Option<Vec<maven::DeclaredDep>>, String> {
-    let android = match model {
-        Value::Block(entries) => entries.get("android"),
+    let entries = match model {
+        Value::Block(entries) => entries,
         _ => return Ok(None),
     };
-    let Some(android) = android else {
-        return Ok(None);
+    let block = match ["android", "jvm"]
+        .into_iter()
+        .filter_map(|name| match entries.get(name) {
+            Some(Value::Block(map)) => Some(map),
+            _ => None,
+        })
+        .find(|map| matches!(map.get("compose"), Some(Value::Bool(true))))
+    {
+        Some(block) => block,
+        None => return Ok(None),
     };
-    let compose = match android {
-        Value::Block(entries) => entries.get("compose"),
-        _ => return Ok(None),
+    let version_for = |key: &str| -> Result<String, String> {
+        match block.get(key) {
+            Some(Value::Str(v)) => Ok(v.clone()),
+            Some(v) => v
+                .as_display_string()
+                .ok_or_else(|| format!("{key} must be a string or version value")),
+            None => Ok(String::new()),
+        }
     };
-    let Some(compose) = compose else {
-        return Ok(None);
+    let compose_version = {
+        let v = version_for("composeVersion")?;
+        if v.is_empty() {
+            DEFAULT_COMPOSE_BOM_VERSION.to_owned()
+        } else {
+            v
+        }
     };
-    if !matches!(compose, Value::Bool(true)) {
-        return Ok(None);
-    }
-    let compose_version = match android {
-        Value::Block(entries) => match entries.get("composeVersion") {
-            Some(Value::Str(v)) => v.clone(),
-            Some(v) => v.as_display_string().ok_or_else(|| {
-                "android.composeVersion must be a string or version value".to_owned()
-            })?,
-            None => DEFAULT_COMPOSE_BOM_VERSION.to_owned(),
-        },
-        _ => DEFAULT_COMPOSE_BOM_VERSION.to_owned(),
+    let compiler_version = {
+        let v = version_for("composeCompilerVersion")?;
+        if v.is_empty() {
+            DEFAULT_COMPOSE_COMPILER_VERSION.to_owned()
+        } else {
+            v
+        }
     };
     let scope = maven::MavenScope::Implementation;
     let bom = maven::DeclaredDep {
@@ -1420,7 +1446,7 @@ fn compose_deps(model: &Value) -> Result<Option<Vec<maven::DeclaredDep>>, String
         dependency: maven::Dependency::parse(&format!(
             "androidx.compose:compose-bom:{compose_version}"
         ))
-        .map_err(|error| format!("invalid android.composeVersion '{compose_version}': {error}"))?,
+        .map_err(|error| format!("invalid composeVersion '{compose_version}': {error}"))?,
     };
     let managed = ["runtime", "ui", "material3"]
         .into_iter()
@@ -1432,8 +1458,16 @@ fn compose_deps(model: &Value) -> Result<Option<Vec<maven::DeclaredDep>>, String
             .expect("valid coordinate"),
         })
         .collect::<Vec<_>>();
+    let compiler = maven::DeclaredDep {
+        scope,
+        dependency: maven::Dependency::parse(&format!(
+            "org.jetbrains.kotlin:compose-compiler-plugin:{compiler_version}"
+        ))
+        .map_err(|error| format!("invalid composeCompilerVersion '{compiler_version}': {error}"))?,
+    };
     let mut deps = vec![bom];
     deps.extend(managed);
+    deps.push(compiler);
     Ok(Some(deps))
 }
 
@@ -2547,7 +2581,7 @@ mod tests {
     }
 
     #[test]
-    fn compose_deps_returns_bom_and_standard_artifacts() {
+    fn compose_deps_returns_bom_standard_artifacts_and_compiler_plugin() {
         let model = serde_json::json!({
             "android": {
                 "compose": true,
@@ -2558,7 +2592,7 @@ mod tests {
         let deps = compose_deps(&value)
             .expect("resolves")
             .expect("compose is true");
-        assert_eq!(deps.len(), 4);
+        assert_eq!(deps.len(), 5);
         assert_eq!(deps[0].dependency.group, "androidx.compose");
         assert_eq!(deps[0].dependency.artifact, "compose-bom");
         assert_eq!(deps[0].dependency.version, "3.1.0");
@@ -2571,10 +2605,13 @@ mod tests {
         assert_eq!(deps[3].dependency.group, "androidx.compose.material3");
         assert_eq!(deps[3].dependency.artifact, "material3");
         assert!(deps[3].dependency.is_version_managed());
+        assert_eq!(deps[4].dependency.group, "org.jetbrains.kotlin");
+        assert_eq!(deps[4].dependency.artifact, "compose-compiler-plugin");
+        assert_eq!(deps[4].dependency.version, DEFAULT_COMPOSE_COMPILER_VERSION);
     }
 
     #[test]
-    fn compose_deps_uses_default_version_when_no_compose_version() {
+    fn compose_deps_uses_default_versions_when_none_specified() {
         let model = serde_json::json!({
             "android": {
                 "compose": true
@@ -2585,6 +2622,23 @@ mod tests {
             .expect("resolves")
             .expect("compose is true");
         assert_eq!(deps[0].dependency.version, DEFAULT_COMPOSE_BOM_VERSION);
+        assert_eq!(deps[4].dependency.version, DEFAULT_COMPOSE_COMPILER_VERSION);
+    }
+
+    #[test]
+    fn compose_deps_honors_compiler_version_override() {
+        let model = serde_json::json!({
+            "android": {
+                "compose": true,
+                "composeCompilerVersion": "2.1.20"
+            }
+        });
+        let value = json_to_value(&model);
+        let deps = compose_deps(&value)
+            .expect("resolves")
+            .expect("compose is true");
+        assert_eq!(deps[4].dependency.artifact, "compose-compiler-plugin");
+        assert_eq!(deps[4].dependency.version, "2.1.20");
     }
 
     #[test]
@@ -2605,6 +2659,39 @@ mod tests {
         });
         let value = json_to_value(&model);
         assert!(compose_deps(&value).expect("resolves").is_none());
+    }
+
+    #[test]
+    fn compose_deps_injects_for_jvm_compose_block() {
+        let model = serde_json::json!({
+            "jvm": {
+                "compose": true
+            }
+        });
+        let value = json_to_value(&model);
+        let deps = compose_deps(&value)
+            .expect("resolves")
+            .expect("jvm.compose is true");
+        assert_eq!(deps.len(), 5);
+        assert_eq!(deps[0].dependency.artifact, "compose-bom");
+        assert_eq!(deps[4].dependency.artifact, "compose-compiler-plugin");
+        assert_eq!(deps[4].dependency.version, DEFAULT_COMPOSE_COMPILER_VERSION);
+    }
+
+    #[test]
+    fn compose_deps_honors_jvm_compiler_version_override() {
+        let model = serde_json::json!({
+            "jvm": {
+                "compose": true,
+                "composeCompilerVersion": "2.0.21"
+            }
+        });
+        let value = json_to_value(&model);
+        let deps = compose_deps(&value)
+            .expect("resolves")
+            .expect("jvm.compose is true");
+        assert_eq!(deps[4].dependency.artifact, "compose-compiler-plugin");
+        assert_eq!(deps[4].dependency.version, "2.0.21");
     }
 
     #[test]
@@ -2783,6 +2870,32 @@ mod tests {
             std::fs::write(dir.join(format!("{artifact}-1.0.jar")), b"jar").expect("write jar");
         }
 
+        let compiler_dir = repo_dir
+            .join("org/jetbrains/kotlin/compose-compiler-plugin")
+            .join(DEFAULT_COMPOSE_COMPILER_VERSION);
+        std::fs::create_dir_all(&compiler_dir).expect("create compiler dir");
+        std::fs::write(
+            compiler_dir.join(format!(
+                "compose-compiler-plugin-{DEFAULT_COMPOSE_COMPILER_VERSION}.pom"
+            )),
+            format!(
+                "<?xml version=\"1.0\"?><project>\
+                 <modelVersion>4.0.0</modelVersion>\
+                 <groupId>org.jetbrains.kotlin</groupId>\
+                 <artifactId>compose-compiler-plugin</artifactId>\
+                 <version>{DEFAULT_COMPOSE_COMPILER_VERSION}</version>\
+                 </project>"
+            ),
+        )
+        .expect("write compiler pom");
+        std::fs::write(
+            compiler_dir.join(format!(
+                "compose-compiler-plugin-{DEFAULT_COMPOSE_COMPILER_VERSION}.jar"
+            )),
+            b"jar",
+        )
+        .expect("write compiler jar");
+
         let model = Value::Block(
             [
                 (
@@ -2830,6 +2943,12 @@ mod tests {
         assert!(
             compile_jars.iter().any(|j| j.contains("material3-1.0")),
             "managed material3 should be on compile classpath: {compile_jars:?}"
+        );
+        assert!(
+            compile_jars
+                .iter()
+                .any(|j| j.contains("compose-compiler-plugin")),
+            "compose compiler plugin should be on compile classpath: {compile_jars:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }

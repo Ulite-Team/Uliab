@@ -594,12 +594,12 @@ tasks; flavor-level `minSdk` override and `applicationIdSuffix` passed
 via `--rename-manifest-package` to `aapt2 link`; APK signing via
 `apksigner` when the module's `signing {}` block is present (passwords
 written to temp files and passed via `--ks-pass file:`/`--key-pass
-file:`). Manifest merging, R8/minification, and AAB packaging remain
-future slices of the same plugin. **The Compose compiler plugin is not
-yet invoked** — plain `kotlinc` is run even when `android.compose` is
-true, so any `@Composable` source fails to compile; this is tracked as
-the top-priority gap in `PROGRESS.md`'s candidate-phases list, ahead of
-Phase 16.
+file:`). Manifest merging and AAB packaging remain future slices of the
+same plugin. Compose is wired through: when `android.compose` is true the
+resolver injects the Compose BOM, the managed `runtime`/`ui`/`material3`
+artifacts, and the `org.jetbrains.kotlin:compose-compiler-plugin` jar, and
+the plugin passes that jar to `kotlinc` via `-Xplugin`, so `@Composable`
+sources compile.
 
 ### 5.3 `ulite/kmp` — depends on `ulite/jvm`, optionally `ulite/android`
 
