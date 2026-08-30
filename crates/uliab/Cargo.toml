@@ -23,6 +23,9 @@ sha2 = "0.10"
 ureq = "3"
 # POM parsing for the Maven dependency resolver.
 quick-xml = "0.37"
+# Reading Android AAR archives (which are zip files) to extract their
+# classes.jar for the compile classpath.
+zip = "2"
 
 [lints]
 workspace = true

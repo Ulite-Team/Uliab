@@ -1436,15 +1436,14 @@ pub fn parse_kotlinc_version(output: &str) -> Option<String> {
         let bare = label.trim_matches(|c: char| !c.is_ascii_alphabetic());
         (bare == "version").then_some(next)
     });
-    let candidate = match after_version.or_else(|| {
-        tokens
-            .iter()
-            .find(|t| t.starts_with(|c: char| c.is_ascii_digit()))
-            .copied()
-    }) {
-        Some(token) => token.trim_start_matches(|c: char| !c.is_ascii_digit()),
-        None => return None,
-    };
+    let candidate = after_version
+        .or_else(|| {
+            tokens
+                .iter()
+                .find(|t| t.starts_with(|c: char| c.is_ascii_digit()))
+                .copied()
+        })?
+        .trim_start_matches(|c: char| !c.is_ascii_digit());
     parse_semver_prefix(candidate)
 }
 

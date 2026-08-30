@@ -600,10 +600,11 @@ injects the Compose BOM, the managed `runtime`/`ui`/`material3`
 artifacts, and the `org.jetbrains.kotlin:kotlin-compose-compiler-plugin`
 jar, and the plugin passes that jar to `kotlinc` via `-Xplugin`. The
 compiler plugin itself resolves as a plain jar. The `@Composable` API
-classes ship in the managed Android artifacts, which are AARs the
-jar-only Maven resolver does not yet unwrap, so a real `@Composable`
-compile still requires AAR materialization plus a kotlinc host (see
-`PROGRESS.md` observed issues).
+classes ship in the managed Android artifacts, which are AARs; the Maven
+resolver unwraps each AAR and contributes its extracted `classes.jar` to
+the compile classpath, so the API classes are reachable for a real
+`@Composable` compile (verified by the resolver's AAR tests; an end-to-end
+kotlinc-driven `@Composable` compile is a `PROGRESS.md` follow-up).
 
 ### 5.3 `ulite/kmp` — depends on `ulite/jvm`, optionally `ulite/android`
 
