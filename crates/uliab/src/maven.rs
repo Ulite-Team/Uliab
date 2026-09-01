@@ -338,6 +338,20 @@ pub struct Classpath {
     /// dependencies), so consumers can build a compile classpath without
     /// pulling in `implementation`-only deps.
     pub api: Vec<PathBuf>,
+    /// The Android Compose runtime artifacts the driver bundles with a
+    /// compiled Android module that uses `@Composable`: the `classes.jar`
+    /// of the `androidx.compose.runtime`, `androidx.compose.ui`, and
+    /// `androidx.compose.material3` artifacts, exactly as resolved from
+    /// the BOM.  These are a subset of [`compile`](Self::compile) — they
+    /// appear there too — but kept separate so an Android linker (d8) can
+    /// add exactly the runtime types the `@Composable` lowering emits
+    /// without scanning a flat classpath by filename.  This bucket is
+    /// produced by the host's `driver::compose_runtime_paths` — the
+    /// resolver itself leaves it empty, since the resolver cannot know
+    /// which resolved coordinates a caller treats as "Compose".  It stays
+    /// empty when the module does not use Compose or none of the runtime
+    /// artifacts resolved.
+    pub compose_runtimes: Vec<PathBuf>,
     /// Jars needed to compile unit tests.
     pub test_compile: Vec<PathBuf>,
     /// Jars needed to run unit tests.
@@ -351,8 +365,8 @@ pub struct Classpath {
 impl Classpath {
     /// Serializes the classpath to the JSON object handed to plugins as the
     /// `classpath` key of their configuration: one array of jar paths per
-    /// bucket, named as the buckets are in GRAMMAR.md Appendix B
-    /// (`compile`, `runtime`, `processor`, `api`, `testCompile`,
+    /// bucket, named as they appear here (`compile`, `runtime`,
+    /// `processor`, `api`, `composeRuntimes`, `testCompile`,
     /// `testRuntime`, `androidTestCompile`, `androidTestRuntime`). The
     /// output is deterministic: each bucket is already sorted by
     /// (`group`, `artifact`) when built by [`Resolver`].
@@ -369,6 +383,7 @@ impl Classpath {
             "runtime": path_list(&self.runtime),
             "processor": path_list(&self.processor),
             "api": path_list(&self.api),
+            "composeRuntimes": path_list(&self.compose_runtimes),
             "testCompile": path_list(&self.test_compile),
             "testRuntime": path_list(&self.test_runtime),
             "androidTestCompile": path_list(&self.android_test_compile),
@@ -384,9 +399,21 @@ impl Classpath {
 pub struct Resolution {
     /// The resolved classpath.
     pub classpath: Classpath,
+    /// The resolved path of each direct declared `deps {}` root coordinate
+    /// (keyed by `(group, artifact)`) that materialized to a jar or an AAR
+    /// `classes.jar`.  Coordinates that carry no artifact — a BOM, say, or
+    /// a dep that did not resolve — are absent.  This lets a caller that
+    /// injected extra declared deps (the host, for the Compose runtime
+    /// artifacts) resolve exactly which jar a known coordinate produced,
+    /// instead of scanning a flattened classpath bucket by filename.
+    pub root_paths: RootPaths,
     /// Human-readable notes about choices made during resolution.
     pub notes: Vec<String>,
 }
+
+/// The resolved file a direct declared root coordinate (`(group, artifact)`)
+/// materialized to, as returned in [`Resolution::root_paths`].
+pub type RootPaths = BTreeMap<(String, String), PathBuf>;
 
 /// Errors produced while resolving dependencies.
 #[derive(Debug, Clone)]
@@ -562,9 +589,10 @@ impl Resolver {
         }
 
         let winners = session.winners();
-        let classpath = session.classpath(declared, &winners)?;
+        let (classpath, root_paths) = session.classpath(declared, &winners)?;
         Ok(Resolution {
             classpath,
+            root_paths,
             notes: session.notes,
         })
     }
@@ -1370,12 +1398,17 @@ impl<'a> Session<'a> {
             .get(version)
     }
 
-    /// Builds the classpath buckets from the winning nodes.
+    /// Builds the classpath buckets from the winning nodes, along with the
+    /// resolved path of each direct declared root coordinate that
+    /// materialized to a jar or an AAR `classes.jar`. The root map is
+    /// derived from the same materializations that build the buckets (the
+    /// union of every bucket's coordinate-keyed paths), so no artifact is
+    /// fetched a second time.
     fn classpath(
         &mut self,
         declared: &[DeclaredDep],
         winners: &BTreeMap<(String, String), String>,
-    ) -> Result<Classpath, ResolveError> {
+    ) -> Result<(Classpath, RootPaths), ResolveError> {
         let roots = |scopes: &[MavenScope]| -> Vec<(String, String)> {
             declared
                 .iter()
@@ -1440,16 +1473,53 @@ impl<'a> Session<'a> {
             self.bucket(winners, &android_test_roots, Some(PomScope::Compile));
         let android_test_runtime = self.bucket(winners, &android_test_roots, None);
 
-        Ok(Classpath {
-            compile: self.materialize(&compile)?,
-            runtime: self.materialize(&runtime)?,
-            processor: self.materialize(&processor)?,
-            api: self.materialize(&api_direct)?,
-            test_compile: self.materialize(&merge(compile.clone(), test_compile))?,
-            test_runtime: self.materialize(&merge(runtime.clone(), test_runtime))?,
-            android_test_compile: self.materialize(&merge(compile, android_test_compile))?,
-            android_test_runtime: self.materialize(&merge(runtime, android_test_runtime))?,
-        })
+        let compile_paths = self.materialize(&compile)?;
+        let runtime_paths = self.materialize(&runtime)?;
+        let processor_paths = self.materialize(&processor)?;
+        let api_paths = self.materialize(&api_direct)?;
+        let test_compile_paths = self.materialize(&merge(compile.clone(), test_compile))?;
+        let test_runtime_paths = self.materialize(&merge(runtime.clone(), test_runtime))?;
+        let android_test_compile_paths = self.materialize(&merge(compile, android_test_compile))?;
+        let android_test_runtime_paths = self.materialize(&merge(runtime, android_test_runtime))?;
+
+        let mut root_paths: RootPaths = BTreeMap::new();
+        for bucket_paths in [
+            &compile_paths,
+            &runtime_paths,
+            &processor_paths,
+            &api_paths,
+            &test_compile_paths,
+            &test_runtime_paths,
+            &android_test_compile_paths,
+            &android_test_runtime_paths,
+        ] {
+            for (key, path) in bucket_paths {
+                let (group, artifact) = key;
+                let declared_root = declared.iter().any(|dep| {
+                    dep.dependency.group == *group && dep.dependency.artifact == *artifact
+                });
+                if declared_root {
+                    root_paths
+                        .entry((group.clone(), artifact.clone()))
+                        .or_insert(path.clone());
+                }
+            }
+        }
+
+        Ok((
+            Classpath {
+                compile: path_entries(&compile_paths),
+                runtime: path_entries(&runtime_paths),
+                processor: path_entries(&processor_paths),
+                api: path_entries(&api_paths),
+                test_compile: path_entries(&test_compile_paths),
+                test_runtime: path_entries(&test_runtime_paths),
+                android_test_compile: path_entries(&android_test_compile_paths),
+                android_test_runtime: path_entries(&android_test_runtime_paths),
+                compose_runtimes: Vec::new(),
+            },
+            root_paths,
+        ))
     }
 
     /// The reachable winner nodes from `roots`, following only
@@ -1490,15 +1560,15 @@ impl<'a> Session<'a> {
     }
 
     /// Downloads and materializes every node in `set` on a worker pool,
-    /// returning their classpath paths in deterministic (`group`, `artifact`)
-    /// order. Plain jars contribute their own file; Android AARs contribute
-    /// the `classes.jar` extracted from the archive; other packaging is noted
-    /// and contributes nothing. The first failure aborts the remaining
-    /// fetches and surfaces its error.
+    /// returning their classpath paths keyed by (`group`, `artifact`) in
+    /// deterministic order.  Plain jars contribute their own file; Android
+    /// AARs contribute the `classes.jar` extracted from the archive; other
+    /// packaging is noted and contributes nothing.  The first failure
+    /// aborts the remaining fetches and surfaces its error.
     fn materialize(
         &mut self,
         set: &BTreeMap<(String, String), (String, String)>,
-    ) -> Result<Vec<PathBuf>, ResolveError> {
+    ) -> Result<RootPaths, ResolveError> {
         let artifacts: Vec<((String, String), (String, String))> = set
             .iter()
             .filter_map(|((group, artifact), (version, packaging))| {
@@ -1564,16 +1634,24 @@ impl<'a> Session<'a> {
         let results = results
             .into_inner()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut paths = Vec::with_capacity(artifacts.len());
-        for result in results {
+        let mut paths: RootPaths = BTreeMap::new();
+        for (result, ((group, artifact), _)) in results.iter().zip(artifacts.iter()) {
             match result {
-                Some(Ok(path)) => paths.push(path),
-                Some(Err(error)) => return Err(error),
+                Some(Ok(path)) => {
+                    paths.insert((group.clone(), artifact.clone()), path.clone());
+                }
+                Some(Err(error)) => return Err(error.clone()),
                 None => {}
             }
         }
         Ok(paths)
     }
+}
+
+/// The materialized paths of `paths`, in the map's deterministic
+/// coordinate-sorted order, as owned values.
+fn path_entries(paths: &RootPaths) -> Vec<PathBuf> {
+    paths.values().cloned().collect()
 }
 
 fn merge(
@@ -2563,6 +2641,7 @@ mod tests {
             runtime: vec![PathBuf::from("/c/a.jar")],
             processor: vec![],
             api: vec![PathBuf::from("/c/a.jar")],
+            compose_runtimes: vec![PathBuf::from("/c/compose-ui.jar")],
             test_compile: vec![PathBuf::from("/c/t.jar")],
             test_runtime: vec![PathBuf::from("/c/t.jar")],
             android_test_compile: vec![],
@@ -2576,6 +2655,7 @@ mod tests {
                 "runtime": ["/c/a.jar"],
                 "processor": [],
                 "api": ["/c/a.jar"],
+                "composeRuntimes": ["/c/compose-ui.jar"],
                 "testCompile": ["/c/t.jar"],
                 "testRuntime": ["/c/t.jar"],
                 "androidTestCompile": [],
@@ -2592,6 +2672,7 @@ mod tests {
             "runtime",
             "processor",
             "api",
+            "composeRuntimes",
             "testCompile",
             "testRuntime",
             "androidTestCompile",
@@ -2675,6 +2756,10 @@ mod tests {
                 .iter()
                 .any(|n| n.contains("no version and no BOM"))
         );
+        assert!(
+            resolution.root_paths.is_empty(),
+            "a declared version-less dep that stays unresolved contributes no root_paths entry"
+        );
     }
 
     #[test]
@@ -2739,6 +2824,73 @@ mod tests {
         assert_eq!(
             jar_names(&resolution.classpath.compile),
             vec!["lib-1.0.jar"]
+        );
+    }
+
+    #[test]
+    fn root_paths_lists_only_declared_roots_not_transitives() {
+        let repo = LocalRepo::new();
+        repo.add(
+            "com.example",
+            "lib",
+            "1.0",
+            &[("com.example:child", "2.0", "")],
+        );
+        repo.add("com.example", "child", "2.0", &[]);
+        let resolution = repo
+            .resolver()
+            .resolve(&[declared(MavenScope::Implementation, "com.example:lib:1.0")])
+            .expect("resolves");
+        assert_eq!(
+            resolution.root_paths.keys().collect::<Vec<_>>(),
+            vec![&("com.example".to_owned(), "lib".to_owned())],
+            "only the declared root lib is keyed in root_paths, not its transitive child"
+        );
+        assert_eq!(
+            resolution.root_paths[&("com.example".to_owned(), "lib".to_owned())]
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()),
+            Some("lib-1.0.jar".to_owned()),
+            "root_paths maps the lib coordinate to its own jar, not the child's"
+        );
+    }
+
+    #[test]
+    fn root_paths_omits_pom_packaging_declared_roots() {
+        let repo = LocalRepo::new();
+        // A BOM root is packaging `pom`, so it carries no jar.
+        write_artifact(
+            &repo.root,
+            "com.example",
+            "bom",
+            "1.0",
+            r#"<?xml version="1.0"?><project>
+              <groupId>com.example</groupId><artifactId>bom</artifactId><version>1.0</version>
+              <packaging>pom</packaging>
+              <dependencyManagement>
+                <dependencies>
+                  <dependency>
+                    <groupId>com.example</groupId><artifactId>lib</artifactId><version>1.0</version>
+                  </dependency>
+                </dependencies>
+              </dependencyManagement>
+            </project>"#,
+        );
+        repo.add("com.example", "lib", "1.0", &[]);
+        let resolution = repo
+            .resolver()
+            .resolve(&[
+                declared(MavenScope::Implementation, "com.example:bom:1.0"),
+                declared(MavenScope::Implementation, "com.example:lib"),
+            ])
+            .expect("resolves");
+        assert_eq!(
+            resolution.root_paths,
+            BTreeMap::from([(
+                ("com.example".to_owned(), "lib".to_owned()),
+                resolution.classpath.compile[0].clone(),
+            )]),
+            "the BOM (pom packaging) and the version-managed lib resolve to one entry: lib's jar"
         );
     }
 
