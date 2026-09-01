@@ -58,13 +58,29 @@ constraints. When a child dependency has no version (declared as
 that cannot be resolved from the POM alone, the resolver looks up the
 managed version from active BOMs.
 
+Every POM also resolves its own version-less dependencies from its own
+`dependencyManagement`, regardless of packaging. This is what lets an AAR
+(non-BOM) pin one of its dependencies in its own `dependencyManagement`
+while declaring that dependency with the Gradle `unspecified` placeholder
+(`<version>unspecified</version>`, meaning "version comes from
+`dependencyManagement`"): the placeholder is treated as version-less and
+resolved against the owning POM's management before any BOM constraint.
+
+POM version normalization: a `<version>` of the Maven hard-pin form
+(`<version>[1.2.3]</version>`) resolves to the pinned `1.2.3` — the
+brackets are pin syntax, not part of the version. Inclusive range pins
+(which carry a comma, e.g. `[1.0,2.0]`) are left as a range and fail to
+resolve, since a range is not a single concrete version.
+
 Resolution order:
 
 1. Declared deps with explicit versions are expanded first.
 2. BOMs encountered during expansion populate the managed-version map.
 3. Version-less declared deps are expanded in a second pass, using the
    now-populated managed versions.
-4. The first BOM to declare a constraint for a given `group:artifact`
+4. Within a POM, its own `dependencyManagement` constraints are consulted
+   before BOM-managed versions (nearest definition wins).
+5. The first BOM to declare a constraint for a given `group:artifact`
    wins (nearest definition wins, matching Maven semantics).
 
 Parent POM inheritance is **not** consulted yet.
