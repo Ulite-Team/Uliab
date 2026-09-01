@@ -1094,7 +1094,7 @@ struct PomProject {
 /// range is not a single concrete version, and failing to resolve it is
 /// the honest outcome.
 fn normalize_pom_version(version: &str) -> String {
-    if version.len() >= 2
+    if version.len() > 2
         && version.starts_with("[")
         && version.ends_with("]")
         && !version.contains(",")
@@ -2069,6 +2069,37 @@ mod tests {
         assert_eq!(normalize_pom_version("[1.2.3]"), "1.2.3");
         assert_eq!(normalize_pom_version("1.2.3"), "1.2.3");
         assert_eq!(normalize_pom_version("${X}"), "${X}");
+        assert_eq!(normalize_pom_version("[]"), "[]");
+    }
+
+    #[test]
+    fn unspecified_in_dependency_management_is_preserved() {
+        let pom = r#"<project>
+          <groupId>com.example</groupId><artifactId>root</artifactId><version>1.0</version>
+          <dependencyManagement>
+            <dependencies>
+              <dependency>
+                <groupId>com.example</groupId><artifactId>managed</artifactId><version>unspecified</version>
+              </dependency>
+            </dependencies>
+          </dependencyManagement>
+          <dependencies>
+            <dependency>
+              <groupId>com.example</groupId><artifactId>real</artifactId><version>unspecified</version>
+            </dependency>
+          </dependencies>
+        </project>"#;
+        let parsed = parse_pom(pom.as_bytes()).expect("parses");
+        assert_eq!(
+            parsed.managed_deps[0].version.as_deref(),
+            Some("unspecified"),
+            "a managed entry keeps `unspecified` so an explicit consumer pin can win"
+        );
+        assert_eq!(
+            parsed.deps[0].version.as_deref(),
+            None,
+            "a regular dependency's `unspecified` is treated as version-less"
+        );
     }
 
     #[test]
@@ -2105,6 +2136,61 @@ mod tests {
             jar_names(&resolution.classpath.runtime),
             vec!["lib-1.0.jar", "kotlin-stdlib-1.9.24.jar"],
             "the `unspecified` dep resolves from the POM's own dependencyManagement"
+        );
+    }
+
+    #[test]
+    fn versionless_dep_falls_back_to_bom_managed_versions() {
+        let repo = LocalRepo::new();
+        write_artifact(
+            &repo.root,
+            "com.example",
+            "bom",
+            "1.0",
+            r#"<?xml version="1.0"?><project>
+              <groupId>com.example</groupId><artifactId>bom</artifactId><version>1.0</version>
+              <packaging>pom</packaging>
+              <dependencyManagement>
+                <dependencies>
+                  <dependency>
+                    <groupId>com.example</groupId><artifactId>two</artifactId><version>2.0</version>
+                  </dependency>
+                </dependencies>
+              </dependencyManagement>
+            </project>"#,
+        );
+        write_artifact(
+            &repo.root,
+            "com.example",
+            "lib",
+            "1.0",
+            r#"<?xml version="1.0"?><project>
+              <groupId>com.example</groupId><artifactId>lib</artifactId><version>1.0</version>
+              <dependencies>
+                <dependency>
+                  <groupId>com.example</groupId><artifactId>two</artifactId><version>unspecified</version>
+                </dependency>
+              </dependencies>
+            </project>"#,
+        );
+        write_artifact(
+            &repo.root,
+            "com.example",
+            "two",
+            "2.0",
+            &repo_pom("com.example", "two", "2.0", &[]),
+        );
+        let resolution = repo
+            .resolver()
+            .resolve(&[
+                declared(MavenScope::Implementation, "com.example:bom:1.0"),
+                declared(MavenScope::Implementation, "com.example:lib:1.0"),
+            ])
+            .expect("resolves");
+        assert_eq!(
+            jar_names(&resolution.classpath.runtime),
+            vec!["lib-1.0.jar", "two-2.0.jar"],
+            "when the POM has no own management, the version-less dep uses a BOM-managed version"
         );
     }
 
