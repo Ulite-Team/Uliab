@@ -275,7 +275,9 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
             for note in &resolution.notes {
                 eprintln!("note: {note}");
             }
-            resolution.classpath
+            let mut classpath = resolution.classpath;
+            classpath.compose_runtimes = compose_runtime_paths(&resolution.root_paths);
+            classpath
         }
         Value::Block(_) => maven::Classpath::default(),
         other => {
@@ -620,7 +622,9 @@ fn build_project_multi(
                 for note in &resolution.notes {
                     eprintln!("note: [{}] {}", m.rel, note);
                 }
-                resolution.classpath
+                let mut classpath = resolution.classpath;
+                classpath.compose_runtimes = compose_runtime_paths(&resolution.root_paths);
+                classpath
             }
             Value::Block(_) => maven::Classpath::default(),
             other => {
@@ -1667,6 +1671,24 @@ fn compose_deps(
     Ok(Some(deps))
 }
 
+/// The resolved paths of the Android Compose runtime artifacts —
+/// `androidx.compose.runtime`, `androidx.compose.ui`, and
+/// `androidx.compose.material3` — looked up by coordinate in
+/// [`maven::Resolution::root_paths`](maven::Resolution::root_paths). These
+/// are the `classes.jar` files an Android linker (d8) bundles alongside the
+/// types the `@Composable` lowering emits. Coordinates that did not resolve
+/// (Compose disabled, or an artifact missing) are omitted.
+fn compose_runtime_paths(root_paths: &maven::RootPaths) -> Vec<PathBuf> {
+    ["runtime", "ui", "material3"]
+        .into_iter()
+        .filter_map(|artifact| {
+            root_paths
+                .get(&(format!("androidx.compose.{artifact}"), artifact.to_owned()))
+                .cloned()
+        })
+        .collect::<Vec<_>>()
+}
+
 /// Resolves the `deps {}` block of an evaluated module model, erroring when
 /// the model declares none.
 fn resolve_model_deps(
@@ -1700,6 +1722,7 @@ fn resolve_model_deps(
         }
         return Ok(maven::Resolution {
             classpath: maven::Classpath::default(),
+            root_paths: std::collections::BTreeMap::new(),
             notes: Vec::new(),
         });
     }
@@ -1746,10 +1769,11 @@ fn resolve_source_set_classpaths(
         if let Some(ref compose) = compose {
             declared.extend(compose.iter().cloned());
         }
-        let classpath = resolver
+        let resolution = resolver
             .resolve(&declared)
-            .map_err(|error| format!("{path}: {error}"))?
-            .classpath;
+            .map_err(|error| format!("{path}: {error}"))?;
+        let mut classpath = resolution.classpath;
+        classpath.compose_runtimes = compose_runtime_paths(&resolution.root_paths);
         resolved.push((path, classpath));
     }
     Ok(resolved)
@@ -2949,6 +2973,85 @@ mod tests {
     }
 
     #[test]
+    fn compose_runtime_paths_lists_resolved_androidx_compose_runtimes() {
+        let root_paths = std::collections::BTreeMap::from([
+            (
+                (
+                    "androidx.compose:compose-bom".to_owned(),
+                    "compose-bom".to_owned(),
+                ),
+                PathBuf::from("/c/bom.jar"),
+            ),
+            (
+                ("androidx.compose.runtime".to_owned(), "runtime".to_owned()),
+                PathBuf::from("/c/runtime-classes.jar"),
+            ),
+            (
+                ("androidx.compose.ui".to_owned(), "ui".to_owned()),
+                PathBuf::from("/c/ui-classes.jar"),
+            ),
+            (
+                (
+                    "androidx.compose.material3".to_owned(),
+                    "material3".to_owned(),
+                ),
+                PathBuf::from("/c/material3-classes.jar"),
+            ),
+            (
+                (
+                    "org.jetbrains.kotlin".to_owned(),
+                    "kotlin-compose-compiler-plugin".to_owned(),
+                ),
+                PathBuf::from("/c/compiler.jar"),
+            ),
+        ]);
+        assert_eq!(
+            compose_runtime_paths(&root_paths),
+            vec![
+                PathBuf::from("/c/runtime-classes.jar"),
+                PathBuf::from("/c/ui-classes.jar"),
+                PathBuf::from("/c/material3-classes.jar"),
+            ],
+            "only the three androidx.compose runtime artifacts are compose runtimes"
+        );
+    }
+
+    #[test]
+    fn compose_runtime_paths_omits_unresolved_coordinates() {
+        let root_paths = std::collections::BTreeMap::from([
+            (
+                ("androidx.compose.runtime".to_owned(), "runtime".to_owned()),
+                PathBuf::from("/c/runtime-classes.jar"),
+            ),
+            (
+                (
+                    "androidx.compose.material3".to_owned(),
+                    "material3".to_owned(),
+                ),
+                PathBuf::from("/c/material3-classes.jar"),
+            ),
+        ]);
+        assert_eq!(
+            compose_runtime_paths(&root_paths),
+            vec![
+                PathBuf::from("/c/runtime-classes.jar"),
+                PathBuf::from("/c/material3-classes.jar"),
+            ],
+            "a runtime artifact that did not resolve is omitted, not an error"
+        );
+    }
+
+    #[test]
+    fn compose_runtime_paths_is_empty_when_none_resolved() {
+        let root_paths: std::collections::BTreeMap<(String, String), PathBuf> =
+            std::collections::BTreeMap::new();
+        assert!(
+            compose_runtime_paths(&root_paths).is_empty(),
+            "no resolved androidx.compose runtime artifacts means no compose runtimes"
+        );
+    }
+
+    #[test]
     fn parse_kotlinc_version_extracts_major_minor_patch() {
         assert_eq!(
             parse_kotlinc_version("Kotlin compiler version 2.2.0\nJVM target 1.8"),
@@ -3254,6 +3357,25 @@ mod tests {
                 .iter()
                 .any(|j| j.contains("kotlin-compose-compiler-plugin")),
             "compose compiler plugin should be on compile classpath: {compile_jars:?}"
+        );
+        let runtime_jars: Vec<&str> = resolved[0]
+            .1
+            .compose_runtimes
+            .iter()
+            .filter_map(|p| p.file_name().map(|f| f.to_str().unwrap()))
+            .collect();
+        assert_eq!(
+            runtime_jars,
+            ["runtime-1.0.jar", "ui-1.0.jar", "material3-1.0.jar"],
+            "the three androidx.compose runtime jars should be listed as compose runtimes"
+        );
+        assert!(
+            resolved[0]
+                .1
+                .compose_runtimes
+                .iter()
+                .all(|rt| resolved[0].1.compile.contains(rt)),
+            "every compose runtime jar should be on the compile classpath too"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
