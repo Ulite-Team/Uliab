@@ -1421,6 +1421,13 @@ const DEFAULT_COMPOSE_BOM_VERSION: &str = "2026.08.00";
 /// which always wins over both detection and the default.
 const DEFAULT_COMPOSE_COMPILER_VERSION: &str = "2.3.10";
 
+/// The artifact names of the managed Compose runtime libraries, in the
+/// order they resolve from the BOM. `compose_deps` declares them as
+/// version-less coordinates and `compose_runtime_paths` looks up their
+/// resolved jars, so the two must name the same set — keeping it here
+/// guarantees they cannot drift apart.
+const COMPOSE_RUNTIME_ARTIFACTS: &[&str] = &["runtime", "ui", "material3"];
+
 /// Extracts the Kotlin compiler version from the output of
 /// `kotlinc -version`, or `None` when no version can be found.
 ///
@@ -1648,8 +1655,8 @@ fn compose_deps(
         ))
         .map_err(|error| format!("invalid composeVersion '{compose_version}': {error}"))?,
     };
-    let managed = ["runtime", "ui", "material3"]
-        .into_iter()
+    let managed = COMPOSE_RUNTIME_ARTIFACTS
+        .iter()
         .map(|artifact| maven::DeclaredDep {
             scope,
             dependency: maven::Dependency::parse(&format!(
@@ -1679,11 +1686,14 @@ fn compose_deps(
 /// types the `@Composable` lowering emits. Coordinates that did not resolve
 /// (Compose disabled, or an artifact missing) are omitted.
 fn compose_runtime_paths(root_paths: &maven::RootPaths) -> Vec<PathBuf> {
-    ["runtime", "ui", "material3"]
-        .into_iter()
+    COMPOSE_RUNTIME_ARTIFACTS
+        .iter()
         .filter_map(|artifact| {
             root_paths
-                .get(&(format!("androidx.compose.{artifact}"), artifact.to_owned()))
+                .get(&(
+                    format!("androidx.compose.{artifact}"),
+                    (*artifact).to_owned(),
+                ))
                 .cloned()
         })
         .collect::<Vec<_>>()
@@ -3225,6 +3235,10 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].0, "commonMain");
         assert_eq!(resolved[0].1.compile.len(), 1);
+        assert!(
+            resolved[0].1.compose_runtimes.is_empty(),
+            "no compose block means no compose runtime links"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

@@ -338,15 +338,19 @@ pub struct Classpath {
     /// dependencies), so consumers can build a compile classpath without
     /// pulling in `implementation`-only deps.
     pub api: Vec<PathBuf>,
-    /// The Android Compose runtime artifacts that must be bundled with a
+    /// The Android Compose runtime artifacts the driver bundles with a
     /// compiled Android module that uses `@Composable`: the `classes.jar`
     /// of the `androidx.compose.runtime`, `androidx.compose.ui`, and
-    /// `androidx.compose.material3` artifacts, exactly as resolved from the
-    /// BOM.  These are a subset of [`compile`](Self::compile) — they appear
-    /// there too — but kept separate so an Android linker (d8) can add
-    /// exactly the runtime types the `@Composable` lowering emits without
-    /// scanning a flat classpath by filename.  Empty when the module does
-    /// not use Compose or none of the runtime artifacts resolved.
+    /// `androidx.compose.material3` artifacts, exactly as resolved from
+    /// the BOM.  These are a subset of [`compile`](Self::compile) — they
+    /// appear there too — but kept separate so an Android linker (d8) can
+    /// add exactly the runtime types the `@Composable` lowering emits
+    /// without scanning a flat classpath by filename.  This bucket is
+    /// produced by the host's `driver::compose_runtime_paths` — the
+    /// resolver itself leaves it empty, since the resolver cannot know
+    /// which resolved coordinates a caller treats as "Compose".  It stays
+    /// empty when the module does not use Compose or none of the runtime
+    /// artifacts resolved.
     pub compose_runtimes: Vec<PathBuf>,
     /// Jars needed to compile unit tests.
     pub test_compile: Vec<PathBuf>,
@@ -361,8 +365,8 @@ pub struct Classpath {
 impl Classpath {
     /// Serializes the classpath to the JSON object handed to plugins as the
     /// `classpath` key of their configuration: one array of jar paths per
-    /// bucket, named as the buckets are in GRAMMAR.md Appendix B
-    /// (`compile`, `runtime`, `processor`, `api`, `testCompile`,
+    /// bucket, named as they appear here (`compile`, `runtime`,
+    /// `processor`, `api`, `composeRuntimes`, `testCompile`,
     /// `testRuntime`, `androidTestCompile`, `androidTestRuntime`). The
     /// output is deterministic: each bucket is already sorted by
     /// (`group`, `artifact`) when built by [`Resolver`].
@@ -2752,6 +2756,10 @@ mod tests {
                 .iter()
                 .any(|n| n.contains("no version and no BOM"))
         );
+        assert!(
+            resolution.root_paths.is_empty(),
+            "a declared version-less dep that stays unresolved contributes no root_paths entry"
+        );
     }
 
     #[test]
@@ -2816,6 +2824,73 @@ mod tests {
         assert_eq!(
             jar_names(&resolution.classpath.compile),
             vec!["lib-1.0.jar"]
+        );
+    }
+
+    #[test]
+    fn root_paths_lists_only_declared_roots_not_transitives() {
+        let repo = LocalRepo::new();
+        repo.add(
+            "com.example",
+            "lib",
+            "1.0",
+            &[("com.example:child", "2.0", "")],
+        );
+        repo.add("com.example", "child", "2.0", &[]);
+        let resolution = repo
+            .resolver()
+            .resolve(&[declared(MavenScope::Implementation, "com.example:lib:1.0")])
+            .expect("resolves");
+        assert_eq!(
+            resolution.root_paths.keys().collect::<Vec<_>>(),
+            vec![&("com.example".to_owned(), "lib".to_owned())],
+            "only the declared root lib is keyed in root_paths, not its transitive child"
+        );
+        assert_eq!(
+            resolution.root_paths[&("com.example".to_owned(), "lib".to_owned())]
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()),
+            Some("lib-1.0.jar".to_owned()),
+            "root_paths maps the lib coordinate to its own jar, not the child's"
+        );
+    }
+
+    #[test]
+    fn root_paths_omits_pom_packaging_declared_roots() {
+        let repo = LocalRepo::new();
+        // A BOM root is packaging `pom`, so it carries no jar.
+        write_artifact(
+            &repo.root,
+            "com.example",
+            "bom",
+            "1.0",
+            r#"<?xml version="1.0"?><project>
+              <groupId>com.example</groupId><artifactId>bom</artifactId><version>1.0</version>
+              <packaging>pom</packaging>
+              <dependencyManagement>
+                <dependencies>
+                  <dependency>
+                    <groupId>com.example</groupId><artifactId>lib</artifactId><version>1.0</version>
+                  </dependency>
+                </dependencies>
+              </dependencyManagement>
+            </project>"#,
+        );
+        repo.add("com.example", "lib", "1.0", &[]);
+        let resolution = repo
+            .resolver()
+            .resolve(&[
+                declared(MavenScope::Implementation, "com.example:bom:1.0"),
+                declared(MavenScope::Implementation, "com.example:lib"),
+            ])
+            .expect("resolves");
+        assert_eq!(
+            resolution.root_paths,
+            BTreeMap::from([(
+                ("com.example".to_owned(), "lib".to_owned()),
+                resolution.classpath.compile[0].clone(),
+            )]),
+            "the BOM (pom packaging) and the version-managed lib resolve to one entry: lib's jar"
         );
     }
 
