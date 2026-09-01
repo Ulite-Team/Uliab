@@ -598,13 +598,18 @@ file:`). Manifest merging and AAB packaging remain future slices of the
 same plugin. Compose wiring: when `android.compose` is true the resolver
 injects the Compose BOM, the managed `runtime`/`ui`/`material3`
 artifacts, and the `org.jetbrains.kotlin:kotlin-compose-compiler-plugin`
-jar, and the plugin passes that jar to `kotlinc` via `-Xplugin`. The
-compiler plugin itself resolves as a plain jar. The `@Composable` API
-classes ship in the managed Android artifacts, which are AARs; the Maven
-resolver unwraps each AAR and contributes its extracted `classes.jar` to
-the compile classpath, so the API classes are reachable for a real
-`@Composable` compile (verified by the resolver's AAR tests; an end-to-end
-kotlinc-driven `@Composable` compile is a `PROGRESS.md` follow-up).
+jar, and the plugin passes that jar to `kotlinc` via `-Xplugin`. Since
+Kotlin 2.0 the Compose compiler is released in lockstep with `kotlinc`,
+so the injected plugin version is read from `kotlinc -version` on `PATH`
+(the host memoizes that probe once per process and only runs it for
+modules that enable Compose); an explicit `android.composeCompilerVersion`
+/ `jvm.composeCompilerVersion` overrides it, and a pinned default covers a
+missing or unparseable `kotlinc`. The compiler plugin itself resolves as a
+plain jar. The `@Composable` API classes ship in the managed Android
+artifacts, which are AARs; the Maven resolver unwraps each AAR and
+contributes its extracted `classes.jar` to the compile classpath, so the
+API classes are reachable for a real `@Composable` compile (verified by
+the resolver's AAR tests).
 
 ### 5.3 `ulite/kmp` — depends on `ulite/jvm`, optionally `ulite/android`
 

@@ -38,6 +38,17 @@ Scope mapping:
 | `test`, `provided`, `system` | dependency is dropped (`Skip`) |
 | anything else (default `compile`) | `Compile` |
 
+## AAR materialization
+
+Android libraries are published as AARs: a zip whose real compile payload
+is an inner `classes.jar`. When a declared or transitive dependency's POM
+has `packaging = "aar"`, the resolver downloads the AAR and extracts that
+`classes.jar` into the artifact's cache directory, contributing the
+extracted jar to the classpath rather than the archive itself. The
+extracted jar is tied to the exact AAR bytes it was derived from, so a
+refetched or re-verified AAR (for example a changed `-SNAPSHOT`)
+invalidates a stale extraction on the next build.
+
 ## BOM / `dependencyManagement` support
 
 POMs with `packaging = "pom"` are treated as BOMs (Bills of Materials).

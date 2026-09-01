@@ -258,7 +258,9 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
         .repos
         .clone()
         .unwrap_or_else(|| vec![maven::MavenRepo::Google, maven::MavenRepo::Central]);
-    let kotlinc_version = detect_kotlinc_version();
+    let kotlinc_version = needs_compose_compiler(&model)
+        .then(detect_kotlinc_version)
+        .flatten();
     let mut classpath = match &model {
         Value::Block(entries)
             if entries.contains_key("deps")
@@ -595,7 +597,11 @@ fn build_project_multi(
     let mut module_api_classpaths: std::collections::HashMap<String, Vec<PathBuf>> =
         std::collections::HashMap::new();
     let mut prepared: Vec<PreparedModule> = Vec::with_capacity(modules.len());
-    let kotlinc_version = detect_kotlinc_version();
+    let kotlinc_version = modules
+        .iter()
+        .any(|m| needs_compose_compiler(&m.model))
+        .then(detect_kotlinc_version)
+        .flatten();
     for m in &modules {
         let model_json = module_model_to_json(&m.model)?;
 
@@ -1298,7 +1304,9 @@ pub fn resolve_project_deps(
     cache_dir: Option<PathBuf>,
 ) -> Result<maven::Resolution, String> {
     let outcome = evaluate_project_dir(dir)?;
-    let kotlinc_version = detect_kotlinc_version();
+    let kotlinc_version = needs_compose_compiler(&outcome.model)
+        .then(detect_kotlinc_version)
+        .flatten();
     resolve_model_deps(&outcome.model, repos, cache_dir, kotlinc_version.as_deref())
 }
 
@@ -1366,7 +1374,9 @@ pub fn resolve_project_source_sets(
     cache_dir: Option<PathBuf>,
 ) -> Result<Vec<(String, maven::Classpath)>, String> {
     let outcome = evaluate_project_dir(dir)?;
-    let kotlinc_version = detect_kotlinc_version();
+    let kotlinc_version = needs_compose_compiler(&outcome.model)
+        .then(detect_kotlinc_version)
+        .flatten();
     resolve_source_set_classpaths(&outcome.model, repos, cache_dir, kotlinc_version.as_deref())
 }
 
@@ -1470,29 +1480,59 @@ fn parse_semver_prefix(token: &str) -> Option<String> {
     Some(format!("{major}.{minor}.{patch}"))
 }
 
-/// Runs `kotlinc -version` and returns the detected compiler version,
-/// or `None` when `kotlinc` is not on `PATH` or its version cannot be
-/// parsed. The result is used to select the Compose compiler plugin
-/// version, which must match the compiler in lockstep since Kotlin 2.0.
+/// Runs `kotlinc -version` and returns the detected compiler version, or
+/// `None` when `kotlinc` is not on `PATH` or its version cannot be parsed.
+/// The result is used to select the Compose compiler plugin version, which
+/// must match the compiler in lockstep since Kotlin 2.0.
 ///
-/// Detection is best-effort: a build with a Compose module but no usable
-/// `kotlinc` falls back to [`DEFAULT_COMPOSE_COMPILER_VERSION`] rather
-/// than failing, and that fallback is announced on stderr so a
-/// version-mismatch failure is not silently attributed to a stale pin.
+/// Detection is memoized, so it runs at most once per process, and is only
+/// invoked when a module actually enables Compose (see
+/// [`needs_compose_compiler`]). It is best-effort: a build with a Compose
+/// module but no usable `kotlinc` falls back to
+/// [`DEFAULT_COMPOSE_COMPILER_VERSION`] rather than failing. Every fallback
+/// — `kotlinc` missing, failing to run, or reporting an unrecognized
+/// version — is announced on stderr so a later version-mismatch failure is
+/// not silently attributed to a stale pin.
 fn detect_kotlinc_version() -> Option<String> {
+    DETECTED_KOTLINC
+        .get_or_init(detect_kotlinc_version_once)
+        .clone()
+}
+
+/// The process-wide result of [`detect_kotlinc_version`], computed at most
+/// once because the `kotlinc` on `PATH` does not change during a build.
+static DETECTED_KOTLINC: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+fn detect_kotlinc_version_once() -> Option<String> {
     let dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
         .unwrap_or_default();
-    let candidates = [("kotlinc", "kotlinc"), ("kotlinc.bat", "kotlinc.bat")];
-    let kotlinc = dirs.iter().find_map(|dir| {
-        candidates
-            .iter()
-            .find_map(|(file, _)| dir.join(file).is_file().then(|| dir.join(file)))
-    })?;
-    let output = std::process::Command::new(&kotlinc)
+    let Some(kotlinc) = dirs
+        .iter()
+        .find_map(|dir| dir.join("kotlinc").is_file().then(|| dir.join("kotlinc")))
+    else {
+        eprintln!(
+            "note: kotlinc not found on PATH; using the pinned compose \
+             compiler default {}",
+            DEFAULT_COMPOSE_COMPILER_VERSION
+        );
+        return None;
+    };
+    let output = match std::process::Command::new(&kotlinc)
         .arg("-version")
         .output()
-        .ok()?;
+    {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!(
+                "note: could not run kotlinc at {} ({error}); using the pinned \
+                 compose compiler default {}",
+                kotlinc.display(),
+                DEFAULT_COMPOSE_COMPILER_VERSION
+            );
+            return None;
+        }
+    };
     let text = String::from_utf8_lossy(&output.stdout)
         .chars()
         .chain(String::from_utf8_lossy(&output.stderr).chars())
@@ -1509,6 +1549,23 @@ fn detect_kotlinc_version() -> Option<String> {
             None
         }
     }
+}
+
+/// Whether any of the `android {}`/`jvm {}` blocks declares `compose = true`,
+/// i.e. whether the build needs a Compose compiler version at all. This
+/// mirrors the guard [`compose_deps`] applies, and lets the caller avoid the
+/// `kotlinc` subprocess when no module opts into Compose.
+fn needs_compose_compiler(model: &Value) -> bool {
+    let entries = match model {
+        Value::Block(entries) => entries,
+        _ => return false,
+    };
+    ["android", "jvm"].into_iter().any(|name| {
+        matches!(
+            entries.get(name),
+            Some(Value::Block(block)) if matches!(block.get("compose"), Some(Value::Bool(true)))
+        )
+    })
 }
 
 /// When `android.compose = true` or `jvm.compose = true` in the module
@@ -2905,6 +2962,11 @@ mod tests {
             parse_kotlinc_version("Kotlin compiler version 1.9.24-RC2"),
             Some("1.9.24".to_owned())
         );
+        assert_eq!(
+            parse_kotlinc_version("Kotlin compiler version v2.2.0"),
+            Some("2.2.0".to_owned()),
+            "a leading non-digit before the version is trimmed"
+        );
     }
 
     #[test]
@@ -2916,6 +2978,25 @@ mod tests {
             parse_kotlinc_version("Kotlin compiler version beta 2"),
             None
         );
+        assert_eq!(parse_kotlinc_version("Kotlin compiler version 2"), None);
+        assert_eq!(parse_kotlinc_version("Kotlin compiler version 2.2"), None);
+    }
+
+    #[test]
+    fn needs_compose_compiler_mirrors_the_compose_guard() {
+        let with_compose = json_to_value(&serde_json::json!({
+            "name": "app",
+            "android": { "compose": true, "compileSdk": 36 }
+        }));
+        assert!(needs_compose_compiler(&with_compose));
+
+        let compose_off = json_to_value(&serde_json::json!({
+            "android": { "compose": false }
+        }));
+        assert!(!needs_compose_compiler(&compose_off));
+
+        let no_android_block = json_to_value(&serde_json::json!({ "name": "app" }));
+        assert!(!needs_compose_compiler(&no_android_block));
     }
 
     #[test]
