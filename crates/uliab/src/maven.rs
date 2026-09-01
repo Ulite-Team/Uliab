@@ -1,5 +1,8 @@
 //! The Maven dependency resolver: turns a project's `deps {}` block into a
-//! concrete classpath of jar files (ARCHITECTURE.md §6, §7).
+//! concrete classpath (ARCHITECTURE.md §6, §7). Plain jars contribute their
+//! own file; Android AARs contribute the `classes.jar` extracted from the
+//! archive, so an `androidx.compose.*` dependency puts its `@Composable`
+//! API classes on the compile classpath.
 //!
 //! A [`Resolver`] expands the declared dependencies transitively by
 //! downloading POMs from its repository list, picks one version per
@@ -46,7 +49,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use sha2::{Digest, Sha256};
 
@@ -407,6 +410,13 @@ pub enum ResolveError {
         /// What about the POM could not be parsed.
         message: String,
     },
+    /// An archive (e.g. an Android AAR) could not be read or unpacked.
+    Archive {
+        /// The coordinate whose archive is malformed.
+        artifact: String,
+        /// What about the archive could not be read.
+        message: String,
+    },
 }
 
 impl std::fmt::Display for ResolveError {
@@ -420,6 +430,9 @@ impl std::fmt::Display for ResolveError {
             }
             ResolveError::Parser { artifact, message } => {
                 write!(formatter, "parsing POM for {artifact}: {message}")
+            }
+            ResolveError::Archive { artifact, message } => {
+                write!(formatter, "unpacking archive for {artifact}: {message}")
             }
         }
     }
@@ -580,6 +593,140 @@ impl Resolver {
         Ok(cache_file)
     }
 
+    /// Downloads an Android AAR and returns the path to the `classes.jar`
+    /// extracted from it, which is what an AAR contributes to a compile
+    /// classpath. The AAR (a zip) is fetched and verified through
+    /// `fetch_cached`; the extracted `classes.jar` is written beside it in
+    /// the artifact's cache directory.
+    ///
+    /// The extracted jar is tied to the AAR it came from: each extraction
+    /// records the AAR's digest beside it, and a later run re-extracts
+    /// whenever that digest no longer matches the currently-cached AAR.
+    /// This keeps the jar correct when a mutable coordinate (a `-SNAPSHOT`,
+    /// or a custom repo serving changing bytes) refetches different AAR
+    /// bytes, and lets a corrupted jar self-heal on the next build.
+    ///
+    /// Extraction writes through a process-unique `<name>.part-<pid>` file
+    /// and renames it into place atomically, so concurrent processes
+    /// extracting the same coordinate never interleave writes, and the
+    /// copy is size-capped like the download path so a pathological
+    /// `classes.jar` cannot grow the cache beyond the artifact byte limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResolveError::Fetch`] when the AAR cannot be downloaded
+    /// and [`ResolveError::Archive`] when the AAR cannot be read, is not a
+    /// zip, lacks a `classes.jar` entry, or its `classes.jar` exceeds the
+    /// size limit.
+    fn materialize_aar(
+        &self,
+        group: &str,
+        artifact: &str,
+        version: &str,
+    ) -> Result<PathBuf, ResolveError> {
+        let aar_path = self.fetch_cached(group, artifact, version, "aar")?;
+        let classes_path = self.cache_dir.join(format!(
+            "{}/{}/{}/{}-{}-classes.jar",
+            group.replace('.', "/"),
+            artifact,
+            version,
+            artifact,
+            version
+        ));
+        let aar_digest = read_recorded_digest(&aar_path);
+        if classes_path.is_file() && read_recorded_digest(&classes_path) == aar_digest {
+            return Ok(classes_path);
+        }
+        let coordinate = format!("{group}:{artifact}:{version}");
+        let file = std::fs::File::open(&aar_path).map_err(|error| ResolveError::Archive {
+            artifact: coordinate.clone(),
+            message: format!("opening {}: {error}", aar_path.display()),
+        })?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|error| ResolveError::Archive {
+            artifact: coordinate.clone(),
+            message: format!("reading {}: {error}", aar_path.display()),
+        })?;
+        let mut entry = archive
+            .by_name("classes.jar")
+            .map_err(|error| ResolveError::Archive {
+                artifact: coordinate.clone(),
+                message: format!("no classes.jar in {}: {error}", aar_path.display()),
+            })?;
+        if let Some(parent) = classes_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| ResolveError::Archive {
+                artifact: coordinate.clone(),
+                message: format!("creating {}: {error}", parent.display()),
+            })?;
+        }
+        let part_path = PathBuf::from(format!(
+            "{}.part-{}-{}",
+            classes_path.display(),
+            std::process::id(),
+            PART_NONCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        let outcome = (|| -> Result<(), ResolveError> {
+            let mut out =
+                std::fs::File::create(&part_path).map_err(|error| ResolveError::Archive {
+                    artifact: coordinate.clone(),
+                    message: format!("creating {}: {error}", part_path.display()),
+                })?;
+            let mut copied = 0u64;
+            let mut buffer = [0u8; 16 * 1024];
+            loop {
+                let read = entry
+                    .read(&mut buffer)
+                    .map_err(|error| ResolveError::Archive {
+                        artifact: coordinate.clone(),
+                        message: format!("reading {}: {error}", part_path.display()),
+                    })?;
+                if read == 0 {
+                    break;
+                }
+                copied += read as u64;
+                if copied > MAX_ARTIFACT_BYTES {
+                    return Err(ResolveError::Archive {
+                        artifact: coordinate.clone(),
+                        message: format!(
+                            "classes.jar in {} exceeds the {MAX_ARTIFACT_BYTES} byte limit",
+                            aar_path.display()
+                        ),
+                    });
+                }
+                out.write_all(&buffer[..read])
+                    .map_err(|error| ResolveError::Archive {
+                        artifact: coordinate.clone(),
+                        message: format!("writing {}: {error}", part_path.display()),
+                    })?;
+            }
+            out.sync_all().map_err(|error| ResolveError::Archive {
+                artifact: coordinate.clone(),
+                message: format!("writing {}: {error}", part_path.display()),
+            })?;
+            drop(out);
+            if let Some(digest) = &aar_digest {
+                std::fs::write(sha_path(&classes_path), digest).map_err(|error| {
+                    ResolveError::Archive {
+                        artifact: coordinate.clone(),
+                        message: format!(
+                            "recording {}: {error}",
+                            sha_path(&classes_path).display()
+                        ),
+                    }
+                })?;
+            }
+            std::fs::rename(&part_path, &classes_path).map_err(|error| ResolveError::Archive {
+                artifact: coordinate.clone(),
+                message: format!("finishing {}: {error}", classes_path.display()),
+            })?;
+            Ok(())
+        })();
+        if let Err(error) = outcome {
+            let _ = std::fs::remove_file(&part_path);
+            return Err(error);
+        }
+        Ok(classes_path)
+    }
+
     fn fetch_from_repos(&self, rel: &str, cache_file: &Path) -> Result<(), ResolveError> {
         let mut first_failure: Option<String> = None;
         for repo in &self.repos {
@@ -732,6 +879,21 @@ fn verified_cached(path: &Path) -> bool {
 fn sha_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.sha256", path.display()))
 }
+
+/// Returns the digest recorded in the sibling `<path>.sha256` file, when
+/// one is present. Used to tie an extracted `classes.jar` to the exact AAR
+/// bytes it was derived from.
+fn read_recorded_digest(path: &Path) -> Option<String> {
+    let digest = std::fs::read_to_string(sha_path(path))
+        .ok()?
+        .trim()
+        .to_owned();
+    (!digest.is_empty()).then_some(digest)
+}
+
+/// Distinguishes concurrent extractions of the same coordinate within one
+/// process, so their `.part` writes never share a file.
+static PART_NONCE: AtomicU64 = AtomicU64::new(0);
 
 fn default_cache_dir() -> PathBuf {
     match std::env::var_os("HOME") {
@@ -1327,44 +1489,48 @@ impl<'a> Session<'a> {
             .collect()
     }
 
-    /// Downloads the jar for every node in `set` on a worker pool,
-    /// returning their paths in deterministic (`group`, `artifact`) order.
-    /// Nodes whose packaging is not a plain jar contribute no file;
-    /// unsupported packaging is noted. The first jar download to fail
-    /// aborts the remaining fetches and surfaces its error.
+    /// Downloads and materializes every node in `set` on a worker pool,
+    /// returning their classpath paths in deterministic (`group`, `artifact`)
+    /// order. Plain jars contribute their own file; Android AARs contribute
+    /// the `classes.jar` extracted from the archive; other packaging is noted
+    /// and contributes nothing. The first failure aborts the remaining
+    /// fetches and surfaces its error.
     fn materialize(
         &mut self,
         set: &BTreeMap<(String, String), (String, String)>,
     ) -> Result<Vec<PathBuf>, ResolveError> {
-        let jars: Vec<((String, String), String)> = set
+        let artifacts: Vec<((String, String), (String, String))> = set
             .iter()
             .filter_map(|((group, artifact), (version, packaging))| {
-                if packaging == "jar" {
-                    Some(((group.clone(), artifact.clone()), version.clone()))
+                if packaging == "jar" || packaging == "aar" {
+                    Some((
+                        (group.clone(), artifact.clone()),
+                        (version.clone(), packaging.clone()),
+                    ))
                 } else {
                     None
                 }
             })
             .collect();
         for ((group, artifact), (version, packaging)) in set {
-            if packaging != "pom" && packaging != "jar" {
+            if packaging != "pom" && packaging != "jar" && packaging != "aar" {
                 self.notes.push(format!(
                     "{group}:{artifact}:{version} uses packaging '{packaging}'; only jar \
-                     artifacts are materialized"
+                     and aar artifacts are materialized"
                 ));
             }
         }
         let workers = std::thread::available_parallelism()
             .map_or(4, |count| count.get().min(8))
-            .min(jars.len())
+            .min(artifacts.len())
             .max(1);
-        let queue = Mutex::new(VecDeque::from_iter(0..jars.len()));
-        let results = Mutex::new(vec![None; jars.len()]);
+        let queue = Mutex::new(VecDeque::from_iter(0..artifacts.len()));
+        let results = Mutex::new(vec![None; artifacts.len()]);
         let failed = AtomicBool::new(false);
         std::thread::scope(|scope| {
             for _ in 0..workers {
                 let resolver = &self.resolver;
-                let jars = &jars;
+                let artifacts = &artifacts;
                 let queue = &queue;
                 let results = &results;
                 let failed = &failed;
@@ -1378,8 +1544,12 @@ impl<'a> Session<'a> {
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .pop_front();
                         let Some(index) = index else { break };
-                        let ((group, artifact), version) = &jars[index];
-                        let outcome = resolver.fetch_cached(group, artifact, version, "jar");
+                        let ((group, artifact), (version, packaging)) = &artifacts[index];
+                        let outcome = if packaging == "aar" {
+                            resolver.materialize_aar(group, artifact, version)
+                        } else {
+                            resolver.fetch_cached(group, artifact, version, "jar")
+                        };
                         if outcome.is_err() {
                             failed.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
@@ -1394,15 +1564,15 @@ impl<'a> Session<'a> {
         let results = results
             .into_inner()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut jar_paths = Vec::with_capacity(jars.len());
+        let mut paths = Vec::with_capacity(artifacts.len());
         for result in results {
             match result {
-                Some(Ok(path)) => jar_paths.push(path),
+                Some(Ok(path)) => paths.push(path),
                 Some(Err(error)) => return Err(error),
                 None => {}
             }
         }
-        Ok(jar_paths)
+        Ok(paths)
     }
 }
 
@@ -1471,6 +1641,39 @@ mod tests {
             format!("{artifact}-{version}"),
         )
         .unwrap();
+    }
+
+    /// Writes a real Android AAR (a zip holding a `classes.jar`) at the
+    /// coordinate's location in `root`, so the resolver's aar path can be
+    /// exercised against an actual archive rather than a placeholder.
+    fn write_aar(root: &Path, group: &str, artifact: &str, version: &str) -> PathBuf {
+        write_aar_with(root, group, artifact, version, b"fake classes")
+    }
+
+    /// Like [`write_aar`], but with a caller-chosen `classes.jar` payload so
+    /// tests can serve different bytes for the same coordinate.
+    fn write_aar_with(
+        root: &Path,
+        group: &str,
+        artifact: &str,
+        version: &str,
+        content: &[u8],
+    ) -> PathBuf {
+        let dir = root.join(format!(
+            "{}/{}/{}/",
+            group.replace('.', "/"),
+            artifact,
+            version
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let aar_path = dir.join(format!("{artifact}-{version}.aar"));
+        let file = std::fs::File::create(&aar_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        writer.start_file("classes.jar", options).unwrap();
+        writer.write_all(content).unwrap();
+        writer.finish().unwrap();
+        aar_path
     }
 
     struct LocalRepo {
@@ -1922,6 +2125,174 @@ mod tests {
         assert_eq!(
             jar_names(&resolution.classpath.compile),
             vec!["real-1.0.jar"]
+        );
+    }
+
+    #[test]
+    fn aar_materialization_extracts_classes_jar() {
+        let repo = LocalRepo::new();
+        let group = "com.example";
+        let artifact = "aarlib";
+        let version = "1.0";
+        let pom = repo_pom(group, artifact, version, &[])
+            .replace("<project>", "<project><packaging>aar</packaging>");
+        write_artifact(&repo.root, group, artifact, version, &pom);
+        write_aar(&repo.root, group, artifact, version);
+        let resolution = repo
+            .resolver()
+            .resolve(&[declared(
+                MavenScope::Implementation,
+                "com.example:aarlib:1.0",
+            )])
+            .expect("resolves");
+        assert_eq!(
+            jar_names(&resolution.classpath.compile),
+            vec!["aarlib-1.0-classes.jar"]
+        );
+        let joined = &resolution.classpath.compile[0];
+        assert_eq!(std::fs::read(joined).unwrap(), b"fake classes");
+        assert!(
+            !resolution
+                .notes
+                .iter()
+                .any(|note| note.contains("only jar and aar")),
+            "aar packaging must not be flagged as unsupported: {:?}",
+            resolution.notes
+        );
+    }
+
+    #[test]
+    fn aar_extracted_jar_path_is_stable_for_unchanged_coordinate() {
+        let repo = LocalRepo::new();
+        let group = "com.example";
+        let artifact = "aarlib";
+        let version = "1.0";
+        let pom = repo_pom(group, artifact, version, &[])
+            .replace("<project>", "<project><packaging>aar</packaging>");
+        write_artifact(&repo.root, group, artifact, version, &pom);
+        write_aar(&repo.root, group, artifact, version);
+        let resolver = repo.resolver();
+        let first = resolver
+            .resolve(&[declared(
+                MavenScope::Implementation,
+                "com.example:aarlib:1.0",
+            )])
+            .expect("resolves");
+        let first_path = first.classpath.compile[0].clone();
+        let second = resolver
+            .resolve(&[declared(
+                MavenScope::Implementation,
+                "com.example:aarlib:1.0",
+            )])
+            .expect("resolves");
+        assert_eq!(second.classpath.compile, vec![first_path]);
+    }
+
+    #[test]
+    fn aar_re_extracts_when_the_aar_changes() {
+        // A mutable coordinate (like a SNAPSHOT) serves different bytes over
+        // time. The extracted classes.jar must track the current AAR rather
+        // than the first one seen, or a refetched AAR would silently leave
+        // stale bytecode on the classpath.
+        let repo = LocalRepo::new();
+        let group = "com.example";
+        let artifact = "aarlib";
+        let version = "1.0-SNAPSHOT";
+        let coordinate = format!("com.example:aarlib:{version}");
+        let pom = repo_pom(group, artifact, version, &[])
+            .replace("<project>", "<project><packaging>aar</packaging>");
+        let resolver = repo.resolver();
+
+        write_artifact(&repo.root, group, artifact, version, &pom);
+        write_aar_with(&repo.root, group, artifact, version, b"first");
+        let first = resolver
+            .resolve(&[declared(MavenScope::Implementation, &coordinate)])
+            .expect("resolves");
+        let classes = first.classpath.compile[0].clone();
+        assert_eq!(std::fs::read(&classes).unwrap(), b"first");
+
+        write_aar_with(&repo.root, group, artifact, version, b"second");
+        let aar_cache = classes.with_file_name(format!("{artifact}-{version}.aar"));
+        let _ = std::fs::remove_file(&aar_cache);
+        let _ = std::fs::remove_file(format!("{}.sha256", aar_cache.display()));
+
+        let second = resolver
+            .resolve(&[declared(MavenScope::Implementation, &coordinate)])
+            .expect("resolves");
+        assert_eq!(
+            std::fs::read(&second.classpath.compile[0]).unwrap(),
+            b"second",
+            "a refetched AAR must invalidate the previously-extracted classes.jar"
+        );
+    }
+
+    #[test]
+    fn aar_that_is_not_a_zip_is_an_archive_error() {
+        let repo = LocalRepo::new();
+        let group = "com.example";
+        let artifact = "badaar";
+        let version = "1.0";
+        let pom = repo_pom(group, artifact, version, &[])
+            .replace("<project>", "<project><packaging>aar</packaging>");
+        write_artifact(&repo.root, group, artifact, version, &pom);
+        let dir = repo.root.join(format!(
+            "{}/{}/{}/",
+            group.replace('.', "/"),
+            artifact,
+            version
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{artifact}-{version}.aar")),
+            b"this is not a zip archive",
+        )
+        .unwrap();
+        let error = repo
+            .resolver()
+            .resolve(&[declared(
+                MavenScope::Implementation,
+                "com.example:badaar:1.0",
+            )])
+            .expect_err("a non-zip aar must fail");
+        assert!(
+            matches!(error, ResolveError::Archive { .. }),
+            "expected Archive error, got {error}"
+        );
+    }
+
+    #[test]
+    fn aar_missing_classes_jar_is_an_archive_error() {
+        let repo = LocalRepo::new();
+        let group = "com.example";
+        let artifact = "badaar";
+        let version = "1.0";
+        let pom = repo_pom(group, artifact, version, &[])
+            .replace("<project>", "<project><packaging>aar</packaging>");
+        write_artifact(&repo.root, group, artifact, version, &pom);
+        let dir = repo.root.join(format!(
+            "{}/{}/{}/",
+            group.replace('.', "/"),
+            artifact,
+            version
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let aar_path = dir.join(format!("{artifact}-{version}.aar"));
+        let file = std::fs::File::create(&aar_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        writer.start_file("not-classes.txt", options).unwrap();
+        writer.write_all(b"nope").unwrap();
+        writer.finish().unwrap();
+        let error = repo
+            .resolver()
+            .resolve(&[declared(
+                MavenScope::Implementation,
+                "com.example:badaar:1.0",
+            )])
+            .expect_err("aar without classes.jar must fail");
+        assert!(
+            matches!(error, ResolveError::Archive { .. }),
+            "expected Archive error, got {error}"
         );
     }
 

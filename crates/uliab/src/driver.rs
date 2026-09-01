@@ -258,11 +258,20 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
         .repos
         .clone()
         .unwrap_or_else(|| vec![maven::MavenRepo::Google, maven::MavenRepo::Central]);
+    let kotlinc_version = needs_compose_compiler(&model)
+        .then(detect_kotlinc_version)
+        .flatten();
     let mut classpath = match &model {
         Value::Block(entries)
-            if entries.contains_key("deps") || compose_deps(&model)?.is_some() =>
+            if entries.contains_key("deps")
+                || compose_deps(&model, kotlinc_version.as_deref())?.is_some() =>
         {
-            let resolution = resolve_model_deps(&model, &repos, options.cache_dir.clone())?;
+            let resolution = resolve_model_deps(
+                &model,
+                &repos,
+                options.cache_dir.clone(),
+                kotlinc_version.as_deref(),
+            )?;
             for note in &resolution.notes {
                 eprintln!("note: {note}");
             }
@@ -293,7 +302,12 @@ fn build_project_single(dir: &Path, options: &BuildOptions) -> Result<BuildResul
         ));
     };
 
-    let source_sets = resolve_source_set_classpaths(&model, &repos, options.cache_dir.clone())?;
+    let source_sets = resolve_source_set_classpaths(
+        &model,
+        &repos,
+        options.cache_dir.clone(),
+        kotlinc_version.as_deref(),
+    )?;
     if !source_sets.is_empty() {
         let mut source_set_map = serde_json::Map::new();
         for (path, source_set_classpath) in &source_sets {
@@ -583,15 +597,26 @@ fn build_project_multi(
     let mut module_api_classpaths: std::collections::HashMap<String, Vec<PathBuf>> =
         std::collections::HashMap::new();
     let mut prepared: Vec<PreparedModule> = Vec::with_capacity(modules.len());
+    let kotlinc_version = modules
+        .iter()
+        .any(|m| needs_compose_compiler(&m.model))
+        .then(detect_kotlinc_version)
+        .flatten();
     for m in &modules {
         let model_json = module_model_to_json(&m.model)?;
 
         // Resolve Maven deps (project refs are skipped by parse_deps_block).
         let mut classpath = match &m.model {
             Value::Block(entries)
-                if entries.contains_key("deps") || compose_deps(&m.model)?.is_some() =>
+                if entries.contains_key("deps")
+                    || compose_deps(&m.model, kotlinc_version.as_deref())?.is_some() =>
             {
-                let resolution = resolve_model_deps(&m.model, &repos, options.cache_dir.clone())?;
+                let resolution = resolve_model_deps(
+                    &m.model,
+                    &repos,
+                    options.cache_dir.clone(),
+                    kotlinc_version.as_deref(),
+                )?;
                 for note in &resolution.notes {
                     eprintln!("note: [{}] {}", m.rel, note);
                 }
@@ -607,8 +632,12 @@ fn build_project_multi(
             }
         };
 
-        let source_sets =
-            resolve_source_set_classpaths(&m.model, &repos, options.cache_dir.clone())?;
+        let source_sets = resolve_source_set_classpaths(
+            &m.model,
+            &repos,
+            options.cache_dir.clone(),
+            kotlinc_version.as_deref(),
+        )?;
         for (_, source_set_classpath) in &source_sets {
             for jar in &source_set_classpath.api {
                 if !classpath.api.contains(jar) {
@@ -1275,7 +1304,10 @@ pub fn resolve_project_deps(
     cache_dir: Option<PathBuf>,
 ) -> Result<maven::Resolution, String> {
     let outcome = evaluate_project_dir(dir)?;
-    resolve_model_deps(&outcome.model, repos, cache_dir)
+    let kotlinc_version = needs_compose_compiler(&outcome.model)
+        .then(detect_kotlinc_version)
+        .flatten();
+    resolve_model_deps(&outcome.model, repos, cache_dir, kotlinc_version.as_deref())
 }
 
 /// Resolves every source-set `deps {}` block declared in the project at
@@ -1342,7 +1374,10 @@ pub fn resolve_project_source_sets(
     cache_dir: Option<PathBuf>,
 ) -> Result<Vec<(String, maven::Classpath)>, String> {
     let outcome = evaluate_project_dir(dir)?;
-    resolve_source_set_classpaths(&outcome.model, repos, cache_dir)
+    let kotlinc_version = needs_compose_compiler(&outcome.model)
+        .then(detect_kotlinc_version)
+        .flatten();
+    resolve_source_set_classpaths(&outcome.model, repos, cache_dir, kotlinc_version.as_deref())
 }
 
 /// Evaluates the project sources at `dir` (`conventions.ulb`, `libs.ulb`,
@@ -1373,11 +1408,165 @@ fn evaluate_project_dir(dir: &Path) -> Result<ulb_lang::eval::EvalOutcome, Strin
 const DEFAULT_COMPOSE_BOM_VERSION: &str = "2026.08.00";
 
 /// Default version of the Compose compiler plugin injected when
-/// `compose = true`. Since Kotlin 2.0 the Compose compiler is released
-/// in lockstep with the Kotlin compiler, so this must match the version
-/// of `kotlinc` the build runs. Override per module with
-/// `android.composeCompilerVersion` (or `jvm.composeCompilerVersion`).
+/// `compose = true` and no compiler version can be determined. Since
+/// Kotlin 2.0 the Compose compiler is released in lockstep with the
+/// Kotlin compiler, so whenever `kotlinc` is on `PATH` its actual
+/// version is used instead ([`detect_kotlinc_version`]); this default
+/// only holds when detection is unavailable. Override per module with
+/// `android.composeCompilerVersion` (or `jvm.composeCompilerVersion`),
+/// which always wins over both detection and the default.
 const DEFAULT_COMPOSE_COMPILER_VERSION: &str = "2.3.10";
+
+/// Extracts the Kotlin compiler version from the output of
+/// `kotlinc -version`, or `None` when no version can be found.
+///
+/// The version is the first `major.minor.patch`-shaped token that follows
+/// the word `version` (e.g. `Kotlin compiler version 2.2.0` → `2.2.0`,
+/// `kotlinc-jvm 2.2.20` → `2.2.20`). A trailing pre-release tag such as
+/// `-RC2` is dropped — only the stable `major.minor.patch` prefix maps to
+/// a release Compose compiler artifact, so keeping the suffix would
+/// resolve a coordinate that does not exist.
+///
+/// # Examples
+///
+/// ```rust
+/// use uliab::driver::parse_kotlinc_version;
+///
+/// assert_eq!(
+///     parse_kotlinc_version("Kotlin compiler version 2.2.0\nJVM target 1.8"),
+///     Some("2.2.0".to_owned())
+/// );
+/// assert_eq!(parse_kotlinc_version("kotlinc-jvm 1.9.24"), Some("1.9.24".to_owned()));
+/// assert_eq!(parse_kotlinc_version("no version here"), None);
+/// ```
+pub fn parse_kotlinc_version(output: &str) -> Option<String> {
+    let tokens: Vec<&str> = output.split_whitespace().collect();
+    let after_version = tokens.windows(2).find_map(|pair| {
+        let (label, next) = (pair[0], pair[1]);
+        let bare = label.trim_matches(|c: char| !c.is_ascii_alphabetic());
+        (bare == "version").then_some(next)
+    });
+    let candidate = after_version
+        .or_else(|| {
+            tokens
+                .iter()
+                .find(|t| t.starts_with(|c: char| c.is_ascii_digit()))
+                .copied()
+        })?
+        .trim_start_matches(|c: char| !c.is_ascii_digit());
+    parse_semver_prefix(candidate)
+}
+
+/// Returns the leading `major.minor.patch` of `token`, dropping any
+/// trailing pre-release suffix, or `None` when the token does not begin
+/// with a dotted version number.
+fn parse_semver_prefix(token: &str) -> Option<String> {
+    let mut split = token.split('.');
+    let major: u32 = split.next()?.parse().ok()?;
+    let minor: u32 = split
+        .next()?
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()?;
+    let patch: u32 = split
+        .next()?
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()?;
+    Some(format!("{major}.{minor}.{patch}"))
+}
+
+/// Runs `kotlinc -version` and returns the detected compiler version, or
+/// `None` when `kotlinc` is not on `PATH` or its version cannot be parsed.
+/// The result is used to select the Compose compiler plugin version, which
+/// must match the compiler in lockstep since Kotlin 2.0.
+///
+/// Detection is memoized, so it runs at most once per process, and is only
+/// invoked when a module actually enables Compose (see
+/// [`needs_compose_compiler`]). It is best-effort: a build with a Compose
+/// module but no usable `kotlinc` falls back to
+/// [`DEFAULT_COMPOSE_COMPILER_VERSION`] rather than failing. Every fallback
+/// — `kotlinc` missing, failing to run, or reporting an unrecognized
+/// version — is announced on stderr so a later version-mismatch failure is
+/// not silently attributed to a stale pin.
+fn detect_kotlinc_version() -> Option<String> {
+    DETECTED_KOTLINC
+        .get_or_init(detect_kotlinc_version_once)
+        .clone()
+}
+
+/// The process-wide result of [`detect_kotlinc_version`], computed at most
+/// once because the `kotlinc` on `PATH` does not change during a build.
+static DETECTED_KOTLINC: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+fn detect_kotlinc_version_once() -> Option<String> {
+    let dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    let Some(kotlinc) = dirs
+        .iter()
+        .find_map(|dir| dir.join("kotlinc").is_file().then(|| dir.join("kotlinc")))
+    else {
+        eprintln!(
+            "note: kotlinc not found on PATH; using the pinned compose \
+             compiler default {}",
+            DEFAULT_COMPOSE_COMPILER_VERSION
+        );
+        return None;
+    };
+    let output = match std::process::Command::new(&kotlinc)
+        .arg("-version")
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!(
+                "note: could not run kotlinc at {} ({error}); using the pinned \
+                 compose compiler default {}",
+                kotlinc.display(),
+                DEFAULT_COMPOSE_COMPILER_VERSION
+            );
+            return None;
+        }
+    };
+    let text = String::from_utf8_lossy(&output.stdout)
+        .chars()
+        .chain(String::from_utf8_lossy(&output.stderr).chars())
+        .collect::<String>();
+    match parse_kotlinc_version(&text) {
+        Some(version) => Some(version),
+        None => {
+            eprintln!(
+                "note: kotlinc at {} reported an unrecognized version; using the pinned \
+                 compose compiler default {}",
+                kotlinc.display(),
+                DEFAULT_COMPOSE_COMPILER_VERSION
+            );
+            None
+        }
+    }
+}
+
+/// Whether any of the `android {}`/`jvm {}` blocks declares `compose = true`,
+/// i.e. whether the build needs a Compose compiler version at all. This
+/// mirrors the guard [`compose_deps`] applies, and lets the caller avoid the
+/// `kotlinc` subprocess when no module opts into Compose.
+fn needs_compose_compiler(model: &Value) -> bool {
+    let entries = match model {
+        Value::Block(entries) => entries,
+        _ => return false,
+    };
+    ["android", "jvm"].into_iter().any(|name| {
+        matches!(
+            entries.get(name),
+            Some(Value::Block(block)) if matches!(block.get("compose"), Some(Value::Bool(true)))
+        )
+    })
+}
 
 /// When `android.compose = true` or `jvm.compose = true` in the module
 /// model, returns the Compose BOM, standard runtime/UI deps, and the
@@ -1388,18 +1577,23 @@ const DEFAULT_COMPOSE_COMPILER_VERSION: &str = "2.3.10";
 ///
 /// The `composeVersion` key in the owning `android {}`/`jvm {}` block
 /// specifies the Compose BOM version (e.g. `"2026.08.00"` or
-/// `ver("2026.08.00")`); `composeCompilerVersion` specifies the Compose
-/// compiler plugin version. When either is omitted its default above is
-/// injected. The compiler plugin jar resolves into the module's
-/// `compile` classpath, where the android/kmp/jvm plugins pick it up to
-/// pass as `-Xplugin`. A plain-JVM compose module targets desktop
-/// Compose, so it receives the same managed runtime/UI set.
+/// `ver("2026.08.00")`). `composeCompilerVersion` specifies the Compose
+/// compiler plugin version; when omitted the version is taken from
+/// `kotlinc_version` (the actual compiler on `PATH`, when detected) and
+/// otherwise from [`DEFAULT_COMPOSE_COMPILER_VERSION`]. The compiler
+/// plugin jar resolves into the module's `compile` classpath, where the
+/// android/kmp/jvm plugins pick it up to pass as `-Xplugin`. A plain-JVM
+/// compose module targets desktop Compose, so it receives the same
+/// managed runtime/UI set.
 ///
 /// # Errors
 ///
 /// Returns an error when `composeVersion`/`composeCompilerVersion` is
 /// present but not displayable as a coordinate version segment.
-fn compose_deps(model: &Value) -> Result<Option<Vec<maven::DeclaredDep>>, String> {
+fn compose_deps(
+    model: &Value,
+    kotlinc_version: Option<&str>,
+) -> Result<Option<Vec<maven::DeclaredDep>>, String> {
     let entries = match model {
         Value::Block(entries) => entries,
         _ => return Ok(None),
@@ -1435,7 +1629,9 @@ fn compose_deps(model: &Value) -> Result<Option<Vec<maven::DeclaredDep>>, String
     let compiler_version = {
         let v = version_for("composeCompilerVersion")?;
         if v.is_empty() {
-            DEFAULT_COMPOSE_COMPILER_VERSION.to_owned()
+            kotlinc_version
+                .map(str::to_owned)
+                .unwrap_or_else(|| DEFAULT_COMPOSE_COMPILER_VERSION.to_owned())
         } else {
             v
         }
@@ -1477,6 +1673,7 @@ fn resolve_model_deps(
     model: &Value,
     repos: &[MavenRepo],
     cache_dir: Option<PathBuf>,
+    kotlinc_version: Option<&str>,
 ) -> Result<maven::Resolution, String> {
     let deps_block = match model {
         Value::Block(entries) => entries.get("deps"),
@@ -1486,7 +1683,7 @@ fn resolve_model_deps(
         Some(block) => maven::parse_deps_block(block)?,
         None => Vec::new(),
     };
-    if let Some(compose) = compose_deps(model)? {
+    if let Some(compose) = compose_deps(model, kotlinc_version)? {
         declared.extend(compose);
     }
     // A deps block whose entries were all project(":…") refs resolves to
@@ -1522,6 +1719,7 @@ fn resolve_source_set_classpaths(
     model: &Value,
     repos: &[MavenRepo],
     cache_dir: Option<PathBuf>,
+    kotlinc_version: Option<&str>,
 ) -> Result<Vec<(String, maven::Classpath)>, String> {
     let top = match model {
         Value::Block(entries) => entries,
@@ -1532,7 +1730,7 @@ fn resolve_source_set_classpaths(
             ));
         }
     };
-    let compose = compose_deps(model)?;
+    let compose = compose_deps(model, kotlinc_version)?;
     let mut blocks = Vec::new();
     for (key, value) in top {
         let mut path = vec![key.clone()];
@@ -2284,7 +2482,8 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let error = resolve_source_set_classpaths(&model, &[], None).expect_err("malformed deps");
+        let error =
+            resolve_source_set_classpaths(&model, &[], None, None).expect_err("malformed deps");
         assert!(error.contains("deps at 'commonMain'"), "{error}");
     }
 
@@ -2589,7 +2788,7 @@ mod tests {
             }
         });
         let value = json_to_value(&model);
-        let deps = compose_deps(&value)
+        let deps = compose_deps(&value, None)
             .expect("resolves")
             .expect("compose is true");
         assert_eq!(deps.len(), 5);
@@ -2621,7 +2820,7 @@ mod tests {
             }
         });
         let value = json_to_value(&model);
-        let deps = compose_deps(&value)
+        let deps = compose_deps(&value, None)
             .expect("resolves")
             .expect("compose is true");
         assert_eq!(deps[0].dependency.version, DEFAULT_COMPOSE_BOM_VERSION);
@@ -2637,7 +2836,7 @@ mod tests {
             }
         });
         let value = json_to_value(&model);
-        let deps = compose_deps(&value)
+        let deps = compose_deps(&value, None)
             .expect("resolves")
             .expect("compose is true");
         assert_eq!(
@@ -2655,7 +2854,7 @@ mod tests {
             }
         });
         let value = json_to_value(&model);
-        assert!(compose_deps(&value).expect("resolves").is_none());
+        assert!(compose_deps(&value, None).expect("resolves").is_none());
     }
 
     #[test]
@@ -2664,7 +2863,7 @@ mod tests {
             "jvm": {}
         });
         let value = json_to_value(&model);
-        assert!(compose_deps(&value).expect("resolves").is_none());
+        assert!(compose_deps(&value, None).expect("resolves").is_none());
     }
 
     #[test]
@@ -2675,7 +2874,7 @@ mod tests {
             }
         });
         let value = json_to_value(&model);
-        let deps = compose_deps(&value)
+        let deps = compose_deps(&value, None)
             .expect("resolves")
             .expect("jvm.compose is true");
         assert_eq!(deps.len(), 5);
@@ -2696,7 +2895,7 @@ mod tests {
             }
         });
         let value = json_to_value(&model);
-        let deps = compose_deps(&value)
+        let deps = compose_deps(&value, None)
             .expect("resolves")
             .expect("jvm.compose is true");
         assert_eq!(
@@ -2704,6 +2903,100 @@ mod tests {
             "kotlin-compose-compiler-plugin"
         );
         assert_eq!(deps[4].dependency.version, "2.0.21");
+    }
+
+    #[test]
+    fn compose_deps_uses_detected_kotlinc_version_when_no_override() {
+        let model = serde_json::json!({
+            "android": {
+                "compose": true
+            }
+        });
+        let value = json_to_value(&model);
+        let deps = compose_deps(&value, Some("2.2.20"))
+            .expect("resolves")
+            .expect("compose is true");
+        assert_eq!(deps[4].dependency.version, "2.2.20");
+    }
+
+    #[test]
+    fn compose_deps_prefers_explicit_override_over_detected_version() {
+        let model = serde_json::json!({
+            "android": {
+                "compose": true,
+                "composeCompilerVersion": "2.1.20"
+            }
+        });
+        let value = json_to_value(&model);
+        let deps = compose_deps(&value, Some("2.2.20"))
+            .expect("resolves")
+            .expect("compose is true");
+        assert_eq!(deps[4].dependency.version, "2.1.20");
+    }
+
+    #[test]
+    fn compose_deps_falls_back_to_default_when_no_version_detected() {
+        let model = serde_json::json!({
+            "android": {
+                "compose": true
+            }
+        });
+        let value = json_to_value(&model);
+        let deps = compose_deps(&value, None)
+            .expect("resolves")
+            .expect("compose is true");
+        assert_eq!(deps[4].dependency.version, DEFAULT_COMPOSE_COMPILER_VERSION);
+    }
+
+    #[test]
+    fn parse_kotlinc_version_extracts_major_minor_patch() {
+        assert_eq!(
+            parse_kotlinc_version("Kotlin compiler version 2.2.0\nJVM target 1.8"),
+            Some("2.2.0".to_owned())
+        );
+        assert_eq!(
+            parse_kotlinc_version("kotlinc-jvm 2.2.20"),
+            Some("2.2.20".to_owned())
+        );
+        assert_eq!(
+            parse_kotlinc_version("Kotlin compiler version 1.9.24-RC2"),
+            Some("1.9.24".to_owned())
+        );
+        assert_eq!(
+            parse_kotlinc_version("Kotlin compiler version v2.2.0"),
+            Some("2.2.0".to_owned()),
+            "a leading non-digit before the version is trimmed"
+        );
+    }
+
+    #[test]
+    fn parse_kotlinc_version_returns_none_when_unparseable() {
+        assert_eq!(parse_kotlinc_version(""), None);
+        assert_eq!(parse_kotlinc_version("no version here"), None);
+        assert_eq!(parse_kotlinc_version("version unknown"), None);
+        assert_eq!(
+            parse_kotlinc_version("Kotlin compiler version beta 2"),
+            None
+        );
+        assert_eq!(parse_kotlinc_version("Kotlin compiler version 2"), None);
+        assert_eq!(parse_kotlinc_version("Kotlin compiler version 2.2"), None);
+    }
+
+    #[test]
+    fn needs_compose_compiler_mirrors_the_compose_guard() {
+        let with_compose = json_to_value(&serde_json::json!({
+            "name": "app",
+            "android": { "compose": true, "compileSdk": 36 }
+        }));
+        assert!(needs_compose_compiler(&with_compose));
+
+        let compose_off = json_to_value(&serde_json::json!({
+            "android": { "compose": false }
+        }));
+        assert!(!needs_compose_compiler(&compose_off));
+
+        let no_android_block = json_to_value(&serde_json::json!({ "name": "app" }));
+        assert!(!needs_compose_compiler(&no_android_block));
     }
 
     #[test]
@@ -2760,7 +3053,7 @@ mod tests {
         let repos = vec![maven::MavenRepo::Custom(
             repo_dir.to_string_lossy().into_owned(),
         )];
-        let result = resolve_source_set_classpaths(&model, &repos, Some(cache_dir));
+        let result = resolve_source_set_classpaths(&model, &repos, Some(cache_dir), None);
         let error = result.expect_err("BOM resolution fails with local-only repo");
         assert!(
             error.contains("compose-bom"),
@@ -2824,7 +3117,7 @@ mod tests {
         let repos = vec![maven::MavenRepo::Custom(
             repo_dir.to_string_lossy().into_owned(),
         )];
-        let resolved = resolve_source_set_classpaths(&model, &repos, Some(cache_dir))
+        let resolved = resolve_source_set_classpaths(&model, &repos, Some(cache_dir), None)
             .expect("resolves without compose");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].0, "commonMain");
@@ -2934,7 +3227,7 @@ mod tests {
         let repos = vec![maven::MavenRepo::Custom(
             repo_dir.to_string_lossy().into_owned(),
         )];
-        let resolved = resolve_source_set_classpaths(&model, &repos, Some(cache_dir))
+        let resolved = resolve_source_set_classpaths(&model, &repos, Some(cache_dir), None)
             .expect("resolves with full compose BOM repo");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].0, "commonMain");
