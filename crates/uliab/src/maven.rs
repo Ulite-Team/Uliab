@@ -1083,6 +1083,32 @@ struct PomProject {
     managed_deps: Vec<PomDependency>,
 }
 
+/// Normalizes a version as read from a POM `<version>` element into the
+/// concrete version a coordinate resolves to.
+///
+/// A dependency declared with a Maven hard pin (`<version>[1.2.3]</version>`)
+/// pins the exact version — the brackets are pin syntax, not part of the
+/// version. Such a dependency resolves to the same artifact as the
+/// unpinned `1.2.3`, so the brackets are stripped here. Inclusive range
+/// pins (which carry a comma, e.g. `[1.0,2.0]`) are left untouched: a
+/// range is not a single concrete version, and failing to resolve it is
+/// the honest outcome.
+fn normalize_pom_version(version: &str) -> String {
+    if version.len() >= 2
+        && version.starts_with("[")
+        && version.ends_with("]")
+        && !version.contains(",")
+    {
+        version[1..version.len() - 1].to_owned()
+    } else {
+        version.to_owned()
+    }
+}
+
+/// The version placeholder Gradle emits in a dependency when the version
+/// is expected to come from a `dependencyManagement` section.
+const UNSPECIFIED_VERSION: &str = "unspecified";
+
 /// Parses a POM's packaging, its direct `compile`/`runtime`-scoped
 /// dependencies, and its `dependencyManagement` entries.
 ///
@@ -1164,7 +1190,20 @@ fn parse_pom(bytes: &[u8]) -> Result<PomProject, String> {
                     Some("groupId") => dependency.group = content,
                     Some("artifactId") => dependency.artifact = content,
                     Some("version") => {
-                        dependency.version = Some(content);
+                        let version = normalize_pom_version(&content);
+                        // A dependency whose version is `unspecified` gets its
+                        // version from the POM's `dependencyManagement`. Treat
+                        // it as version-less so the resolver fills it in from
+                        // managed versions, rather than trying to resolve a
+                        // literal artifact named `unspecified`. Managed
+                        // dependency entries keep their version: a BOM may
+                        // itself declare `unspecified` for a dep the consumer
+                        // pins, and preserving that here lets it win.
+                        dependency.version = if in_dependencies && version == UNSPECIFIED_VERSION {
+                            None
+                        } else {
+                            Some(version)
+                        };
                     }
                     Some("scope") => {
                         dependency.scope = match content.as_str() {
@@ -1296,6 +1335,21 @@ impl<'a> Session<'a> {
             }
         }
 
+        // Every POM's own `dependencyManagement` constraints resolve its
+        // version-less deps too. This matters for aar POMs, which are not
+        // BOMs and therefore never contribute to `managed_versions` above,
+        // but may still pin a dependency (e.g. `kotlin-stdlib`) in their
+        // own `dependencyManagement` with the dependency using the Gradle
+        // `unspecified` placeholder.
+        let mut local_managed: BTreeMap<(String, String), String> = BTreeMap::new();
+        for managed in &pom.managed_deps {
+            if let Some(ref ver) = managed.version {
+                local_managed
+                    .entry((managed.group.clone(), managed.artifact.clone()))
+                    .or_insert_with(|| ver.clone());
+            }
+        }
+
         let mut node = GraphNode {
             packaging: pom.packaging,
             edges: Vec::new(),
@@ -1303,8 +1357,14 @@ impl<'a> Session<'a> {
         for dependency in pom.deps {
             let version = match dependency.version {
                 None => {
-                    // Version-less child: look up in BOM-managed versions.
-                    if let Some(managed) = self
+                    // Version-less child: look up in the POM's own
+                    // `dependencyManagement`, falling back to BOM-managed
+                    // versions.
+                    if let Some(local) =
+                        local_managed.get(&(dependency.group.clone(), dependency.artifact.clone()))
+                    {
+                        local.clone()
+                    } else if let Some(managed) = self
                         .managed_versions
                         .get(&(dependency.group.clone(), dependency.artifact.clone()))
                     {
@@ -1979,6 +2039,73 @@ mod tests {
         assert_eq!(parsed.managed_deps.len(), 1);
         assert_eq!(parsed.managed_deps[0].artifact, "managed");
         assert_eq!(parsed.managed_deps[0].version.as_deref(), Some("2.0"));
+    }
+
+    #[test]
+    fn normalizes_hard_pin_versions() {
+        let pom = r#"<project>
+          <groupId>com.example</groupId><artifactId>root</artifactId><version>1.0</version>
+          <dependencies>
+            <dependency>
+              <groupId>com.example</groupId><artifactId>pinned</artifactId><version>[1.2.3]</version>
+            </dependency>
+            <dependency>
+              <groupId>com.example</groupId><artifactId>ranged</artifactId><version>[1.0,2.0]</version>
+            </dependency>
+          </dependencies>
+        </project>"#;
+        let parsed = parse_pom(pom.as_bytes()).expect("parses");
+        assert_eq!(parsed.deps.len(), 2);
+        assert_eq!(
+            parsed.deps[0].version.as_deref(),
+            Some("1.2.3"),
+            "a hard pin resolves to the pinned version"
+        );
+        assert_eq!(
+            parsed.deps[1].version.as_deref(),
+            Some("[1.0,2.0]"),
+            "a range pin is not a single version and is left as-is"
+        );
+        assert_eq!(normalize_pom_version("[1.2.3]"), "1.2.3");
+        assert_eq!(normalize_pom_version("1.2.3"), "1.2.3");
+        assert_eq!(normalize_pom_version("${X}"), "${X}");
+    }
+
+    #[test]
+    fn resolves_unspecified_version_from_same_pom_management() {
+        let repo = LocalRepo::new();
+        let pom = r#"<?xml version="1.0"?><project>
+          <groupId>com.example</groupId><artifactId>lib</artifactId><version>1.0</version>
+          <dependencyManagement>
+            <dependencies>
+              <dependency>
+                <groupId>org.jetbrains.kotlin</groupId><artifactId>kotlin-stdlib</artifactId><version>1.9.24</version>
+              </dependency>
+            </dependencies>
+          </dependencyManagement>
+          <dependencies>
+            <dependency>
+              <groupId>org.jetbrains.kotlin</groupId><artifactId>kotlin-stdlib</artifactId><version>unspecified</version><scope>runtime</scope>
+            </dependency>
+          </dependencies>
+        </project>"#;
+        write_artifact(&repo.root, "com.example", "lib", "1.0", pom);
+        write_artifact(
+            &repo.root,
+            "org.jetbrains.kotlin",
+            "kotlin-stdlib",
+            "1.9.24",
+            &repo_pom("org.jetbrains.kotlin", "kotlin-stdlib", "1.9.24", &[]),
+        );
+        let resolution = repo
+            .resolver()
+            .resolve(&[declared(MavenScope::Implementation, "com.example:lib:1.0")])
+            .expect("resolves");
+        assert_eq!(
+            jar_names(&resolution.classpath.runtime),
+            vec!["lib-1.0.jar", "kotlin-stdlib-1.9.24.jar"],
+            "the `unspecified` dep resolves from the POM's own dependencyManagement"
+        );
     }
 
     #[test]
