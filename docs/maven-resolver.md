@@ -85,6 +85,35 @@ Resolution order:
 
 Parent POM inheritance is **not** consulted yet.
 
+## KMP Android-variant substitution
+
+AndroidX Compose and the rest of the Android KMP ecosystem publish each
+library twice: a *metadata-stub* base artifact and a real `-android`
+variant. The base `aar` is empty (it carries no `classes.jar`); Gradle
+normally maps a dependency onto the `-android` variant by reading the
+artifact's `.module` (Gradle module metadata), which a POM-only resolver
+cannot do. When resolving for an **Android target** the resolver instead
+substitutes each base coordinate with its `-android` sibling.
+
+This is opt-in via `Resolver::with_android_variants(true)` — the driver
+enables it for modules that declare an `android {}` block. Plain-JVM
+(`jvm {}`) modules target desktop and must **not** substitute, since
+`org.jetbrains.compose` artifacts follow a separate distribution.
+
+Selection happens during graph expansion, per `group:artifact:version`:
+when the coordinate is an `aar`, is not already named `-android`, and a
+same-version `-android` sibling exists whose `aar` actually carries a
+`classes.jar`, the sibling's POM is expanded (its transitive children join
+the graph) and the base coordinate is resolved to the sibling's archive.
+
+- The winning coordinate stays keyed by the **base** `group:artifact`, so
+  `root_paths` callers that look up `runtime`/`ui`/`material3` are
+  unaffected; only the archive fetch is redirected to the sibling.
+- Materializing an empty stub under this mode contributes nothing and
+  records an explanatory note rather than failing the whole resolution.
+- With the flag **off** the behavior is unchanged and strict: an `aar`
+  lacking `classes.jar` is a hard `ArchiveError`.
+
 ## Transitive expansion and conflict resolution
 
 Expansion is transitive from the module's declared deps. For each

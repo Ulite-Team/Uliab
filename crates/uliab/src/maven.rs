@@ -475,6 +475,9 @@ impl std::error::Error for ResolveError {}
 pub struct Resolver {
     repos: Vec<MavenRepo>,
     cache_dir: PathBuf,
+    /// When set, KMP modular coordinates are substituted to their `-android`
+    /// sibling before materialization (see `Session::expand`).
+    android_variants: bool,
 }
 
 impl Resolver {
@@ -484,7 +487,24 @@ impl Resolver {
         Resolver {
             repos,
             cache_dir: cache_dir.unwrap_or_else(default_cache_dir),
+            android_variants: false,
         }
+    }
+
+    /// Returns a resolver that substitutes KMP modular child coordinates to
+    /// their `-android` sibling before materialization. This is the
+    /// Android-target resolution mode: androidx.compose publishes each
+    /// library as a metadata-stub base artifact (an empty `aar`) alongside
+    /// a real `-android` artifact, and a POM-only resolver must select the
+    /// `-android` variant explicitly because it cannot read the Gradle
+    /// module metadata that normally maps a base coordinate to its variant.
+    /// When set, an `aar` node whose `-android` sibling exists at the same
+    /// version expands the sibling (so its transitive dependencies land in
+    /// the graph) and materializes the sibling's `classes.jar` instead of
+    /// the empty base archive.
+    pub fn with_android_variants(mut self, enabled: bool) -> Resolver {
+        self.android_variants = enabled;
+        self
     }
 
     /// Resolves `declared` into a classpath, downloading POMs and jars
@@ -776,6 +796,19 @@ impl Resolver {
             },
         })
     }
+}
+
+/// Reports whether the AAR at `aar_path` contains a `classes.jar` entry.
+/// Used by the KMP android-variant probe to confirm a sibling archive
+/// actually carries classes before a coordinate is substituted to it.
+fn aar_has_classes_jar(aar_path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(aar_path) else {
+        return false;
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(file) else {
+        return false;
+    };
+    archive.by_name("classes.jar").is_ok()
 }
 
 impl Default for Resolver {
@@ -1268,7 +1301,7 @@ struct GraphNode {
 }
 
 /// A resolved compile/runtime-scoped child edge.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PomEdge {
     group: String,
     artifact: String,
@@ -1282,6 +1315,11 @@ struct Session<'a> {
     seen: BTreeSet<(String, String, String)>,
     notes: Vec<String>,
     managed_versions: BTreeMap<(String, String), String>,
+    /// Maps a base coordinate whose `-android` variant was selected to its
+    /// `-android` coordinate, keyed by `(group, artifact, version)`. During
+    /// materialization a substituted coordinate fetches the `-android`
+    /// artifact instead of the empty base `aar`.
+    android_substitutions: BTreeMap<(String, String, String), (String, String, String)>,
 }
 
 impl<'a> Session<'a> {
@@ -1293,6 +1331,7 @@ impl<'a> Session<'a> {
             seen: BTreeSet::new(),
             notes: Vec::new(),
             managed_versions: BTreeMap::new(),
+            android_substitutions: BTreeMap::new(),
         }
     }
 
@@ -1348,6 +1387,36 @@ impl<'a> Session<'a> {
                     .entry((managed.group.clone(), managed.artifact.clone()))
                     .or_insert_with(|| ver.clone());
             }
+        }
+
+        // KMP modular substitution: an Android target resolves a library's
+        // `-android` variant, not its metadata-stub base. The base archive is
+        // an empty `aar` (no `classes.jar`), so when android_variants is on
+        // and this coordinate has an `-android` sibling at the same version
+        // that carries real classes, the sibling's graph is expanded and the
+        // coordinate is flagged for substitution so materialization fetches
+        // the sibling's archive. The base coordinate is still recorded in the
+        // graph (as an aar, carrying the sibling's classpath edges) so the
+        // winner rule and classpath keying see this version; only the
+        // archive fetch is redirected. A coordinate whose name already ends
+        // in `-android`, and a sibling that does not actually carry classes,
+        // fall back to the base coordinate.
+        if self.resolver.android_variants
+            && !artifact.ends_with("-android")
+            && let Some(edges) = self.try_substitute_android(group, artifact, version)
+        {
+            self.graph
+                .entry((group.to_owned(), artifact.to_owned()))
+                .or_default()
+                .insert(
+                    version.to_owned(),
+                    GraphNode {
+                        packaging: "aar".to_owned(),
+                        edges,
+                    },
+                );
+            self.order.push(key);
+            return Ok(());
         }
 
         let mut node = GraphNode {
@@ -1410,6 +1479,112 @@ impl<'a> Session<'a> {
             .insert(version.to_owned(), node);
         self.order.push(key);
         Ok(())
+    }
+
+    /// Attempts to substitute `group:artifact:version` (a KMP metadata-stub
+    /// base) with its real `-android` variant. Expands the variant's graph
+    /// and records the substitution when the sibling exists at the same
+    /// version, is an `aar`, and its POM resolves to an archive actually
+    /// carrying a `classes.jar`. Returns the sibling's classpath edges on
+    /// success, or `None` (leaving the base coordinate unchanged) when no
+    /// usable sibling exists.
+    fn try_substitute_android(
+        &mut self,
+        group: &str,
+        artifact: &str,
+        version: &str,
+    ) -> Option<Vec<PomEdge>> {
+        let android_artifact = format!("{artifact}-android");
+        let android_pom = match self
+            .resolver
+            .fetch_cached(group, &android_artifact, version, "pom")
+        {
+            Ok(path) => match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.notes.push(format!(
+                        "reading {} POM for substitution: {error}",
+                        android_artifact
+                    ));
+                    return None;
+                }
+            },
+            Err(_) => {
+                self.notes.push(format!(
+                    "{group}:{artifact}:{version} has no {android_artifact} sibling; \
+                     resolved as the base coordinate"
+                ));
+                return None;
+            }
+        };
+        let android_pom = match parse_pom(&android_pom) {
+            Ok(pom) => pom,
+            Err(message) => {
+                self.notes.push(format!(
+                    "{}:{}:{} POM is malformed: {message}",
+                    android_artifact, version, ""
+                ));
+                return None;
+            }
+        };
+        if android_pom.packaging != "aar" {
+            self.notes.push(format!(
+                "{group}:{android_artifact}:{version} is packaging '{}', not aar; \
+                 base coordinate kept",
+                android_pom.packaging
+            ));
+            return None;
+        }
+        // The sibling must actually carry classes before we substitute, or
+        // materialization would still fail on an empty archive.
+        let classes_ok = match self
+            .resolver
+            .fetch_cached(group, &android_artifact, version, "aar")
+        {
+            Ok(aar_path) => aar_has_classes_jar(&aar_path),
+            Err(error) => {
+                self.notes.push(format!(
+                    "fetching {group}:{android_artifact}:{version} aar: {error}"
+                ));
+                return None;
+            }
+        };
+        if !classes_ok {
+            self.notes.push(format!(
+                "{group}:{android_artifact}:{version} has no classes.jar; \
+                 base coordinate kept"
+            ));
+            return None;
+        }
+        // Expand the variant's own graph so its transitive dependencies
+        // (e.g. runtime-android, ui-android) reach the graph.
+        if let Err(error) = self.expand(group, &android_artifact, version) {
+            self.notes.push(format!(
+                "expanding substitution {group}:{android_artifact}:{version}: {error}"
+            ));
+            return None;
+        }
+        // The base coordinate's classpath edges are the sibling's: the base
+        // stub is empty, so only the real variant's dependencies should be
+        // followed when the base coordinate is traversed.
+        let edges = self
+            .graph
+            .get(&(group.to_owned(), android_artifact.clone()))
+            .and_then(|versions| versions.get(version))
+            .map(|node| node.edges.clone())
+            .unwrap_or_default();
+        self.android_substitutions.insert(
+            (group.to_owned(), artifact.to_owned(), version.to_owned()),
+            (
+                group.to_owned(),
+                android_artifact.clone(),
+                version.to_owned(),
+            ),
+        );
+        self.notes.push(format!(
+            "{group}:{artifact}:{version} substituted by {group}:{android_artifact}:{version}"
+        ));
+        Some(edges)
     }
 
     /// Picks the winning version per `group:artifact` by the
@@ -1657,6 +1832,7 @@ impl<'a> Session<'a> {
         let queue = Mutex::new(VecDeque::from_iter(0..artifacts.len()));
         let results = Mutex::new(vec![None; artifacts.len()]);
         let failed = AtomicBool::new(false);
+        let substitutions = &self.android_substitutions;
         std::thread::scope(|scope| {
             for _ in 0..workers {
                 let resolver = &self.resolver;
@@ -1675,10 +1851,42 @@ impl<'a> Session<'a> {
                             .pop_front();
                         let Some(index) = index else { break };
                         let ((group, artifact), (version, packaging)) = &artifacts[index];
+                        // An android-variant coordinate fetches its `-android`
+                        // sibling's archive; the classpath key stays the base
+                        // coordinate so `root_paths` callers (e.g. the compose
+                        // runtime lookup) are unaffected.
+                        let (fetch_group, fetch_artifact) = substitutions
+                            .get(&(group.clone(), artifact.clone(), version.clone()))
+                            .map(|(g, a, _)| (g.as_str(), a.as_str()))
+                            .unwrap_or((group.as_str(), artifact.as_str()));
                         let outcome = if packaging == "aar" {
-                            resolver.materialize_aar(group, artifact, version)
+                            // Under android-variant mode an empty stub archive
+                            // (no usable -android sibling) contributes nothing
+                            // rather than failing the whole resolution; the
+                            // note explaining the skip is surfaced by the
+                            // main thread after the workers finish.
+                            if resolver.android_variants {
+                                let aar = resolver.fetch_cached(
+                                    fetch_group,
+                                    fetch_artifact,
+                                    version,
+                                    "aar",
+                                );
+                                match aar {
+                                    Ok(path) if aar_has_classes_jar(&path) => resolver
+                                        .materialize_aar(fetch_group, fetch_artifact, version)
+                                        .map(Some),
+                                    _ => Ok(None),
+                                }
+                            } else {
+                                resolver
+                                    .materialize_aar(fetch_group, fetch_artifact, version)
+                                    .map(Some)
+                            }
                         } else {
-                            resolver.fetch_cached(group, artifact, version, "jar")
+                            resolver
+                                .fetch_cached(fetch_group, fetch_artifact, version, "jar")
+                                .map(Some)
                         };
                         if outcome.is_err() {
                             failed.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1695,10 +1903,16 @@ impl<'a> Session<'a> {
             .into_inner()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut paths: RootPaths = BTreeMap::new();
-        for (result, ((group, artifact), _)) in results.iter().zip(artifacts.iter()) {
+        for (result, ((group, artifact), (version, _))) in results.iter().zip(artifacts.iter()) {
             match result {
-                Some(Ok(path)) => {
+                Some(Ok(Some(path))) => {
                     paths.insert((group.clone(), artifact.clone()), path.clone());
+                }
+                Some(Ok(None)) => {
+                    self.notes.push(format!(
+                        "{group}:{artifact}:{version} is an empty Android AAR with no \
+                         usable -android variant; it contributes nothing to the classpath"
+                    ));
                 }
                 Some(Err(error)) => return Err(error.clone()),
                 None => {}
@@ -1839,6 +2053,51 @@ mod tests {
                 version,
                 &repo_pom(group, artifact, version, children),
             );
+        }
+
+        /// Adds an Android `aar` coordinate: a POM declaring `aar` packaging
+        /// plus an archive carrying a real `classes.jar`.
+        fn add_aar(
+            &self,
+            group: &str,
+            artifact: &str,
+            version: &str,
+            children: &[(&str, &str, &str)],
+        ) {
+            let pom = repo_pom(group, artifact, version, children).replace(
+                "<modelVersion>4.0.0</modelVersion>",
+                "<modelVersion>4.0.0</modelVersion><packaging>aar</packaging>",
+            );
+            write_artifact(&self.root, group, artifact, version, &pom);
+            write_aar(&self.root, group, artifact, version);
+        }
+
+        /// Adds an Android `aar` coordinate whose archive is an empty stub
+        /// (no `classes.jar`) — the KMP metadata-base shape.
+        fn add_aar_stub(&self, group: &str, artifact: &str, version: &str) {
+            let pom = repo_pom(group, artifact, version, &[]).replace(
+                "<modelVersion>4.0.0</modelVersion>",
+                "<modelVersion>4.0.0</modelVersion><packaging>aar</packaging>",
+            );
+            write_artifact(&self.root, group, artifact, version, &pom);
+            let dir = self.root.join(format!(
+                "{}/{}/{}/",
+                group.replace('.', "/"),
+                artifact,
+                version
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let file =
+                std::fs::File::create(dir.join(format!("{artifact}-{version}.aar"))).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer
+                .start_file(
+                    "AndroidManifest.xml",
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+            writer.write_all(b"manifest").unwrap();
+            writer.finish().unwrap();
         }
 
         fn resolver(&self) -> Resolver {
@@ -3243,5 +3502,138 @@ mod tests {
             "compileOnly dep with no BOM version must be skipped, not panic"
         );
         assert!(resolution.notes.iter().any(|n| n.contains("skipped")));
+    }
+
+    #[test]
+    fn android_substitution_selects_sibling_with_classes() {
+        let repo = LocalRepo::new();
+        // `com.example:widget` is the KMP base stub; `widget-android` is the
+        // real variant, and it depends on `helper`.
+        repo.add_aar("com.example", "widget", "1.0", &[]);
+        repo.add_aar(
+            "com.example",
+            "widget-android",
+            "1.0",
+            &[("com.example:helper", "1.0", "")],
+        );
+        repo.add("com.example", "helper", "1.0", &[]);
+        let resolution = repo
+            .resolver()
+            .with_android_variants(true)
+            .resolve(&[declared(
+                MavenScope::Implementation,
+                "com.example:widget:1.0",
+            )])
+            .expect("resolves");
+        assert_eq!(
+            jar_names(&resolution.classpath.compile),
+            vec!["helper-1.0.jar", "widget-android-1.0-classes.jar"],
+            "the base coordinate resolves to the -android variant and follows its children"
+        );
+        // The declared root is still keyed by the base coordinate, pointing at
+        // the substituted classes.jar.
+        let root = resolution
+            .root_paths
+            .get(&("com.example".to_owned(), "widget".to_owned()))
+            .expect("root is keyed by base coordinate");
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("widget-android"),
+            "root path points at the -android classes.jar: {}",
+            root.display()
+        );
+        assert!(
+            resolution.notes.iter().any(|n| n.contains("substituted")),
+            "a note records the substitution"
+        );
+    }
+
+    #[test]
+    fn android_substitution_skips_empty_unsubstituted_stub_under_flag() {
+        let repo = LocalRepo::new();
+        // `widget` stub has no `-android` sibling at all.
+        repo.add_aar_stub("com.example", "widget", "1.0");
+        let resolution = repo
+            .resolver()
+            .with_android_variants(true)
+            .resolve(&[declared(
+                MavenScope::Implementation,
+                "com.example:widget:1.0",
+            )])
+            .expect("resolves");
+        assert!(
+            resolution.classpath.compile.is_empty(),
+            "an unsubstitutable empty stub contributes nothing under the flag"
+        );
+        assert!(
+            resolution
+                .notes
+                .iter()
+                .any(|n| n.contains("no usable -android")),
+            "a note explains the skip"
+        );
+    }
+
+    #[test]
+    fn android_substitution_strict_archive_error_when_flag_off() {
+        let repo = LocalRepo::new();
+        repo.add_aar_stub("com.example", "widget", "1.0");
+        let error = repo
+            .resolver()
+            .resolve(&[declared(
+                MavenScope::Implementation,
+                "com.example:widget:1.0",
+            )])
+            .expect_err("empty aar is a hard archive error when the flag is off");
+        assert!(
+            error.to_string().contains("classes.jar"),
+            "error names the missing classes.jar: {error}"
+        );
+    }
+
+    #[test]
+    fn android_substitution_falls_back_when_sibling_has_no_classes() {
+        let repo = LocalRepo::new();
+        repo.add_aar_stub("com.example", "widget", "1.0");
+        repo.add_aar_stub("com.example", "widget-android", "1.0");
+        let resolution = repo
+            .resolver()
+            .with_android_variants(true)
+            .resolve(&[declared(
+                MavenScope::Implementation,
+                "com.example:widget:1.0",
+            )])
+            .expect("resolves");
+        assert!(
+            resolution.classpath.compile.is_empty(),
+            "an empty sibling is not substituted and the empty base is skipped"
+        );
+        assert!(
+            resolution
+                .notes
+                .iter()
+                .any(|n| n.contains("no classes.jar")),
+            "a note records the sibling lacking classes"
+        );
+    }
+
+    #[test]
+    fn android_substitution_off_uses_base_coordinate_directly() {
+        let repo = LocalRepo::new();
+        // Both the stub base and a real sibling exist, but the flag is off:
+        // the base must resolve on its own terms.
+        repo.add_aar("com.example", "lib", "1.0", &[]);
+        repo.add_aar("com.example", "lib-android", "1.0", &[]);
+        let resolution = repo
+            .resolver()
+            .resolve(&[declared(MavenScope::Implementation, "com.example:lib:1.0")])
+            .expect("resolves");
+        assert_eq!(
+            jar_names(&resolution.classpath.compile),
+            vec!["lib-1.0-classes.jar"],
+            "with the flag off the base coordinate's own archive is materialized"
+        );
     }
 }
