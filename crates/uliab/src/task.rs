@@ -946,8 +946,12 @@ fn resolve_tool_binary(tool: AllowlistedTool, args: &[String]) -> Option<PathBuf
 /// path, or `None` when no candidate exists. The Windows executable
 /// suffixes (from `PATHEXT`) are honored so the resolved file matches the
 /// one that would actually run.
+///
+/// Exposed to the driver so `kotlinc` discovery for the Compose compiler
+/// version and the task engine's tool resolution agree on which concrete
+/// file runs, rather than each drifting to its own PATH-walk semantics.
 #[must_use]
-fn resolve_on_path(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+pub(crate) fn resolve_on_path(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     if cfg!(windows) {
         let exts: Vec<String> = std::env::var_os("PATHEXT")
             .map(|value| {
