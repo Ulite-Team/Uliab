@@ -1510,15 +1510,6 @@ fn detect_kotlinc_version() -> Option<String> {
         .clone()
 }
 
-/// Resolves the `kotlinc` binary the way the task engine would run it, so
-/// detection and the tool fingerprinting agree on the same file. An
-/// executable-bit/PATHEXT-aware walk lives in [`crate::task::resolve_on_path`]
-/// (the canonical tool resolver); this helper exists so the PATH read and the
-/// resolution can be tested together without invoking a real subprocess.
-fn resolve_kotlinc_on_path(dirs: &[PathBuf]) -> Option<PathBuf> {
-    resolve_on_path("kotlinc", dirs)
-}
-
 /// The process-wide result of [`detect_kotlinc_version`], computed at most
 /// once because the `kotlinc` on `PATH` does not change during a build.
 static DETECTED_KOTLINC: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
@@ -1530,7 +1521,7 @@ fn detect_kotlinc_version_once() -> Option<String> {
     let dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
         .unwrap_or_default();
-    let Some(kotlinc) = resolve_kotlinc_on_path(&dirs) else {
+    let Some(kotlinc) = resolve_on_path("kotlinc", &dirs) else {
         eprintln!(
             "note: kotlinc not found on PATH; using the pinned compose \
              compiler default {}",
@@ -3117,8 +3108,9 @@ mod tests {
         assert_eq!(parse_kotlinc_version("Kotlin compiler version 2.2"), None);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn resolve_kotlinc_on_path_skips_non_executable_shadow() {
+    fn detect_kotlinc_resolution_skips_non_executable_shadow() {
         let tmp = std::env::temp_dir().join(format!("uliab-kotlinc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let shadow = tmp.join("shadow");
@@ -3126,8 +3118,8 @@ mod tests {
         std::fs::create_dir_all(&shadow).unwrap();
         std::fs::create_dir_all(&real).unwrap();
         // A non-executable `kotlinc` shadowing a later real one on the path
-        // must be skipped over (the divergence the fold closed): detection
-        // and the task engine's tool resolution both use the canonical walk.
+        // must be skipped over so detection and the task engine's tool
+        // resolution choose the same runnable file.
         let non_executable = shadow.join("kotlinc");
         std::fs::write(&non_executable, "#!/bin/sh\necho shadow\n").unwrap();
         #[cfg(unix)]
@@ -3147,7 +3139,7 @@ mod tests {
             std::fs::set_permissions(&real, perms).unwrap();
         }
         let dirs = vec![tmp.join("shadow"), tmp.join("real")];
-        let resolved = resolve_kotlinc_on_path(&dirs);
+        let resolved = resolve_on_path("kotlinc", &dirs);
         assert_eq!(resolved, Some(real), "the shadow must be skipped");
         let _ = std::fs::remove_dir_all(&tmp);
     }
