@@ -1562,6 +1562,17 @@ fn detect_kotlinc_version_once() -> Option<String> {
     }
 }
 
+/// Whether the module model declares an `android {}` block, i.e. builds an
+/// Android target. Such modules resolve KMP modular dependencies against
+/// their `-android` variant (see [`maven::Resolver::with_android_variants`]);
+/// plain-JVM modules (`jvm {}` only) target desktop and must not substitute.
+fn has_android_target(model: &Value) -> bool {
+    match model {
+        Value::Block(entries) => matches!(entries.get("android"), Some(Value::Block(_))),
+        _ => false,
+    }
+}
+
 /// Whether any of the `android {}`/`jvm {}` blocks declares `compose = true`,
 /// i.e. whether the build needs a Compose compiler version at all. This
 /// mirrors the guard [`compose_deps`] applies, and lets the caller avoid the
@@ -1736,7 +1747,8 @@ fn resolve_model_deps(
             notes: Vec::new(),
         });
     }
-    let resolver = maven::Resolver::new(repos.to_vec(), cache_dir);
+    let resolver = maven::Resolver::new(repos.to_vec(), cache_dir)
+        .with_android_variants(has_android_target(model));
     resolver
         .resolve(&declared)
         .map_err(|error| error.to_string())
@@ -1772,7 +1784,8 @@ fn resolve_source_set_classpaths(
     // A resolver is reusable across independent declarations (its `resolve`
     // is stateless), so one instance serves every source set instead of
     // cloning the repository list per block.
-    let resolver = maven::Resolver::new(repos.to_vec(), cache_dir);
+    let resolver = maven::Resolver::new(repos.to_vec(), cache_dir)
+        .with_android_variants(has_android_target(model));
     let mut resolved = Vec::new();
     for (path, deps) in blocks {
         let mut declared = maven::parse_deps_block(deps)?;
