@@ -1402,6 +1402,7 @@ impl<'a> Session<'a> {
         // in `-android`, and a sibling that does not actually carry classes,
         // fall back to the base coordinate.
         if self.resolver.android_variants
+            && pom.packaging == "aar"
             && !artifact.ends_with("-android")
             && let Some(edges) = self.try_substitute_android(group, artifact, version)
         {
@@ -1521,8 +1522,7 @@ impl<'a> Session<'a> {
             Ok(pom) => pom,
             Err(message) => {
                 self.notes.push(format!(
-                    "{}:{}:{} POM is malformed: {message}",
-                    android_artifact, version, ""
+                    "{group}:{android_artifact}:{version} POM is malformed: {message}"
                 ));
                 return None;
             }
@@ -1876,7 +1876,12 @@ impl<'a> Session<'a> {
                                     Ok(path) if aar_has_classes_jar(&path) => resolver
                                         .materialize_aar(fetch_group, fetch_artifact, version)
                                         .map(Some),
-                                    _ => Ok(None),
+                                    // A fetch/download failure is a real error,
+                                    // not an empty stub; surface it so it is not
+                                    // mistaken for the benign "contributes
+                                    // nothing" case below.
+                                    Err(error) => Err(error),
+                                    Ok(_) => Ok(None),
                                 }
                             } else {
                                 resolver
@@ -3634,6 +3639,120 @@ mod tests {
             jar_names(&resolution.classpath.compile),
             vec!["lib-1.0-classes.jar"],
             "with the flag off the base coordinate's own archive is materialized"
+        );
+    }
+
+    #[test]
+    fn android_substitution_winner_version_with_sibling() {
+        let repo = LocalRepo::new();
+        // `widget` is reached at 1.0 (empty stub, no usable sibling) and again
+        // at 2.0 through `app`; 2.0 has a real `-android` sibling. The winner
+        // rule must still pick 2.0 and substitution must fire for that version.
+        repo.add_aar_stub("com.example", "widget", "1.0");
+        repo.add_aar_stub("com.example", "widget", "2.0");
+        repo.add_aar(
+            "com.example",
+            "widget-android",
+            "2.0",
+            &[("com.example:helper", "1.0", "")],
+        );
+        repo.add("com.example", "helper", "1.0", &[]);
+        repo.add(
+            "com.example",
+            "app",
+            "1.0",
+            &[("com.example:widget", "2.0", "")],
+        );
+        let resolution = repo
+            .resolver()
+            .with_android_variants(true)
+            .resolve(&[
+                declared(MavenScope::Implementation, "com.example:widget:1.0"),
+                declared(MavenScope::Implementation, "com.example:app:1.0"),
+            ])
+            .expect("resolves");
+        assert_eq!(
+            jar_names(&resolution.classpath.compile),
+            vec![
+                "app-1.0.jar",
+                "helper-1.0.jar",
+                "widget-android-2.0-classes.jar"
+            ],
+            "the highest widget version wins with its sibling substituted; app joins unchanged"
+        );
+        let root = resolution
+            .root_paths
+            .get(&("com.example".to_owned(), "widget".to_owned()))
+            .expect("root keyed by base coordinate");
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("widget-android-2.0"),
+            "root points at the winning variant's classes.jar: {}",
+            root.display()
+        );
+    }
+
+    #[test]
+    fn android_substitution_transitive_sibling_dep_also_substituted() {
+        let repo = LocalRepo::new();
+        // `widget-android` depends on `foo:1.0`, another KMP stub with its own
+        // `-android` sibling. Recursive expansion must substitute `foo` too.
+        repo.add_aar_stub("com.example", "widget", "1.0");
+        repo.add_aar(
+            "com.example",
+            "widget-android",
+            "1.0",
+            &[("com.example:foo", "1.0", "")],
+        );
+        repo.add_aar_stub("com.example", "foo", "1.0");
+        repo.add_aar(
+            "com.example",
+            "foo-android",
+            "1.0",
+            &[("com.example:baz", "1.0", "")],
+        );
+        repo.add("com.example", "baz", "1.0", &[]);
+        let resolution = repo
+            .resolver()
+            .with_android_variants(true)
+            .resolve(&[declared(
+                MavenScope::Implementation,
+                "com.example:widget:1.0",
+            )])
+            .expect("resolves");
+        assert_eq!(
+            jar_names(&resolution.classpath.compile),
+            vec![
+                "baz-1.0.jar",
+                "foo-android-1.0-classes.jar",
+                "widget-android-1.0-classes.jar"
+            ],
+            "both levels of the graph substitute to their -android variants"
+        );
+    }
+
+    #[test]
+    fn android_substitution_jar_base_coordinate_is_not_substituted() {
+        let repo = LocalRepo::new();
+        // A `jar`-packaged coordinate must NOT have its resolution redirected
+        // to an unrelated same-version `-android` twin: substitution is gated
+        // on the base being an `aar`.
+        repo.add("com.example", "widget", "1.0", &[]);
+        repo.add_aar("com.example", "widget-android", "1.0", &[]);
+        let resolution = repo
+            .resolver()
+            .with_android_variants(true)
+            .resolve(&[declared(
+                MavenScope::Implementation,
+                "com.example:widget:1.0",
+            )])
+            .expect("resolves");
+        assert_eq!(
+            jar_names(&resolution.classpath.compile),
+            vec!["widget-1.0.jar"],
+            "a jar base coordinate resolves to its own jar, never the sibling"
         );
     }
 }

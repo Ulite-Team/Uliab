@@ -140,7 +140,12 @@ What the core *does* keep, because it's genuinely target-agnostic:
   fetching, transitive resolution, `api`/`implementation` classpath
   visibility rules) — every JVM-family plugin (jvm/android/kmp) needs the
   same resolver, so it stays core rather than being reimplemented three
-  times.
+  times. The resolver remains target-agnostic by default; it carries an
+  opt-in Android-variant substitution mode (`Resolver::with_android_variants`)
+  that resolves a KMP library's real `-android` sibling instead of its empty
+  metadata-stub base. The *decision* to enable it for a module is made by a
+  non-core layer (the driver, from the presence of an `android {}` block),
+  so the resolver itself never hardcodes a target.
 - The plugin host itself (§3.3–§3.5) and the plugin registry client
   (§3.6).
 
